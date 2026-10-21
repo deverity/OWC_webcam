@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ struct Args {
   int port = 47800;
   std::string transport = "tcp";
   double seconds = 5.0;
+  bool seconds_set = false;   // --seconds given (idle: screenshot at 75 % of it instead of 1.5 s)
   std::wstring screenshot;
   std::wstring logfile;
   std::string tab;
@@ -48,6 +50,10 @@ struct Args {
   std::string rec_priority;   // --rec-priority quality|latency
   std::wstring rec_dir;       // --rec-dir
   std::vector<std::string> sets;  // --set id:value (self-test: send a param, report the outcome)
+  int size_w = 0, size_h = 0;     // --size WxH: client area size (screenshots)
+  int palette = -1;               // --palette N: colour page palette (0 wheels .. 4 gallery)
+  bool color_demo = false;        // --color-demo (self-test): sample grade + 2 scopes, for screenshots
+  std::string ui_script;          // --ui-script "cmd; cmd; ..." (self-test): injected ImGui input, one step per frame
 };
 
 HWND g_hwnd = nullptr;
@@ -123,10 +129,20 @@ bool parseArgs(Args& a) {
     else if (s == L"--host") a.host = toUtf8(next());
     else if (s == L"--port") a.port = _wtoi(next().c_str());
     else if (s == L"--transport") a.transport = toUtf8(next());
-    else if (s == L"--seconds") a.seconds = _wtof(next().c_str());
+    else if (s == L"--seconds") { a.seconds = _wtof(next().c_str()); a.seconds_set = true; }
     else if (s == L"--screenshot") a.screenshot = next();
     else if (s == L"--log") a.logfile = next();
     else if (s == L"--tab") a.tab = toUtf8(next());
+    else if (s == L"--size") {
+      const std::wstring v = next();
+      const size_t x = v.find_first_of(L"xX");
+      if (x != std::wstring::npos) {
+        a.size_w = _wtoi(v.substr(0, x).c_str());
+        a.size_h = _wtoi(v.substr(x + 1).c_str());
+      }
+    } else if (s == L"--palette") a.palette = _wtoi(next().c_str());
+    else if (s == L"--color-demo") a.color_demo = true;
+    else if (s == L"--ui-script") a.ui_script = toUtf8(next());
     else if (s == L"--help" || s == L"-h" || s == L"/?") a.help = true;
   }
   LocalFree(argv);
@@ -213,6 +229,107 @@ void trayMenu() {
   }
 }
 
+// ------------------------------------------------------------------ UI input script (self-test)
+// Commands (client pixels), one per UI frame:
+//   move X Y | down | up | rdown | rup | click X Y | dclick X Y | rclick X Y |
+//   drag X0 Y0 X1 Y1 [N] | shift 0/1 | ctrl 0/1 | key ctrl+z|ctrl+y|esc | wait N
+// Events are injected after the Win32 backend's NewFrame, and the scripted mouse
+// position is re-sent every frame so the real cursor never interferes.
+struct UiStep {
+  enum Kind { Move, Button, Mod, Key, Wait } kind = Wait;
+  float x = 0, y = 0;
+  int button = 0;
+  bool down = false;
+  ImGuiKey key = ImGuiKey_None;
+  int frames = 0;
+};
+std::vector<UiStep> g_uiSteps;
+size_t g_uiPos = 0;
+bool g_uiHavePos = false;
+ImVec2 g_uiMouse(0, 0);
+
+void parseUiScript(const std::string& script) {
+  size_t i = 0;
+  while (i < script.size()) {
+    size_t j = script.find(';', i);
+    if (j == std::string::npos) j = script.size();
+    std::string cmd = script.substr(i, j - i);
+    i = j + 1;
+    std::istringstream in(cmd);
+    std::string c, ks;
+    if (!(in >> c)) continue;
+    float a[5] = {0, 0, 0, 0, 10};
+    if (c == "key") in >> ks;
+    else
+      for (float& v : a)
+        if (!(in >> v)) break;
+    auto mv = [&](float x, float y) { UiStep s; s.kind = UiStep::Move; s.x = x; s.y = y; g_uiSteps.push_back(s); };
+    auto bt = [&](int b, bool d) { UiStep s; s.kind = UiStep::Button; s.button = b; s.down = d; g_uiSteps.push_back(s); };
+    if (c == "move") mv(a[0], a[1]);
+    else if (c == "down") bt(0, true);
+    else if (c == "up") bt(0, false);
+    else if (c == "rdown") bt(1, true);
+    else if (c == "rup") bt(1, false);
+    else if (c == "click" || c == "rclick") { const int b = c == "click" ? 0 : 1; mv(a[0], a[1]); bt(b, true); bt(b, false); }
+    else if (c == "dclick") { mv(a[0], a[1]); bt(0, true); bt(0, false); bt(0, true); bt(0, false); }
+    else if (c == "drag") {
+      const int steps = std::max(1, static_cast<int>(a[4]));
+      mv(a[0], a[1]);
+      bt(0, true);
+      for (int k = 1; k <= steps; ++k) {
+        const float t = static_cast<float>(k) / static_cast<float>(steps);
+        mv(a[0] + (a[2] - a[0]) * t, a[1] + (a[3] - a[1]) * t);
+      }
+      bt(0, false);
+    } else if (c == "shift" || c == "ctrl") {
+      UiStep s; s.kind = UiStep::Mod; s.key = c == "shift" ? ImGuiMod_Shift : ImGuiMod_Ctrl; s.down = a[0] != 0; g_uiSteps.push_back(s);
+    } else if (c == "key" && !ks.empty()) {
+      const std::string& k = ks;
+      UiStep s; s.kind = UiStep::Key;
+      s.key = k == "ctrl+z" ? ImGuiKey_Z : k == "ctrl+y" ? ImGuiKey_Y : ImGuiKey_Escape;
+      s.down = k.rfind("ctrl+", 0) == 0;  // reuse: true = with Ctrl
+      g_uiSteps.push_back(s);
+    } else if (c == "wait") {
+      UiStep s; s.kind = UiStep::Wait; s.frames = std::max(1, static_cast<int>(a[0])); g_uiSteps.push_back(s);
+    }
+  }
+}
+
+bool uiScriptActive() { return g_uiPos < g_uiSteps.size(); }
+
+void uiScriptStep() {
+  ImGuiIO& io = ImGui::GetIO();
+  if (g_uiHavePos) io.AddMousePosEvent(g_uiMouse.x, g_uiMouse.y);
+  static int waitLeft = 0;
+  static ImGuiKey releaseKey = ImGuiKey_None;
+  static bool releaseCtrl = false;
+  if (releaseKey != ImGuiKey_None) {
+    io.AddKeyEvent(releaseKey, false);
+    if (releaseCtrl) io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    releaseKey = ImGuiKey_None;
+    return;
+  }
+  if (waitLeft > 0) { --waitLeft; return; }
+  if (!uiScriptActive()) return;
+  const UiStep& s = g_uiSteps[g_uiPos++];
+  switch (s.kind) {
+    case UiStep::Move:
+      g_uiMouse = ImVec2(s.x, s.y);
+      g_uiHavePos = true;
+      io.AddMousePosEvent(s.x, s.y);
+      break;
+    case UiStep::Button: io.AddMouseButtonEvent(s.button, s.down); break;
+    case UiStep::Mod: io.AddKeyEvent(s.key, s.down); break;
+    case UiStep::Key:
+      if (s.down) io.AddKeyEvent(ImGuiMod_Ctrl, true);
+      io.AddKeyEvent(s.key, true);
+      releaseKey = s.key;
+      releaseCtrl = s.down;
+      break;
+    case UiStep::Wait: waitLeft = s.frames - 1; break;
+  }
+}
+
 // ------------------------------------------------------------------ rendering
 void rebuildFonts() {
   ImGui_ImplDX11_InvalidateDeviceObjects();
@@ -231,11 +348,15 @@ void renderFrame() {
     // color_matrix: 0 unknown (709 for >= 720p, else 601), 1 = BT.601, 2 = BT.709
     yp.bt709 = frame.color_matrix == 2 || (frame.color_matrix == 0 && frame.h >= 720);
     yp.full_range = frame.full_range;
-    if (g_renderer.uploadNv12(frame.y.data(), frame.uv.data(), frame.w, frame.h, yp)) g_app->noteDisplayed(frame);
+    if (g_renderer.uploadNv12(frame.y.data(), frame.uv.data(), frame.w, frame.h, yp)) {
+      g_app->noteDisplayed(frame);
+      uiOnPreviewFrame(frame);  // colour page scopes / LUT thumbnails (may swap the buffers)
+    }
   }
 
   ImGui_ImplDX11_NewFrame();
   ImGui_ImplWin32_NewFrame();
+  if (!g_uiSteps.empty()) uiScriptStep();
   ImGui::NewFrame();
   uiDraw(*g_app, g_renderer);
   ImGui::Render();
@@ -450,11 +571,13 @@ void recordSelftest(ULONGLONG now) {
 void selftestTick() {
   const ULONGLONG now = GetTickCount64();
   if (g_args.idle) {
-    if (now - g_st.t_start > 1500 && !g_st.shot_requested && !g_args.screenshot.empty()) {
+    const ULONGLONG shotAt = g_args.seconds_set ? static_cast<ULONGLONG>(g_args.seconds * 750.0) : 1500;
+    if (now - g_st.t_start > shotAt && !uiScriptActive() && !g_st.shot_requested && !g_args.screenshot.empty()) {
       g_renderer.requestScreenshot(g_args.screenshot);
       g_st.shot_requested = true;
     }
-    if (now - g_st.t_start > 1800 && !g_renderer.screenshotPending()) {
+    if (now - g_st.t_start > shotAt + 300 && !uiScriptActive() && (g_st.shot_requested || g_args.screenshot.empty()) &&
+        !g_renderer.screenshotPending()) {
       emitf("SELFTEST idle: screenshot %s\n", g_renderer.lastScreenshotOk() ? "ok" : "FALHOU");
       g_st.exit_code = g_renderer.lastScreenshotOk() ? 0 : 1;
       g_st.done = true;
@@ -559,7 +682,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   parseArgs(g_args);
   g_logPath = g_args.logfile;
   if (g_args.help) {
-    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]]\n");
+    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--size WxH] [--palette 0-4] [--color-demo] [--ui-script \"...\"] [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]]\n");
     return 0;
   }
 
@@ -595,6 +718,31 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
   int ww = app.settings.window_w, wh = app.settings.window_h;
+  if (g_args.size_w >= 640 && g_args.size_h >= 400) {  // --size: client area
+    RECT wr{0, 0, g_args.size_w, g_args.size_h};
+    AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    ww = wr.right - wr.left;
+    wh = wr.bottom - wr.top;
+  }
+  if (g_args.palette >= 0 && g_args.palette <= 4) app.settings.color_palette = g_args.palette;
+  if (g_args.color_demo && g_args.selftest) {  // never persisted (self-test settings are not saved)
+    owc::ClientOptions o = app.client.options();
+    owc::ColorGrade& g = o.color;
+    g.enabled = true;
+    g.compare_split = true;
+    g.lut = "builtin:teal_orange";
+    g.lut_strength = 0.8f;
+    g.lift = {0.0f, 0.02f, 0.06f, -0.05f};
+    g.gain = {0.08f, 0.0f, -0.06f, 0.1f};
+    g.contrast = 0.15f;
+    g.curve_y = {{0, 0}, {0.25f, 0.2f}, {0.75f, 0.82f}, {1, 1}};
+    g.hue_vs_sat = {{0.2f, 0.5f}, {0.33f, 0.8f}, {0.46f, 0.5f}};
+    app.client.setOptions(o);
+    app.settings.opts = o;
+    app.settings.color_scope_two = true;
+    app.settings.color_scope_a = 1;
+    app.settings.color_scope_b = 2;
+  }
   g_hwnd = CreateWindowExW(0, kClassName, L"OWC - Webcam do celular", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                            CW_USEDEFAULT, CW_USEDEFAULT, ww, wh, nullptr, nullptr, inst, nullptr);
   if (!g_hwnd) return 2;
@@ -621,6 +769,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   ImGui_ImplWin32_Init(g_hwnd);
   ImGui_ImplDX11_Init(g_renderer.device(), g_renderer.context());
   uiSetup(g_dpiScale);
+  if (g_args.selftest && !g_args.ui_script.empty()) parseUiScript(g_args.ui_script);
   if (!g_args.tab.empty() && !uiSelectTab(g_args.tab)) emitf("aviso: aba desconhecida '%s'\n", g_args.tab.c_str());
 
   ShowWindow(g_hwnd, SW_SHOWNORMAL);
@@ -640,6 +789,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   while (g_running) {
     const bool idle = IsIconic(g_hwnd) || g_hidden;
     DWORD timeout = idle ? 250 : 100;
+    if (uiScriptActive()) extra = std::max(extra, 1);  // self-test input script: render continuously
     if (extra > 0) timeout = 0;
     DWORD r = MsgWaitForMultipleObjects(1, waitH, FALSE, timeout, QS_ALLINPUT);
     bool activity = false;
@@ -675,6 +825,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
   saveWindowSize();
   app.disconnect();
+  uiShutdown();
   ImGui_ImplDX11_Shutdown();
   ImGui_ImplWin32_Shutdown();
   ImGui::DestroyContext();

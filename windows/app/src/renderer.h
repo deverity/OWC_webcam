@@ -18,6 +18,24 @@ struct YuvParams {
   bool full_range = false;
 };
 
+// Small RGBA8 texture for ImGui::Image / ImDrawList::AddImage (scopes, LUT
+// thumbnails). Recreated when the size changes. UI thread only (immediate context).
+class ImageTexture {
+ public:
+  // rgba: w*h*4 bytes, tightly packed, straight alpha. Returns false on error.
+  bool update(ID3D11Device* dev, ID3D11DeviceContext* ctx, const uint8_t* rgba, uint32_t w, uint32_t h);
+  void reset();
+  ID3D11ShaderResourceView* srv() const { return srv_.Get(); }
+  bool valid() const { return srv_ != nullptr; }
+  uint32_t width() const { return w_; }
+  uint32_t height() const { return h_; }
+
+ private:
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> tex_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv_;
+  uint32_t w_ = 0, h_ = 0;
+};
+
 class Renderer {
  public:
   bool init(HWND hwnd, int width, int height);

@@ -334,4 +334,33 @@ bool Renderer::saveBackBuffer(const std::wstring& path) {
   return ok;
 }
 
+// ---------------------------------------------------------------- ImageTexture
+bool ImageTexture::update(ID3D11Device* dev, ID3D11DeviceContext* ctx, const uint8_t* rgba, uint32_t w, uint32_t h) {
+  if (!dev || !ctx || !rgba || w == 0 || h == 0) return false;
+  if (!tex_ || w != w_ || h != h_) {
+    reset();
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(dev->CreateTexture2D(&d, nullptr, &tex_))) { reset(); return false; }
+    if (FAILED(dev->CreateShaderResourceView(tex_.Get(), nullptr, &srv_))) { reset(); return false; }
+    w_ = w;
+    h_ = h;
+  }
+  ctx->UpdateSubresource(tex_.Get(), 0, nullptr, rgba, w * 4, 0);
+  return true;
+}
+
+void ImageTexture::reset() {
+  srv_.Reset();
+  tex_.Reset();
+  w_ = h_ = 0;
+}
+
 }  // namespace owcapp

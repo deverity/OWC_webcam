@@ -7,6 +7,7 @@
 #include "params_meta.h"
 
 namespace owcapp {
+class Renderer;
 namespace ui {
 
 extern float S;  // DPI scale
@@ -36,7 +37,13 @@ std::string escapePct(const std::string& s);
 // tabs (ui_tabs.cpp / ui_params.cpp)
 void tabPresets(App& app);
 void tabCamera(App& app);
-void tabColor(App& app);  // ui_color.cpp
+// "Cor / LUT" colour page (ui_color*.cpp, ui_scopes.cpp): takes the whole window.
+void colorPage(App& app, Renderer& r);
+// Latest preview frame (already uploaded); may swap its buffers (scopes / thumbnails).
+void colorOnFrame(PreviewFrame& f);
+void colorShutdown();
+// Live video is being shown (streaming, a frame displayed in the last 2.5 s).
+bool previewLive(App& app, Renderer& r);
 void tabEncoder(App& app);
 void tabPc(App& app);
 void tabDevice(App& app);

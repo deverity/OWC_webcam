@@ -24,6 +24,11 @@ add_executable(OWC WIN32
   src/app_record.cpp
   src/ui_record.cpp
   src/ui_color.cpp
+  src/ui_color_wheels.cpp
+  src/ui_color_curves.cpp
+  src/ui_color_gallery.cpp
+  src/ui_scopes.cpp
+  src/color_worker.cpp
   src/platform.cpp
   src/settings.cpp
   src/params_meta.cpp

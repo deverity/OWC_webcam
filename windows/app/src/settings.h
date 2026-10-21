@@ -43,6 +43,14 @@ struct AppSettings {
   bool rec_keep_current = true;  // real time: keep current resolution/fps
   int rec_rt_w = 0, rec_rt_h = 0, rec_rt_fps = 0;
   std::string rec_dir;        // "" = %USERPROFILE%\Videos\OWC
+  // colour page ("Cor / LUT"): LUT gallery sources and UI layout
+  std::vector<std::string> color_recent_luts;  // .cube files loaded by the user (newest first, max 24)
+  std::vector<std::string> color_lut_folders;  // folders scanned (non-recursive) for .cube files
+  int color_palette = 0;       // 0 wheels, 1 curves, 2 hue/sat, 3 adjustments, 4 LUT gallery
+  int color_scope_a = 0;       // 0 waveform, 1 parade, 2 vectorscope, 3 histogram
+  int color_scope_b = 2;
+  bool color_scope_two = false;
+  float color_split = 0.48f;   // viewer row height / page height
   // per-device parameter memory, key = "model|name"
   std::map<std::string, ParamList> device_params;
   // per-device orientation: mode -1 = auto (phone hint), else 0/90/180/270; mirror

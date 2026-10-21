@@ -1,5 +1,7 @@
 #include "settings.h"
 
+#include <algorithm>
+
 #include "json.h"
 #include "platform.h"
 
@@ -46,6 +48,72 @@ static void paramsFromJson(const Json* a, ParamList& out) {
   }
 }
 
+static Json wheelToJson(const owc::ColorWheel& w) {
+  Json a = Json::array();
+  a.push(Json::number(static_cast<double>(w.r)));
+  a.push(Json::number(static_cast<double>(w.g)));
+  a.push(Json::number(static_cast<double>(w.b)));
+  a.push(Json::number(static_cast<double>(w.y)));
+  return a;
+}
+
+static float clampNum(const Json& v, double lo, double hi, float def) {
+  if (v.type != Json::Type::Num || v.n != v.n) return def;
+  return static_cast<float>(v.n < lo ? lo : (v.n > hi ? hi : v.n));
+}
+
+// [r, g, b, y], each -1..1
+static void wheelFromJson(const Json* j, owc::ColorWheel& w) {
+  if (!j || !j->isArr() || j->a.size() != 4) return;
+  w.r = clampNum(j->a[0], -1.0, 1.0, 0.0f);
+  w.g = clampNum(j->a[1], -1.0, 1.0, 0.0f);
+  w.b = clampNum(j->a[2], -1.0, 1.0, 0.0f);
+  w.y = clampNum(j->a[3], -1.0, 1.0, 0.0f);
+}
+
+// [[x, y], ...]
+static Json curveToJson(const std::vector<owc::CurvePoint>& c) {
+  Json a = Json::array();
+  for (const auto& p : c) {
+    Json e = Json::array();
+    e.push(Json::number(static_cast<double>(p.x)));
+    e.push(Json::number(static_cast<double>(p.y)));
+    a.push(std::move(e));
+  }
+  return a;
+}
+
+// Clamped to 0..1, NaN dropped, sorted by x, duplicates in x merged, at most 16 points.
+static void curveFromJson(const Json* j, std::vector<owc::CurvePoint>& c) {
+  if (!j || !j->isArr()) return;
+  c.clear();
+  for (const auto& e : j->a) {
+    if (!e.isArr() || e.a.size() != 2 || e.a[0].type != Json::Type::Num || e.a[1].type != Json::Type::Num) continue;
+    if (e.a[0].n != e.a[0].n || e.a[1].n != e.a[1].n) continue;
+    owc::CurvePoint p;
+    p.x = clampNum(e.a[0], 0.0, 1.0, 0.0f);
+    p.y = clampNum(e.a[1], 0.0, 1.0, 0.0f);
+    c.push_back(p);
+  }
+  std::stable_sort(c.begin(), c.end(), [](const owc::CurvePoint& a, const owc::CurvePoint& b) { return a.x < b.x; });
+  c.erase(std::unique(c.begin(), c.end(), [](const owc::CurvePoint& a, const owc::CurvePoint& b) { return a.x == b.x; }),
+          c.end());
+  if (c.size() > 16) c.resize(16);
+}
+
+static Json stringsToJson(const std::vector<std::string>& v) {
+  Json a = Json::array();
+  for (const auto& s : v) a.push(Json::string(s));
+  return a;
+}
+
+static void stringsFromJson(const Json* j, std::vector<std::string>& v, size_t cap) {
+  if (!j || !j->isArr()) return;
+  v.clear();
+  for (const auto& e : j->a)
+    if (e.type == Json::Type::Str && !e.s.empty() && v.size() < cap) v.push_back(e.s);
+}
+
 static Json optionsToJson(const owc::ClientOptions& o) {
   Json j = Json::object();
   j.set("jitter_buffer_ms", Json::number(o.jitter_buffer_ms));
@@ -80,6 +148,18 @@ static Json optionsToJson(const owc::ClientOptions& o) {
   j.set("color_lut", Json::string(o.color.lut));
   j.set("color_lut_strength", Json::number(static_cast<double>(o.color.lut_strength)));
   j.set("color_compare_split", Json::boolean(o.color.compare_split));
+  j.set("color_pivot", Json::number(static_cast<double>(o.color.pivot)));
+  j.set("color_lift", wheelToJson(o.color.lift));
+  j.set("color_gamma", wheelToJson(o.color.gamma));
+  j.set("color_gain", wheelToJson(o.color.gain));
+  j.set("color_offset", wheelToJson(o.color.offset));
+  j.set("color_curve_y", curveToJson(o.color.curve_y));
+  j.set("color_curve_r", curveToJson(o.color.curve_r));
+  j.set("color_curve_g", curveToJson(o.color.curve_g));
+  j.set("color_curve_b", curveToJson(o.color.curve_b));
+  j.set("color_hue_vs_hue", curveToJson(o.color.hue_vs_hue));
+  j.set("color_hue_vs_sat", curveToJson(o.color.hue_vs_sat));
+  j.set("color_luma_vs_sat", curveToJson(o.color.luma_vs_sat));
   return j;
 }
 
@@ -128,6 +208,18 @@ static void optionsFromJson(const Json& j, owc::ClientOptions& o) {
   g.lut = j.str("color_lut", g.lut);
   g.lut_strength = cf("color_lut_strength", g.lut_strength, 0.0, 1.0);
   g.compare_split = j.flag("color_compare_split", g.compare_split);
+  g.pivot = cf("color_pivot", g.pivot, 0.1, 0.9);
+  wheelFromJson(j.find("color_lift"), g.lift);
+  wheelFromJson(j.find("color_gamma"), g.gamma);
+  wheelFromJson(j.find("color_gain"), g.gain);
+  wheelFromJson(j.find("color_offset"), g.offset);
+  curveFromJson(j.find("color_curve_y"), g.curve_y);
+  curveFromJson(j.find("color_curve_r"), g.curve_r);
+  curveFromJson(j.find("color_curve_g"), g.curve_g);
+  curveFromJson(j.find("color_curve_b"), g.curve_b);
+  curveFromJson(j.find("color_hue_vs_hue"), g.hue_vs_hue);
+  curveFromJson(j.find("color_hue_vs_sat"), g.hue_vs_sat);
+  curveFromJson(j.find("color_luma_vs_sat"), g.luma_vs_sat);
 }
 
 bool loadSettings(AppSettings& s) {
@@ -154,6 +246,17 @@ bool loadSettings(AppSettings& s) {
   s.rec_rt_fps = static_cast<int>(j.num("rec_rt_fps", s.rec_rt_fps));
   s.rec_dir = j.str("rec_dir", s.rec_dir);
   if (const Json* o = j.find("options")) optionsFromJson(*o, s.opts);
+  stringsFromJson(j.find("color_recent_luts"), s.color_recent_luts, 24);
+  stringsFromJson(j.find("color_lut_folders"), s.color_lut_folders, 16);
+  auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  s.color_palette = clampi(static_cast<int>(j.num("color_palette", s.color_palette)), 0, 4);
+  s.color_scope_a = clampi(static_cast<int>(j.num("color_scope_a", s.color_scope_a)), 0, 3);
+  s.color_scope_b = clampi(static_cast<int>(j.num("color_scope_b", s.color_scope_b)), 0, 3);
+  s.color_scope_two = j.flag("color_scope_two", s.color_scope_two);
+  {
+    const double sp = j.num("color_split", static_cast<double>(s.color_split));
+    s.color_split = (sp == sp) ? static_cast<float>(sp < 0.25 ? 0.25 : (sp > 0.75 ? 0.75 : sp)) : 0.48f;
+  }
   if (const Json* d = j.find("devices"); d && d->isObj()) {
     for (const auto& kv : d->o) {
       ParamList l;
@@ -192,6 +295,13 @@ bool saveSettings(const AppSettings& s) {
   j.set("rec_rt_fps", Json::number(s.rec_rt_fps));
   j.set("rec_dir", Json::string(s.rec_dir));
   j.set("options", optionsToJson(s.opts));
+  j.set("color_recent_luts", stringsToJson(s.color_recent_luts));
+  j.set("color_lut_folders", stringsToJson(s.color_lut_folders));
+  j.set("color_palette", Json::number(s.color_palette));
+  j.set("color_scope_a", Json::number(s.color_scope_a));
+  j.set("color_scope_b", Json::number(s.color_scope_b));
+  j.set("color_scope_two", Json::boolean(s.color_scope_two));
+  j.set("color_split", Json::number(static_cast<double>(s.color_split)));
   Json d = Json::object();
   for (const auto& kv : s.device_params) d.set(kv.first, paramsToJson(kv.second));
   j.set("devices", std::move(d));

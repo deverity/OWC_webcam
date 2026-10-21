@@ -4,7 +4,9 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cwchar>
 
 namespace owcapp {
 
@@ -139,6 +141,51 @@ bool pickSaveFile(void* owner, const wchar_t* title, const wchar_t* filterName, 
   bool ok = runFileDialog(dlg, static_cast<HWND>(owner), title, filterName, filterSpec, out);
   dlg->Release();
   return ok;
+}
+
+bool pickFolder(void* owner, const wchar_t* title, std::string& out) {
+  IFileOpenDialog* dlg = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+  if (title) dlg->SetTitle(title);
+  bool ok = false;
+  if (SUCCEEDED(dlg->Show(static_cast<HWND>(owner)))) {
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+      PWSTR p = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) {
+        out = toUtf8(p);
+        ok = true;
+        CoTaskMemFree(p);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  return ok;
+}
+
+std::vector<std::string> listFiles(const std::string& dir, const wchar_t* ext) {
+  std::vector<std::string> out;
+  if (dir.empty() || !ext) return out;
+  std::wstring base = fromUtf8(dir);
+  if (!base.empty() && base.back() != L'\\' && base.back() != L'/') base += L'\\';
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileExW((base + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+  if (h == INVALID_HANDLE_VALUE) return out;
+  const size_t el = wcslen(ext);
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    const size_t n = wcslen(fd.cFileName);
+    if (n <= el || _wcsicmp(fd.cFileName + (n - el), ext) != 0) continue;
+    out.push_back(toUtf8(base + fd.cFileName));
+    if (out.size() >= 500) break;  // sanity cap
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 static bool regKeyExists(HKEY root, const wchar_t* sub) {

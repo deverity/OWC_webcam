@@ -1,6 +1,7 @@
 // Small Win32 helpers: paths, UTF-8, registry probes, file IO.
 #pragma once
 #include <string>
+#include <vector>
 
 namespace owcapp {
 
@@ -25,6 +26,12 @@ bool pickOpenFile(void* owner, const wchar_t* title, const wchar_t* filterName, 
                   std::string& out);
 bool pickSaveFile(void* owner, const wchar_t* title, const wchar_t* filterName, const wchar_t* filterSpec,
                   const wchar_t* defaultExt, const std::wstring& defaultName, std::string& out);
+
+// Native folder picker (UTF-8 path). Returns false on cancel or failure.
+bool pickFolder(void* owner, const wchar_t* title, std::string& out);
+// Files directly inside `dir` (non-recursive) whose extension matches `ext`
+// (case-insensitive, e.g. L".cube"), as UTF-8 absolute paths sorted by name.
+std::vector<std::string> listFiles(const std::string& dir, const wchar_t* ext);
 
 // DirectShow virtual camera registered (HKCU or HKLM Instance key)?
 bool virtualCamRegistered(bool* perUser = nullptr);

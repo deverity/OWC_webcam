@@ -77,6 +77,11 @@ std::string escapePct(const std::string& s) {
   return o;
 }
 
+bool previewLive(App& app, Renderer& r) {
+  return r.previewSrv() && r.previewWidth() > 0 && app.frames_shown > 0 && app.stats.state == owc::ClientState::Streaming &&
+         !(app.rec_phase == RecPhase::Recording && !app.rec_preview_available) && uiPreviewHasVideo();
+}
+
 const char* thermalName(int st) {
   switch (st) {
     case 0: return "normal";
@@ -112,6 +117,7 @@ const TabDef kTabs[] = {{"presets", "Presets"},   {"camera", "Câmera"}, {"color
                         {"pc", "PC"},             {"device", "Dispositivo"}, {"record", "Gravação"}, {"outputs", "Saídas"},
                         {"logs", "Logs"}};
 int g_tab = 0;
+constexpr int kColorTab = 2;
 bool g_openHelp = false;
 
 char g_manual[96] = "";
@@ -483,11 +489,8 @@ void drawHud(App& app, ImDrawList* dl, ImVec2 imgMin, ImVec2 imgMax) {
   dl->AddRect(g0, g1, IM_COL32(90, 100, 115, 120));
 }
 
-void drawPreview(App& app, Renderer& r, ImVec2 size) {
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  ImVec2 base = ImGui::GetCursorScreenPos();
-  dl->AddRectFilled(base, ImVec2(base.x + size.x, base.y + size.y), IM_COL32(10, 11, 14, 255), sc(10));
-
+// Once per UI frame (whatever the layout): is real video being shown?
+void updateVideoState(App& app, Renderer& r) {
   if (app.frames_shown != g_lastShown) {
     g_lastShown = app.frames_shown;
     g_lastShownTick = GetTickCount64();
@@ -495,6 +498,12 @@ void drawPreview(App& app, Renderer& r, ImVec2 size) {
   const owc::ClientState cs = app.stats.state;
   g_hasVideo = r.previewSrv() && r.previewWidth() > 0 && g_lastShown > 0 &&
                GetTickCount64() - g_lastShownTick < 2500 && (cs == owc::ClientState::Streaming);
+}
+
+void drawPreview(App& app, Renderer& r, ImVec2 size) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  ImVec2 base = ImGui::GetCursorScreenPos();
+  dl->AddRectFilled(base, ImVec2(base.x + size.x, base.y + size.y), IM_COL32(10, 11, 14, 255), sc(10));
 
   if (app.rec_phase == RecPhase::Recording && !app.rec_preview_available) {
     const char* l1 = "Gravando em HEVC";
@@ -704,8 +713,8 @@ void drawCenter(App& app, Renderer& r) {
   ImGui::PopStyleColor();
 }
 
-void drawRight(App& app) {
-  // pill tabs, wrapping
+// Pill tabs, wrapping.
+void drawTabPills() {
   const float avail = ImGui::GetContentRegionAvail().x;
   float x = 0;
   for (int i = 0; i < static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0])); ++i) {
@@ -726,13 +735,17 @@ void drawRight(App& app) {
     ImGui::PopStyleColor(2);
     x += w;
   }
+}
+
+void drawRight(App& app) {
+  drawTabPills();
   ImGui::Dummy(ImVec2(0, sc(4)));
   ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, sc(8));
   ImGui::BeginChild("tabbody", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_None);
   switch (g_tab) {
     case 0: tabPresets(app); break;
     case 1: tabCamera(app); break;
-    case 2: tabColor(app); break;
+    case 2: break;  // colour page: full window (colorPage)
     case 3: tabEncoder(app); break;
     case 4: tabPc(app); break;
     case 5: tabDevice(app); break;
@@ -869,6 +882,10 @@ bool uiSelectTab(const std::string& name) {
 
 bool uiPreviewHasVideo() { return g_hasVideo; }
 
+void uiOnPreviewFrame(PreviewFrame& frame) { colorOnFrame(frame); }
+
+void uiShutdown() { colorShutdown(); }
+
 void uiDraw(App& app, Renderer& r) {
   app.beginFrame();
   app.pollLogs();
@@ -882,6 +899,21 @@ void uiDraw(App& app, Renderer& r) {
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus);
   ImGui::PopStyleVar();
+
+  updateVideoState(app, r);
+  if (g_tab == kColorTab) {
+    // Colour page (Resolve style): the whole window, with the tab pills on top to leave it.
+    ImGui::PushFont(fontTitle);
+    ImGui::TextColored(col::accent(), "OWC");
+    ImGui::PopFont();
+    ImGui::SameLine(0, sc(14));
+    drawTabPills();
+    ImGui::Dummy(ImVec2(0, sc(2)));
+    colorPage(app, r);
+    ImGui::End();
+    drawToasts(app);
+    return;
+  }
 
   const float total = ImGui::GetContentRegionAvail().x;
   const float gap = ImGui::GetStyle().ItemSpacing.x;
