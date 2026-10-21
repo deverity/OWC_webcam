@@ -48,6 +48,7 @@ constexpr uint16_t kProtocolVersion = 1;
 constexpr uint16_t kDefaultControlPort = 47800;
 constexpr uint16_t kDefaultVideoUdpPort = 47801;
 constexpr uint16_t kDefaultDiscoveryPort = 47802;
+constexpr uint16_t kDefaultAnnouncePort = 47803;  // PC listens for phone announcements
 constexpr uint32_t kMaxTcpPayload = 16u * 1024u * 1024u;  // reject larger frames
 constexpr size_t kUdpMaxDatagram = 1400;                   // header + payload
 constexpr uint16_t kUdpMagic = 0x574Fu;                    // bytes 'O','W'
@@ -352,11 +353,16 @@ constexpr size_t kUdpMaxPayload = kUdpMaxDatagram - kUdpHeaderSize;
 // Request wire: u32 magic, u16 version, u8 kind=1.
 // Reply wire:   u32 magic, u16 version, u8 kind=2, u16 control_port,
 //               u16 udp_port, string device_name, string model, u8 busy
+// Announce (kind=3): same layout as the reply, broadcast by the phone every
+// ~2 s to kDefaultAnnouncePort while no client is connected. Needed because
+// many phones drop INCOMING broadcasts while the screen is off (APF), so the
+// PC's DiscoveryRequest never arrives; outgoing broadcasts still work.
 struct DiscoveryReply {
   uint16_t control_port = kDefaultControlPort;
   uint16_t udp_port = kDefaultVideoUdpPort;
   std::string device_name, model;
   bool busy = false;
+  bool announce = false;  // true: unsolicited announcement (kind=3)
 };
 
 // ================================================================ codec API

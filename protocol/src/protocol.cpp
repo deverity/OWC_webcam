@@ -104,6 +104,7 @@ bool getValue(Reader& r, ParamValue& v) {
 
 constexpr uint8_t kDiscoveryKindRequest = 1;
 constexpr uint8_t kDiscoveryKindReply = 2;
+constexpr uint8_t kDiscoveryKindAnnounce = 3;
 
 template <class T>
 size_t clampCount(const std::vector<T>& v) {
@@ -383,7 +384,8 @@ bool isDiscoveryRequest(const uint8_t* p, size_t n) {
 }
 std::vector<uint8_t> encode(const DiscoveryReply& m) {
   std::vector<uint8_t> b; Writer w{b};
-  w.u32(kMagic); w.u16(kProtocolVersion); w.u8(kDiscoveryKindReply);
+  w.u32(kMagic); w.u16(kProtocolVersion);
+  w.u8(m.announce ? kDiscoveryKindAnnounce : kDiscoveryKindReply);
   w.u16(m.control_port); w.u16(m.udp_port); w.str(m.device_name); w.str(m.model);
   w.u8(m.busy ? 1 : 0);
   return b;
@@ -391,7 +393,10 @@ std::vector<uint8_t> encode(const DiscoveryReply& m) {
 bool decode(const uint8_t* p, size_t n, DiscoveryReply& m) {
   Reader r(p, n);
   uint32_t magic = r.u32(); r.u16(); uint8_t kind = r.u8();
-  if (!r.ok || magic != kMagic || kind != kDiscoveryKindReply) return false;
+  if (!r.ok || magic != kMagic ||
+      (kind != kDiscoveryKindReply && kind != kDiscoveryKindAnnounce))
+    return false;
+  m.announce = kind == kDiscoveryKindAnnounce;
   m.control_port = r.u16(); m.udp_port = r.u16();
   r.str(m.device_name); r.str(m.model);
   m.busy = r.u8() != 0;

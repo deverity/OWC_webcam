@@ -348,8 +348,13 @@ static void testMessages() {
     CHECK(!isDiscoveryRequest(e.data(), e.size()));
     DiscoveryReply o; CHECK(decode(e.data(), e.size(), o));
     CHECK(o.control_port == 1111 && o.udp_port == 2222 && o.device_name == kUnicode &&
-          o.model == "Pixel" && o.busy);
+          o.model == "Pixel" && o.busy && !o.announce);
     checkTruncations<DiscoveryReply>(e);
+    r.announce = true;
+    auto ea = encode(r);
+    CHECK(ea.size() == e.size() && ea[6] == 3 && !isDiscoveryRequest(ea.data(), ea.size()));
+    DiscoveryReply oa; CHECK(decode(ea.data(), ea.size(), oa) && oa.announce && oa.busy);
+    bad = ea; bad[6] = 4; CHECK(!decode(bad.data(), bad.size(), oa));
     CHECK(!decode(rq.data(), rq.size(), o));
     bad = e; bad[1] ^= 0xFF; CHECK(!decode(bad.data(), bad.size(), o));
   }
