@@ -191,6 +191,11 @@ struct ClientOptions {
   // codec can be negotiated first; at most 500 ms later). Effect: next connect.
   bool auto_start_stream = true;
 
+  // Cap on presented (read back / converted / published / onFrame) frames per
+  // second; 0 = no cap. Every frame is still decoded. prepareSlowMotion() sets
+  // 60 while streaming at 240 fps. Effect: immediate.
+  uint32_t max_present_fps = 0;
+
   // Codec negotiation (see CodecPreference). Effect: next connect / next
   // Capabilities from the phone. Latency: HEVC/AV1 save bitrate at equal
   // quality; on hardware decoders latency is the same as H.264.
@@ -277,6 +282,62 @@ struct FrameCopy {
   uint64_t frame_number = 0;     // increments per published frame (pass back as lastSeen)
   uint64_t capture_ts_us = 0;
   int64_t capture_qpc = 0, publish_qpc = 0;
+};
+
+// ------------------------------------------------------------------ recording
+// PASSTHROUGH recording: the compressed access units received from the phone
+// (H.264 / HEVC; AV1 if the MF MP4 sink accepts it) are muxed into an MP4 with
+// the Media Foundation Sink Writer. No decode, no re-encode: the file has the
+// phone's quality and costs ~no CPU. Every received frame goes to the recorder
+// (independent of the preview's latency-first presentation drops), through a
+// bounded queue on its own thread ("owc-record"); the network and decode
+// threads never block on disk I/O.
+enum class RecordMode : uint8_t {
+  RealTime = 0,    // timestamps = phone capture times (gaps preserved): plays at real speed
+  SlowMotion = 1,  // every received frame gets 1/slowmo_output_fps: a 240 fps capture
+                   // written at 30 fps plays 8x slower in any player
+};
+
+struct RecordOptions {
+  // Output file (UTF-8). "" = %USERPROFILE%\Videos\OWC\OWC_yyyyMMdd_HHmmss.mp4.
+  // When the stream changes codec/resolution mid-recording, the file is closed
+  // and a new one is started with a suffix: name_2.mp4, name_3.mp4, ...
+  std::string path;
+  RecordMode mode = RecordMode::RealTime;
+  uint32_t slowmo_output_fps = 30;   // SlowMotion playback rate (30 => 240/30 = 8x)
+  // false: stop decoding/presenting/publishing while recording (saves CPU at
+  // 240 fps; the preview and virtual camera freeze). Resumes at the next
+  // keyframe after stopRecording().
+  bool present = true;
+  // Bounded queue between the decode thread and the writer thread. On
+  // overflow frames are dropped (counted) until the next keyframe.
+  uint32_t max_queue_mb = 256;
+};
+
+enum class RecordState : uint8_t {
+  Idle = 0,             // not recording
+  WaitingForKeyframe,   // started; a file begins at the first keyframe
+  Recording,
+  Error,                // stopped because of an error (see last_error); call stopRecording()
+};
+
+struct RecordStatus {
+  RecordState state = RecordState::Idle;
+  RecordMode mode = RecordMode::RealTime;
+  std::string path;                 // current (or last) file
+  std::vector<std::string> files;   // all files of this recording (epoch splits)
+  uint64_t frames_received = 0;     // frames handed to the recorder
+  uint64_t frames_written = 0;
+  uint64_t frames_dropped = 0;      // queue overflow / waiting for a keyframe after a gap
+                                    // (frames before the first keyframe are not counted)
+  uint64_t frames_missing = 0;      // phone frame_seq gaps (lost on the network / phone drops)
+  uint32_t gaps = 0;                // number of seq discontinuities
+  uint64_t bytes = 0;               // compressed bytes written (file size ~ this)
+  double media_duration_s = 0;      // duration of the file(s) when played
+  double capture_span_s = 0;        // capture time covered by the written frames
+  double capture_fps = 0;           // true capture rate (frames / capture span)
+  double slowmo_factor = 1;         // capture_fps / slowmo_output_fps (SlowMotion)
+  std::string last_error;
 };
 
 // ------------------------------------------------------------------ logs
@@ -423,6 +484,33 @@ class Client {
   bool resetParams();
   bool setDeviceName(const std::string& name);
   bool sendCommand(const Command& cmd);  // raw escape hatch
+
+  // ---- recording (see RecordOptions). Thread-safe, non-blocking except
+  // stopRecording() (waits for the writer to finalize the MP4, typically
+  // < 1 s). startRecording() fails if already recording or the file can't be
+  // created; it can be called before the stream starts (waits for it).
+  bool startRecording(const RecordOptions& opts, std::string* err = nullptr);
+  RecordStatus stopRecording();         // finalizes; returns the final status
+  RecordStatus recordingStatus() const;
+
+  // ---- slow-motion helper. Saves the phone's current values and sends, in
+  // this order: HighSpeedMode=1, VideoWidth/VideoHeight, Fps=fps (encoder at
+  // the full sensor rate), Bitrate=min(40 Mbps * pixels/720p, max),
+  // AdaptiveBitrate=false, LatencyDropPolicy=1 (queue, don't drop),
+  // MaxSendQueueFrames=min(32, max), KeyframeIntervalMs=1000 (some high-speed
+  // encoders ignore RequestKeyframe; bounds the wait for the first keyframe of
+  // a recording), FecPercent=0 on TCP; and sets
+  // ClientOptions::max_present_fps = 60 (decimated preview). Typical use:
+  //   prepareSlowMotion(240, 1280, 720); wait for VideoFormat fps == 240;
+  //   startRecording({.mode = SlowMotion, .slowmo_output_fps = 30}); ...
+  //   stopRecording(); endSlowMotion();   // restores everything
+  // Returns false if not connected. Params the phone lacks are skipped.
+  bool prepareSlowMotion(uint32_t fps = 240, uint32_t width = 1280, uint32_t height = 720);
+  // Restores the saved values (no-op if not prepared). If the session is
+  // down (phone closed / network lost), the values are re-applied right after
+  // the next connection's Capabilities.
+  bool endSlowMotion();
+  bool slowMotionActive() const;
 
   // ---- snapshots (thread-safe copies)
   bool deviceInfo(DeviceInfo& out) const;          // false before HelloAck

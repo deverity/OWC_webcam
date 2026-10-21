@@ -4,6 +4,7 @@
 #include "codec_select.h"
 #include "decoder.h"
 #include "metrics.h"
+#include "recorder.h"
 #include "sps_patch.h"
 #include "transform.h"
 #include "util.h"
@@ -296,6 +297,16 @@ struct Client::Impl {
   KeyframePolicy kfPolicy;
   std::atomic<uint32_t> kfRequests{0};
   std::atomic<int32_t> bframesParam{0};
+
+  // ---- recording / slow motion
+  Recorder recorder;
+  std::atomic<bool> decodeEnabled{true};   // false while recording with present=false
+  std::atomic<bool> decodeResume{false};   // decode thread: wait for a keyframe again
+  std::mutex slowMx;
+  bool slowActive = false;
+  std::vector<std::pair<ParamId, ParamValue>> slowSaved;
+  std::vector<std::pair<ParamId, ParamValue>> pendingRestore;  // endSlowMotion() while offline
+  uint32_t slowSavedMaxPresent = 0;
 
   // ---- codec negotiation
   std::atomic<uint32_t> blockedCodecs{0};   // codecBit()s that failed (until connect())
@@ -859,7 +870,11 @@ struct Client::Impl {
       }
       // keyframe policy
       {
-        const bool need = needKey.load() || forceKey.exchange(false);
+        // forceKey is cleared only once a request actually goes out (it used to
+        // be lost when the rate limiter said "not now"). The recorder keeps
+        // asking (paced by the policy) while it waits for its first keyframe.
+        const bool force = forceKey.load();
+        const bool need = needKey.load() || force || recorder.waitingForKeyframe();
         bool send;
         {
           std::lock_guard<std::mutex> lk(kfMx);
@@ -870,6 +885,7 @@ struct Client::Impl {
         if (send) {
           ++kfRequests;
           sendCmd(CommandId::RequestKeyframe);
+          if (force) forceKey = false;
         }
       }
       if (now - lastRx > static_cast<int64_t>(oc.idle_timeout_ms)) {
@@ -992,6 +1008,18 @@ struct Client::Impl {
           if (pd.id == ParamId::BFrames) bframesParam = static_cast<int32_t>(pd.current.i);
         capsSeen = true;
         negotiatePending = true;
+        {
+          // endSlowMotion() was called while disconnected: restore now.
+          std::vector<std::pair<ParamId, ParamValue>> restore;
+          {
+            std::lock_guard<std::mutex> lk(slowMx);
+            restore.swap(pendingRestore);
+          }
+          for (const auto& kv : restore)
+            sendMsg(MsgType::SetParam, encode(SetParam{kv.first, kv.second}));
+          if (!restore.empty())
+            logf(LogLevel::Info, "slow motion: restored %zu params after reconnect", restore.size());
+        }
         if (ev) ev->onCapabilities(c);
         break;
       }
@@ -1394,6 +1422,7 @@ struct Client::Impl {
   }
 
   void onFormat(Dec& ds, const VideoFormat& f) {
+    if (recorder.active()) recorder.onFormat(f);
     const bool sameGeometry = ds.haveFmt && ds.fmt.codec == f.codec && ds.fmt.width == f.width &&
                               ds.fmt.height == f.height;
     ds.fmt = f;
@@ -1417,7 +1446,12 @@ struct Client::Impl {
     std::deque<EarlyFrame> early;
     early.swap(ds.early);
     for (EarlyFrame& e : early)
-      if (e.f.epoch == static_cast<uint16_t>(f.epoch & 0xFFFF)) ds.ready.push_back(std::move(e));
+      if (e.f.epoch == static_cast<uint16_t>(f.epoch & 0xFFFF)) {
+        if (recorder.active())
+          recorder.onFrame(e.f.epoch, e.f.frame_seq, e.f.capture_ts_us, e.f.flags, e.f.data.data(),
+                           e.f.data.size());
+        ds.ready.push_back(std::move(e));
+      }
   }
 
   static constexpr uint32_t kBenchSkip = 10, kBenchFrames = 40;
@@ -1536,6 +1570,9 @@ struct Client::Impl {
         rx.capToArr.add(static_cast<double>(arrival - (static_cast<int64_t>(f.capture_ts_us) - offset)) / 1000.0);
     }
     if (ds.epochFirstDataUs == 0) ds.epochFirstDataUs = arrival;
+    // Recorder gets EVERY complete frame (presentation may drop some later).
+    if (recorder.active() && ds.haveFmt && f.epoch == static_cast<uint16_t>(ds.fmt.epoch & 0xFFFF))
+      recorder.onFrame(f.epoch, f.frame_seq, f.capture_ts_us, f.flags, f.data.data(), f.data.size());
     ds.ready.push_back(EarlyFrame{std::move(f), arrival});
   }
 
@@ -1548,6 +1585,14 @@ struct Client::Impl {
   //    jitter_buffer_ms), jump to the newest keyframe in the backlog, or drop
   //    it all, wait for a keyframe and request one (counted in frames_lost).
   void decodeReady(Dec& ds) {
+    if (decodeResume.exchange(false)) {
+      ds.waitKey = true;  // references were skipped while decoding was off
+      forceKey = true;
+    }
+    if (!decodeEnabled) {  // recording with present=false: the recorder already has them
+      ds.ready.clear();
+      return;
+    }
     if (ds.ready.empty()) return;
     const ClientOptions o = getOpt();
     const int64_t now = pcNowUs();
@@ -1601,8 +1646,11 @@ struct Client::Impl {
       // Present the newest frame of the backlog, plus one at least every 50 ms
       // so the published rate degrades to ~20 fps rather than collapsing.
       // (the extra presentations only while not behind: frame younger than maxAge/2).
-      const bool presentIt = newest || o.jitter_buffer_ms > 0 ||
+      bool presentIt = newest || o.jitter_buffer_ms > 0 ||
                              (t0 - ds.lastPresentUs >= 50000 && t0 - r.arrival_us < maxAge / 2);
+      if (presentIt && o.max_present_fps &&
+          t0 - ds.lastPresentUs < 1000000 / static_cast<int64_t>(o.max_present_fps))
+        presentIt = false;  // decimated preview (e.g. 240 fps slow-motion stream)
       if (presentIt) ds.lastPresentUs = t0;
       decodeFrame(ds, r.f, r.arrival_us, presentIt);
       if (ds.inputs == inputsBefore) continue;  // not submitted (waiting for keyframe, ...)
@@ -2292,6 +2340,123 @@ int64_t Client::phoneTimeToQpc(uint64_t phone_us) const {
   int64_t off = 0;
   if (!impl_->clockSynced(off)) return 0;
   return usToQpc(static_cast<int64_t>(phone_us) - off);
+}
+
+// ================================================================ recording
+bool Client::startRecording(const RecordOptions& opts, std::string* err) {
+  VideoFormat f;
+  const bool haveFmt = videoFormat(f);
+  std::string e;
+  if (!impl_->recorder.start(opts, haveFmt ? &f : nullptr, e)) {
+    if (err) *err = e;
+    impl_->logf(LogLevel::Error, "recording: %s", e.c_str());
+    return false;
+  }
+  if (!opts.present) impl_->decodeEnabled = false;
+  impl_->forceKey = true;  // a file starts at a keyframe: ask for one now (and keep asking)
+  const RecordStatus st = impl_->recorder.status();
+  impl_->logf(LogLevel::Info, "recording started (%s%s): %s",
+              opts.mode == RecordMode::SlowMotion ? "slow motion at " : "real time",
+              opts.mode == RecordMode::SlowMotion ? (std::to_string(opts.slowmo_output_fps) + " fps").c_str() : "",
+              st.path.c_str());
+  return true;
+}
+
+RecordStatus Client::stopRecording() {
+  const RecordStatus st = impl_->recorder.stop();
+  if (!impl_->decodeEnabled.exchange(true)) impl_->decodeResume = true;
+  if (!st.files.empty())
+    impl_->logf(LogLevel::Info,
+                "recording stopped: %llu frames written (%llu received, %llu dropped, %llu missing "
+                "in %u gaps), capture %.1f fps over %.2f s, plays %.2f s%s%s",
+                static_cast<unsigned long long>(st.frames_written),
+                static_cast<unsigned long long>(st.frames_received),
+                static_cast<unsigned long long>(st.frames_dropped),
+                static_cast<unsigned long long>(st.frames_missing), st.gaps, st.capture_fps,
+                st.capture_span_s, st.media_duration_s, st.last_error.empty() ? "" : ", error: ",
+                st.last_error.c_str());
+  return st;
+}
+
+RecordStatus Client::recordingStatus() const { return impl_->recorder.status(); }
+
+// ================================================================ slow motion
+bool Client::prepareSlowMotion(uint32_t fps, uint32_t width, uint32_t height) {
+  if (!impl_->sessionUp) return false;
+  ConnectParams cp = connectParams();
+  std::lock_guard<std::mutex> lk(impl_->slowMx);
+  struct Want {
+    ParamId id;
+    ParamValue v;
+  };
+  // 40 Mbps for 1280x720, scaled by pixel count, clamped to the phone's range.
+  double bitrate = 40e6 * (static_cast<double>(width) * height) / (1280.0 * 720.0);
+  ParamDesc d;
+  if (paramDesc(ParamId::Bitrate, d) && d.max > 0) bitrate = std::min(bitrate, d.max);
+  int32_t queue = 32;
+  if (paramDesc(ParamId::MaxSendQueueFrames, d) && d.max > 0)
+    queue = static_cast<int32_t>(std::min<double>(queue, d.max));
+  std::vector<Want> wants = {
+      {ParamId::HighSpeedMode, ParamValue::EnumV(1)},
+      {ParamId::VideoWidth, ParamValue::Int(static_cast<int32_t>(width))},
+      {ParamId::VideoHeight, ParamValue::Int(static_cast<int32_t>(height))},
+      {ParamId::Fps, ParamValue::Int(static_cast<int32_t>(fps))},
+      {ParamId::Bitrate, ParamValue::Int(static_cast<int32_t>(bitrate))},
+      {ParamId::AdaptiveBitrate, ParamValue::Bool(false)},
+      {ParamId::LatencyDropPolicy, ParamValue::EnumV(1)},
+      {ParamId::MaxSendQueueFrames, ParamValue::Int(queue)},
+      // The constrained high-speed encoder may ignore RequestKeyframe (seen on a
+      // Note 9): a 1 s GOP bounds the wait for the recording's first keyframe.
+      {ParamId::KeyframeIntervalMs, ParamValue::Int(1000)},
+  };
+  if (cp.transport == VideoTransport::Tcp) wants.push_back({ParamId::FecPercent, ParamValue::Int(0)});
+  if (!impl_->slowActive) {
+    impl_->slowSaved.clear();
+    for (const Want& w : wants) {
+      ParamValue cur;
+      if (paramValue(w.id, cur)) impl_->slowSaved.emplace_back(w.id, cur);
+    }
+    impl_->slowSavedMaxPresent = options().max_present_fps;
+  }
+  int sent = 0;
+  for (const Want& w : wants) {
+    ParamDesc pd;
+    if (!paramDesc(w.id, pd) || !(pd.flags & kParamSupported) || (pd.flags & kParamReadOnly)) continue;
+    if (setParam(w.id, w.v)) ++sent;
+  }
+  ClientOptions o = options();
+  o.max_present_fps = 60;
+  setOptions(o);
+  impl_->slowActive = true;
+  impl_->logf(LogLevel::Info, "slow motion: requested %ux%u @ %u fps, %.0f Mbps (%d params)", width,
+              height, fps, bitrate / 1e6, sent);
+  return true;
+}
+
+bool Client::endSlowMotion() {
+  std::lock_guard<std::mutex> lk(impl_->slowMx);
+  if (!impl_->slowActive) return false;
+  impl_->slowActive = false;
+  ClientOptions o = options();
+  o.max_present_fps = impl_->slowSavedMaxPresent;
+  setOptions(o);
+  if (!impl_->sessionUp) {
+    // Session lost (phone closed / network): re-apply on the next connection.
+    impl_->pendingRestore = impl_->slowSaved;
+    impl_->logf(LogLevel::Warn, "slow motion ended while disconnected: %zu params will be restored "
+                "on the next connection", impl_->pendingRestore.size());
+    return true;
+  }
+  int sent = 0;
+  for (const auto& kv : impl_->slowSaved)
+    if (setParam(kv.first, kv.second)) ++sent;
+  impl_->logf(LogLevel::Info, "slow motion ended: %d params restored", sent);
+  return sent > 0 || impl_->slowSaved.empty();
+}
+
+bool Client::slowMotionActive() const {
+  std::lock_guard<std::mutex> lk(impl_->slowMx);
+  return impl_->slowActive;
 }
 
 }  // namespace owc

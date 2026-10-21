@@ -13,7 +13,7 @@ if(EXISTS ${OWC_FAKEPHONE_DIR}/fake_phone.cpp)
     ${OWC_FAKEPHONE_DIR}/h264_encoder.cpp
     ${OWC_FAKEPHONE_DIR}/pattern.cpp)
   target_include_directories(owc_core_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src ${OWC_FAKEPHONE_DIR})
-  target_link_libraries(owc_core_integration_test PRIVATE owc_core ws2_32 mfplat mfuuid wmcodecdspuuid ole32 oleaut32)
+  target_link_libraries(owc_core_integration_test PRIVATE owc_core ws2_32 mfplat mfuuid mfreadwrite wmcodecdspuuid ole32 oleaut32)
   # Real-phone H.264 samples (Note 9 / Qualcomm) for the replay regression.
   target_compile_definitions(owc_core_integration_test PRIVATE
     OWC_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")

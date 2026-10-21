@@ -5,6 +5,10 @@
 //   owc_core_probe --connect host:port [--transport tcp|udp] [--seconds N]
 //                  [--set id=value]... [--decoder auto|hw|sw] [--shm]
 //                  [--no-patch] [--jitter MS]
+//                  [--record FILE.mp4|default [--slowmo OUT_FPS] [--record-seconds N]
+//                   [--prepare-slowmo FPS] [--no-present]]
+//       --prepare-slowmo calls Client::prepareSlowMotion(FPS) and starts the
+//       recording once the phone streams at FPS; endSlowMotion() at exit.
 //       Runs an owc::Client session and prints logs + stats every second.
 //       --set values: plain number = Int32; prefix B = Bool, L = Int64,
 //       F = Float, E = Enum (e.g. --set 18=E0 --set 2=1920 --set 29=F2.5).
@@ -119,6 +123,18 @@ struct Events : ClientEvents {
   }
 };
 
+void printRecord(const RecordStatus& r) {
+  std::printf("RECORDING %s: written %llu, received %llu, dropped %llu, missing %llu in %u gaps, "
+              "capture %.2f fps over %.2f s, plays %.2f s (x%.2f), %.2f MB%s%s\n",
+              r.path.c_str(), static_cast<unsigned long long>(r.frames_written),
+              static_cast<unsigned long long>(r.frames_received),
+              static_cast<unsigned long long>(r.frames_dropped),
+              static_cast<unsigned long long>(r.frames_missing), r.gaps, r.capture_fps,
+              r.capture_span_s, r.media_duration_s, r.slowmo_factor, static_cast<double>(r.bytes) / 1e6,
+              r.last_error.empty() ? "" : " ERROR ", r.last_error.c_str());
+  for (auto& f : r.files) std::printf("  file: %s\n", f.c_str());
+}
+
 int connectMode(int argc, char** argv) {
   ConnectParams cp;
   ClientOptions o;
@@ -126,6 +142,10 @@ int connectMode(int argc, char** argv) {
   o.auto_reconnect = false;
   int seconds = 10;
   std::vector<std::pair<ParamId, ParamValue>> sets;
+  std::string recordPath;
+  uint32_t slowmoFps = 0, prepareFps = 0;
+  int recordSeconds = 0;
+  bool noPresent = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -157,6 +177,16 @@ int connectMode(int argc, char** argv) {
       o.patch_sps = false;
     } else if (a == "--jitter") {
       o.jitter_buffer_ms = static_cast<uint32_t>(atoi(next()));
+    } else if (a == "--record") {
+      recordPath = next();
+    } else if (a == "--slowmo") {
+      slowmoFps = static_cast<uint32_t>(atoi(next()));
+    } else if (a == "--prepare-slowmo") {
+      prepareFps = static_cast<uint32_t>(atoi(next()));
+    } else if (a == "--record-seconds") {
+      recordSeconds = atoi(next());
+    } else if (a == "--no-present") {
+      noPresent = true;
     } else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
       return 2;
@@ -166,13 +196,37 @@ int connectMode(int argc, char** argv) {
   Events ev;
   Client client(&ev, o);
   client.connect(cp);
-  bool sent = false;
+  bool sent = false, recStarted = false, recStopped = false;
+  int recStartT = 0;
   uint64_t logId = 0;
   for (int t = 0; t < seconds * 10; ++t) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!sent && (client.state() == ClientState::Connected || client.state() == ClientState::Streaming)) {
       for (auto& kv : sets) client.setParam(kv.first, kv.second);
+      if (prepareFps) client.prepareSlowMotion(prepareFps);
       sent = true;
+    }
+    if (!recordPath.empty() && !recStarted && client.state() == ClientState::Streaming) {
+      VideoFormat vf;
+      if (client.videoFormat(vf) && (prepareFps == 0 || vf.fps == prepareFps)) {
+        RecordOptions ro;
+        ro.path = recordPath == "default" ? std::string() : recordPath;
+        ro.mode = slowmoFps ? RecordMode::SlowMotion : RecordMode::RealTime;
+        if (slowmoFps) ro.slowmo_output_fps = slowmoFps;
+        ro.present = !noPresent;
+        std::string err;
+        if (client.startRecording(ro, &err)) {
+          recStarted = true;
+          recStartT = t;
+        } else {
+          std::printf("startRecording failed: %s\n", err.c_str());
+          recordPath.clear();
+        }
+      }
+    }
+    if (recStarted && !recStopped && recordSeconds > 0 && t - recStartT >= recordSeconds * 10) {
+      printRecord(client.stopRecording());
+      recStopped = true;
     }
     for (const LogEntry& l : client.logs(logId)) {
       logId = l.id;
@@ -194,8 +248,25 @@ int connectMode(int argc, char** argv) {
           s.capture_to_arrival_ms_avg, s.capture_to_publish_ms_avg, s.capture_to_publish_ms_p95,
           s.rtt_ms, s.keyframe_requests, s.decoder_selection.empty() ? "" : " | ",
           s.decoder_selection.c_str(), s.phone.encode_fps, s.phone.send_queue, s.phone.dropped_frames);
+      if (recStarted && !recStopped) {
+        const RecordStatus r = client.recordingStatus();
+        std::printf("      [rec] state %d written %llu received %llu dropped %llu missing %llu capture %.1f fps media %.1f s %.1f MB %s\n",
+                    static_cast<int>(r.state), static_cast<unsigned long long>(r.frames_written),
+                    static_cast<unsigned long long>(r.frames_received),
+                    static_cast<unsigned long long>(r.frames_dropped),
+                    static_cast<unsigned long long>(r.frames_missing), r.capture_fps,
+                    r.media_duration_s, static_cast<double>(r.bytes) / 1e6, r.last_error.c_str());
+      }
       std::fflush(stdout);
     }
+  }
+  if (recStarted && !recStopped) printRecord(client.stopRecording());
+  if (client.slowMotionActive()) {
+    client.endSlowMotion();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // let the phone apply + answer
+    for (const LogEntry& l : client.logs(logId))
+      std::printf("[log %s %d] %s\n", l.source == LogSource::Phone ? "phone" : "pc",
+                  static_cast<int>(l.level), l.text.c_str());
   }
   const uint64_t frames = ev.frames;
   client.disconnect();
