@@ -1,6 +1,7 @@
 #include <owc/client.h>
 
 #include "annexb.h"
+#include "codec_select.h"
 #include "decoder.h"
 #include "metrics.h"
 #include "sps_patch.h"
@@ -8,6 +9,9 @@
 #include "util.h"
 
 #include <owc/shm.h>
+
+#include <dxgi.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -69,9 +73,11 @@ namespace {
 
 constexpr size_t kLogCap = 1000;
 constexpr size_t kMaxQueuedDatagrams = 8192;  // ~11 MB worst case
-constexpr size_t kMaxQueuedFrames = 8;        // TCP frames waiting for the decoder
+constexpr size_t kMaxQueuedFrames = 240;      // TCP frames queued: memory safety net only (the
+                                              // latency policy is decodeReady, age-based)
 constexpr size_t kMaxJitterFrames = 64;
 constexpr int64_t kKeyGraceUs = 150000;       // don't request IDR right at stream start
+constexpr int64_t kMaxBacklogUs = 100000;     // + jitter_buffer_ms: oldest undecoded frame age
 
 // FrameAssembler::Counters::frames_recovered appears when FEC lands in protocol/.
 template <class T, class = void>
@@ -137,6 +143,71 @@ class FragLoss {
 
 }  // namespace
 
+// ================================================================ capabilities
+namespace {
+
+std::mutex g_capsMx;
+bool g_capsProbed = false;
+DecoderCapabilities g_caps;
+bool g_capsOverridden = false;
+DecoderCapabilities g_capsOverride;
+
+DecoderCapabilities probeDecoders() {
+  DecoderCapabilities caps;
+  // Own thread: needs COM MTA + MFStartup regardless of the caller's apartment.
+  std::thread([&caps] {
+    MfThreadScope mf;
+    if (!mf.ok()) return;
+    for (Codec c : {Codec::H264, Codec::Hevc, Codec::Av1}) {
+      DecoderCapabilities::Entry& e =
+          c == Codec::H264 ? caps.h264 : c == Codec::Hevc ? caps.hevc : caps.av1;
+      for (DecoderMode m : {DecoderMode::Hardware, DecoderMode::Software}) {
+        MfDecoder d;
+        DecoderConfig cfg;
+        cfg.codec = c;
+        cfg.width = 1920;
+        cfg.height = 1080;
+        cfg.mode = m;
+        std::string err;
+        if (!d.open(cfg, err)) continue;
+        if (m == DecoderMode::Hardware && d.d3dConfigured()) e.hardware = true;
+        if (m == DecoderMode::Software) e.software = true;
+        if (e.mft_name.empty()) e.mft_name = d.mftName();
+        d.close();
+      }
+    }
+    Microsoft::WRL::ComPtr<IDXGIFactory1> f;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumAdapters1(0, &a))) {
+      DXGI_ADAPTER_DESC1 d{};
+      if (SUCCEEDED(a->GetDesc1(&d))) {
+        caps.adapter = wideToUtf8(d.Description);
+        caps.dedicated_video_memory = d.DedicatedVideoMemory;
+        caps.adapter_discrete = d.DedicatedVideoMemory >= (512ull << 20);
+      }
+    }
+  }).join();
+  return caps;
+}
+
+}  // namespace
+
+DecoderCapabilities Client::decoderCapabilities() {
+  std::lock_guard<std::mutex> lk(g_capsMx);
+  if (g_capsOverridden) return g_capsOverride;
+  if (!g_capsProbed) {
+    g_caps = probeDecoders();
+    g_capsProbed = true;
+  }
+  return g_caps;
+}
+
+void Client::overrideDecoderCapabilitiesForTest(const DecoderCapabilities* caps) {
+  std::lock_guard<std::mutex> lk(g_capsMx);
+  g_capsOverridden = caps != nullptr;
+  if (caps) g_capsOverride = *caps;
+}
+
 // ================================================================ Impl
 struct Client::Impl {
   ClientEvents* ev = nullptr;
@@ -195,6 +266,7 @@ struct Client::Impl {
     uint64_t frames_received = 0, frames_lost_extra = 0;
     uint64_t asm_frames_lost = 0, fragments_received = 0, fragments_lost = 0, recovered = 0;
     uint64_t datagrams_dropped = 0;
+    uint64_t notPresented = 0, backlogDrops = 0;
     RateMeter rxFps, rxBits, decFps, pubFps;
     JitterEstimator jitter;
     DelayTrend trend{20};
@@ -202,7 +274,8 @@ struct Client::Impl {
     uint32_t decDelayMax = 0;
     uint64_t frames_decoded = 0, frames_published = 0;
     bool decoderHw = false, decoderLL = false, bframes = false, spsPatched = false;
-    std::string decName, decErr, decSelection, shmError;
+    std::string decName, decErr, decSelection, shmError, codecSel;
+    Codec requestedCodec = Codec::H264;
     bool shmPublishing = false;
     uint32_t colorMatrix = 0;
     bool fullRange = false;
@@ -223,6 +296,12 @@ struct Client::Impl {
   KeyframePolicy kfPolicy;
   std::atomic<uint32_t> kfRequests{0};
   std::atomic<int32_t> bframesParam{0};
+
+  // ---- codec negotiation
+  std::atomic<uint32_t> blockedCodecs{0};   // codecBit()s that failed (until connect())
+  std::atomic<int> codecFailure{-1};        // set by the decode thread: Codec that failed
+  Codec requestedCodec = Codec::H264;       // net thread
+  bool capsSeen = false, negotiatePending = false;  // net thread, per session
 
   // ---- decode queue (qMx)
   std::mutex qMx;
@@ -701,6 +780,8 @@ struct Client::Impl {
       rx.trend.reset();
     }
     punched = false;
+    capsSeen = negotiatePending = false;
+    codecFailure = -1;
     needKey = false;
     WorkItem start;
     start.kind = WorkItem::SessionStart;
@@ -747,7 +828,20 @@ struct Client::Impl {
         sendPunch(udpPeer, ack.session_id);
         nextPunch = now + (punched ? 1000 : 200);
       }
-      if (!startSent && wantStreaming &&
+      {
+        const int cf = codecFailure.exchange(-1);
+        if (cf >= 0 && cf != static_cast<int>(Codec::H264)) {
+          blockedCodecs |= codecBit(static_cast<Codec>(cf));
+          logf(LogLevel::Warn, "%s does not work here (decoder failed): falling back to H.264",
+               codecName(static_cast<Codec>(cf)));
+          negotiatePending = true;
+        }
+      }
+      if (negotiatePending) {
+        negotiatePending = false;
+        negotiateCodec(ack.codec_mask, oc);
+      }
+      if (!startSent && wantStreaming && (capsSeen || now - t0 > 500) &&
           (p.transport == VideoTransport::Tcp || punched || now - t0 > 1000)) {
         if (sendCmd(CommandId::StartStream)) startSent = true;
       }
@@ -830,6 +924,37 @@ struct Client::Impl {
     return res;
   }
 
+  // Net thread: decide the codec and ask the phone for it if needed.
+  void negotiateCodec(uint32_t phoneMask, const ClientOptions& o) {
+    CodecChoice ch = chooseCodec(o.codec_preference, phoneMask, Client::decoderCapabilities(),
+                                 blockedCodecs.load());
+    ParamDesc vc;
+    bool haveParam = false;
+    {
+      std::lock_guard<std::mutex> lk(stMx);
+      for (const ParamDesc& pd : caps.params)
+        if (pd.id == ParamId::VideoCodec && (pd.flags & kParamSupported)) {
+          vc = pd;
+          haveParam = true;
+        }
+    }
+    if (!haveParam && ch.codec != Codec::H264) {
+      ch.reason += " - but the phone has no VideoCodec param: H.264";
+      ch.codec = Codec::H264;
+    }
+    const bool changed = ch.codec != requestedCodec;
+    requestedCodec = ch.codec;
+    if (haveParam && vc.current.i != static_cast<int64_t>(ch.codec))
+      sendMsg(MsgType::SetParam,
+              encode(SetParam{ParamId::VideoCodec, ParamValue::EnumV(static_cast<int32_t>(ch.codec))}));
+    {
+      std::lock_guard<std::mutex> lk(statMx);
+      if (rx.codecSel != ch.reason || changed) logf(LogLevel::Info, "codec %s", ch.reason.c_str());
+      rx.codecSel = ch.reason;
+      rx.requestedCodec = ch.codec;
+    }
+  }
+
   // Returns false to end the session (res filled).
   bool handleMsg(const TcpFrameParser::Message& m, int64_t trecv, SessionResult& res) {
     const uint8_t* d = m.payload.data();
@@ -865,6 +990,8 @@ struct Client::Impl {
         }
         for (const ParamDesc& pd : c.params)
           if (pd.id == ParamId::BFrames) bframesParam = static_cast<int32_t>(pd.current.i);
+        capsSeen = true;
+        negotiatePending = true;
         if (ev) ev->onCapabilities(c);
         break;
       }
@@ -877,6 +1004,12 @@ struct Client::Impl {
             if (pd.id == ps.id) pd.current = ps.value;
         }
         if (ps.id == ParamId::BFrames) bframesParam = static_cast<int32_t>(ps.value.i);
+        if (ps.id == ParamId::VideoCodec && ps.status != ParamStatus::Ok &&
+            requestedCodec != Codec::H264 && ps.value.i != static_cast<int64_t>(requestedCodec)) {
+          blockedCodecs |= codecBit(requestedCodec);
+          logf(LogLevel::Warn, "phone rejected %s: falling back to H.264", codecName(requestedCodec));
+          negotiatePending = true;
+        }
         if (ps.status != ParamStatus::Ok)
           logf(LogLevel::Warn, "phone rejected %s (status %d)", owc::toString(ps.id),
                static_cast<int>(ps.status));
@@ -1097,6 +1230,17 @@ struct Client::Impl {
     double benchMs[2] = {0, 0};
     uint32_t benchN[2] = {0, 0};
     uint32_t framesSinceOpen = 0;
+    uint32_t inputsSinceOpen = 0, outputsSinceOpen = 0;
+    bool codecFailReported = false;
+    // Latency-first decode backlog (see decodeReady)
+    std::deque<EarlyFrame> ready;   // complete frames not decoded yet (oldest first)
+    bool presentNext = true;        // present the output of the frame being decoded
+    int64_t backlogWindowStart = 0;
+    uint32_t backlogDropsInWindow = 0;
+    int64_t lastReevalUs = 0;
+    int64_t lastBacklogLogUs = 0;
+    double frameCostUs = 0;
+    int64_t lastPresentUs = 0;     // EMA of decodeFrame() duration (decode + present when presented)
   };
 
   void decMain() {
@@ -1120,6 +1264,7 @@ struct Client::Impl {
         qFrames = qDatagrams = 0;
       }
       for (WorkItem& w : batch) process(ds, w);
+      decodeReady(ds);
       presentDue(ds, false);
       // liveness
       const ClientOptions o = getOpt();
@@ -1162,6 +1307,7 @@ struct Client::Impl {
         ds.haveFmt = false;
         ds.waitKey = true;
         ds.early.clear();
+        ds.ready.clear();
         ds.jb.clear();
         ds.inflight.clear();
         ds.haveLastTs = false;
@@ -1173,6 +1319,7 @@ struct Client::Impl {
         if (ds.decoder.isOpen()) ds.decoder.flush();
         break;
       case WorkItem::StreamEnd:
+        ds.ready.clear();
         presentDue(ds, true);
         ds.jb.clear();
         if (ds.shmActive) {
@@ -1184,6 +1331,7 @@ struct Client::Impl {
         needKey = false;
         break;
       case WorkItem::Format:
+        decodeReady(ds);  // frames of the previous epoch first
         onFormat(ds, w.fmt);
         break;
       case WorkItem::Frame: {
@@ -1269,7 +1417,7 @@ struct Client::Impl {
     std::deque<EarlyFrame> early;
     early.swap(ds.early);
     for (EarlyFrame& e : early)
-      if (e.f.epoch == static_cast<uint16_t>(f.epoch & 0xFFFF)) onCompleteFrame(ds, e.f, e.arrival_us);
+      if (e.f.epoch == static_cast<uint16_t>(f.epoch & 0xFFFF)) ds.ready.push_back(std::move(e));
   }
 
   static constexpr uint32_t kBenchSkip = 10, kBenchFrames = 40;
@@ -1346,6 +1494,8 @@ struct Client::Impl {
       dc.mode = ds.autoPhase == 1 ? DecoderMode::Software
                                   : ds.autoPhase == 2 ? ds.autoChoice : DecoderMode::Auto;
     ds.framesSinceOpen = 0;
+    ds.inputsSinceOpen = ds.outputsSinceOpen = 0;
+    ds.codecFailReported = false;
     // Measured with the Microsoft H.264 MFT: low-latency OFF buffers a whole
     // DPB (14-19 frames); ON still outputs B-frame streams in display order.
     dc.low_latency = o.low_latency_decode;
@@ -1367,6 +1517,7 @@ struct Client::Impl {
     } else {
       ds.decoderFailed = true;
       if (err != ds.lastOpenErr) logf(LogLevel::Error, "decoder open failed: %s", err.c_str());
+      if (ds.fmt.codec != Codec::H264) codecFailure = static_cast<int>(ds.fmt.codec);
     }
     ds.lastOpenErr = ok ? std::string() : err;
   }
@@ -1385,11 +1536,124 @@ struct Client::Impl {
         rx.capToArr.add(static_cast<double>(arrival - (static_cast<int64_t>(f.capture_ts_us) - offset)) / 1000.0);
     }
     if (ds.epochFirstDataUs == 0) ds.epochFirstDataUs = arrival;
+    ds.ready.push_back(EarlyFrame{std::move(f), arrival});
+  }
+
+  // Latency-first decode of the complete frames gathered from one batch:
+  //  * every frame is DECODED (keeps references valid, no IDR needed), but only
+  //    the newest is read back / transformed / published / sent to onFrame
+  //    (+ all of them when a jitter buffer is configured) -> when the PC
+  //    can't keep up, the published fps degrades and latency stays bounded;
+  //  * if even decode-only falls behind (oldest frame older than 100 ms +
+  //    jitter_buffer_ms), jump to the newest keyframe in the backlog, or drop
+  //    it all, wait for a keyframe and request one (counted in frames_lost).
+  void decodeReady(Dec& ds) {
+    if (ds.ready.empty()) return;
+    const ClientOptions o = getOpt();
+    const int64_t now = pcNowUs();
+    const int64_t maxAge = kMaxBacklogUs + static_cast<int64_t>(o.jitter_buffer_ms) * 1000;
+    // Predictive: age of the oldest frame + time to get through the backlog.
+    // Soft limit: jump to the newest keyframe already in the backlog (free).
+    // Hard limit (1.5x): decode-only can't keep up at all -> drop everything,
+    // wait for a keyframe and request one (an IDR costs bandwidth and a round
+    // trip, so it is the last resort).
+    const int64_t backlogCost = static_cast<int64_t>(ds.frameCostUs * static_cast<double>(ds.ready.size()));
+    const int64_t projected = now - ds.ready.front().arrival_us + backlogCost;
+    size_t keyIdx = ds.ready.size();
+    for (size_t i = ds.ready.size(); i-- > 0;)
+      if (ds.ready[i].f.flags & kFrameKey) {
+        keyIdx = i;
+        break;
+      }
+    size_t drop = 0;
+    if (ds.ready.size() > 1 && projected > maxAge && keyIdx < ds.ready.size()) {
+      drop = keyIdx;  // everything before the newest keyframe (never the keyframe itself)
+    } else if (ds.ready.size() > 1 && projected > maxAge + maxAge / 2 &&
+               keyIdx == ds.ready.size() && !ds.waitKey) {
+      // The cost estimate only learns from delta frames, so keyframe/decoder
+      // re-open spikes can't trigger an IDR-request loop. While waiting for a
+      // keyframe, deltas are skipped anyway.
+      drop = ds.ready.size();
+      ds.waitKey = true;
+      forceKey = true;
+    }
+    if (drop) {
+      for (size_t i = 0; i < drop; ++i) ds.ready.pop_front();
+      {
+        std::lock_guard<std::mutex> lk(statMx);
+        rx.frames_lost_extra += drop;
+        ++rx.backlogDrops;
+      }
+      if (now - ds.lastBacklogLogUs > 1000000) {
+        ds.lastBacklogLogUs = now;
+        logf(LogLevel::Warn, "decoder can't keep up: dropped %zu backlog frame(s) (%s)", drop,
+             ds.ready.empty() ? "requesting keyframe" : "jumped to keyframe");
+      }
+      noteBacklogDrop(ds, now);
+    }
+    while (!ds.ready.empty()) {
+      EarlyFrame r = std::move(ds.ready.front());
+      ds.ready.pop_front();
+      const bool newest = ds.ready.empty();
+      const bool isKey = (r.f.flags & kFrameKey) != 0;
+      const uint64_t inputsBefore = ds.inputs;
+      const int64_t t0 = pcNowUs();
+      // Present the newest frame of the backlog, plus one at least every 50 ms
+      // so the published rate degrades to ~20 fps rather than collapsing.
+      // (the extra presentations only while not behind: frame younger than maxAge/2).
+      const bool presentIt = newest || o.jitter_buffer_ms > 0 ||
+                             (t0 - ds.lastPresentUs >= 50000 && t0 - r.arrival_us < maxAge / 2);
+      if (presentIt) ds.lastPresentUs = t0;
+      decodeFrame(ds, r.f, r.arrival_us, presentIt);
+      if (ds.inputs == inputsBefore) continue;  // not submitted (waiting for keyframe, ...)
+      const double cost = static_cast<double>(pcNowUs() - t0);
+      // steady-state cost: keyframes (and decoder re-opens on them) are outliers
+      if (!isKey) ds.frameCostUs = ds.frameCostUs == 0 ? cost : ds.frameCostUs * 0.9 + cost * 0.1;
+      // Auto HW/SW benchmark on the real per-frame cost (decode + read-back +
+      // transform + publish when presented): what limits throughput.
+      autoBench(ds, cost / 1000.0);
+    }
+  }
+
+  // Auto mode: repeated backlog drops => the chosen path can't keep up with
+  // this stream (e.g. 1080p120): re-run the HW/SW benchmark (at most every 30 s).
+  void noteBacklogDrop(Dec& ds, int64_t now) {
+    if (now - ds.backlogWindowStart > 5000000) {
+      ds.backlogWindowStart = now;
+      ds.backlogDropsInWindow = 0;
+    }
+    ++ds.backlogDropsInWindow;
+    if (getOpt().decoder_mode != DecoderMode::Auto || ds.autoPhase < 2) return;
+    if (ds.backlogDropsInWindow < 2 || now - ds.lastReevalUs < 10000000) return;
+    // Switch to the other path only if it was MEASURED faster than what the
+    // current one costs now (never go back to a path known to be slower).
+    const bool onSw = ds.autoChoice == DecoderMode::Software;
+    const int other = onSw ? 0 : 1;  // benchMs index: 0 = HW, 1 = SW
+    if (ds.benchN[other] == 0) return;
+    const double otherMs = ds.benchMs[other] / ds.benchN[other];
+    const double currentMs = ds.frameCostUs / 1000.0;
+    if (!(otherMs < currentMs * 0.8)) return;
+    ds.lastReevalUs = now;
+    ds.autoChoice = onSw ? DecoderMode::Hardware : DecoderMode::Software;
+    ds.reopen = true;
+    forceKey = true;
+    char msg[160];
+    snprintf(msg, sizeof(msg), "auto: %s can't keep up with %u fps (%.1f ms/frame), switching to %s (%.1f ms)",
+             onSw ? "software" : "hardware", ds.fmt.fps, currentMs, onSw ? "hardware" : "software",
+             otherMs);
+    logf(LogLevel::Info, "decoder %s", msg);
+    std::lock_guard<std::mutex> lk(statMx);
+    rx.decSelection = msg;
+  }
+
+  void decodeFrame(Dec& ds, FrameAssembler::Frame& f, int64_t arrival, bool present) {
     if (!ds.haveFmt || f.epoch != static_cast<uint16_t>(ds.fmt.epoch & 0xFFFF)) {
       if (ds.early.size() < 16) ds.early.push_back(EarlyFrame{std::move(f), arrival});
       return;
     }
-    if (f.flags & kFrameConfig) {
+    // AV1 is not Annex-B (OBUs): no NAL processing (csd prepend / SPS patch / colour).
+    const bool annexB = ds.fmt.codec != Codec::Av1;
+    if ((f.flags & kFrameConfig) && annexB) {
       // kFrameConfig = "the AU carries codec config". The Android encoder sets
       // it (together with kFrameKey) on IDRs with SPS/PPS prepended, so it is
       // NOT necessarily config-only: refresh the csd from its parameter sets
@@ -1445,7 +1709,7 @@ struct Client::Impl {
     const uint8_t* au = f.data.data();
     size_t auLen = f.data.size();
     const bool patch = getOpt().patch_sps && !ds.bframes;
-    if (key && (!ds.csd.empty() || patch)) {
+    if (key && annexB && (!ds.csd.empty() || patch)) {
       ds.auBuf.clear();
       if (!hasSps(ds.fmt.codec, au, auLen)) ds.auBuf.insert(ds.auBuf.end(), ds.csd.begin(), ds.csd.end());
       ds.auBuf.insert(ds.auBuf.end(), au, au + auLen);
@@ -1462,6 +1726,7 @@ struct Client::Impl {
     InFlight inf;
     inf.sample_time = static_cast<int64_t>(f.capture_ts_us) * 10;
     inf.input_idx = ds.inputs++;
+    ++ds.inputsSinceOpen;
     inf.seq = f.frame_seq;
     inf.epoch = ds.fmt.epoch;
     inf.capture_ts = f.capture_ts_us;
@@ -1470,8 +1735,10 @@ struct Client::Impl {
     ds.inflight.push_back(inf);
     while (ds.inflight.size() > 64) ds.inflight.pop_front();
     const int64_t dur = 10000000 / std::max<int64_t>(1, ds.fmt.fps ? ds.fmt.fps : 30);
+    ds.presentNext = present;
     const bool ok = ds.decoder.decode(au, auLen, inf.sample_time, dur, key,
-                                      [&](const DecodedImage& img) { onDecoded(ds, img); });
+                                      [&](const DecodedImage& img) { onDecoded(ds, img); },
+                                      present);
     if (!ok) {
       ++ds.errors;
       logf(LogLevel::Warn, "decode error on frame %u (%d in a row): %s", f.frame_seq, ds.errors,
@@ -1480,9 +1747,21 @@ struct Client::Impl {
       ds.inflight.clear();
         ds.waitKey = true;
       if (ds.errors >= 3) ds.reopen = true;
+      if (ds.errors >= 3 && ds.fmt.codec != Codec::H264 && !ds.codecFailReported) {
+        ds.codecFailReported = true;
+        codecFailure = static_cast<int>(ds.fmt.codec);
+      }
     } else {
       ds.errors = 0;
       if (key) ds.waitKey = false;
+    }
+    // HEVC/AV1 accepted by the MFT but nothing comes out: treat as unusable.
+    if (ds.fmt.codec != Codec::H264 && !ds.codecFailReported && ds.inputsSinceOpen >= 60 &&
+        ds.outputsSinceOpen == 0) {
+      ds.codecFailReported = true;
+      codecFailure = static_cast<int>(ds.fmt.codec);
+      logf(LogLevel::Warn, "%s decoder produced no output after %u frames", codecName(ds.fmt.codec),
+           ds.inputsSinceOpen);
     }
     // MF_E_TRANSFORM_STREAM_CHANGE storm -> ask for a clean keyframe.
     const uint32_t sc = ds.decoder.streamChanges();
@@ -1533,6 +1812,7 @@ struct Client::Impl {
       meta.submit_us = now;
       meta.epoch = ds.fmt.epoch;
     }
+    ++ds.outputsSinceOpen;
     const uint64_t delayFrames = ds.inputs - 1 - meta.input_idx;
     {
       std::lock_guard<std::mutex> lk(statMx);
@@ -1544,8 +1824,9 @@ struct Client::Impl {
       rx.decDelay.add(static_cast<double>(delayFrames));
       rx.decDelayMax = std::max<uint32_t>(rx.decDelayMax, static_cast<uint32_t>(delayFrames));
       rx.decoderHw = ds.decoder.hardware();
+      if (!ds.presentNext || !img.y) ++rx.notPresented;
     }
-    autoBench(ds, static_cast<double>(now - meta.submit_us) / 1000.0);
+    if (!ds.presentNext || !img.y) return;  // decoded only (backlog): not presented
     const uint32_t jbMs = getOpt().jitter_buffer_ms;
     if (jbMs == 0) {
       if (!ds.jb.empty()) presentDue(ds, true);
@@ -1785,6 +2066,7 @@ bool Client::connect(const ConnectParams& p) {
   std::lock_guard<std::mutex> lk(impl_->ctlMx);
   impl_->params = p;
   impl_->wantConnected = true;
+  impl_->blockedCodecs = 0;  // a new connect() may retry HEVC/AV1
   ++impl_->gen;
   impl_->ctlCv.notify_all();
   return true;
@@ -1960,6 +2242,8 @@ ClientStats Client::stats() const {
     s.decoder_name = r.decName;
     s.decoder_error = r.decErr;
     s.decoder_selection = r.decSelection;
+    s.codec_selection = r.codecSel;
+    s.requested_codec = r.requestedCodec;
     s.shm_publishing = r.shmPublishing;
     s.shm_error = r.shmError;
     s.color_matrix = r.colorMatrix;
@@ -1978,6 +2262,8 @@ ClientStats Client::stats() const {
     s.capture_to_publish_ms_p95 = r.capToPub.percentile(95);
     s.capture_to_arrival_ms_avg = r.capToArr.avg();
     s.jitter_buffer_frames = r.jbFrames;
+    s.frames_not_presented = r.notPresented;
+    s.backlog_drops = r.backlogDrops;
   }
   return s;
 }

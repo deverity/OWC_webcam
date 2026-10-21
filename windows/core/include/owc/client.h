@@ -91,6 +91,33 @@ enum class DecoderMode : uint8_t {
 
 enum class LogSource : uint8_t { Client = 0, Phone = 1 };
 
+// Which codec the client asks the phone for (ClientOptions::codec_preference).
+//   Auto: first of AV1 > HEVC that the phone advertises (HelloAck codec_mask)
+//         AND this PC can decode IN HARDWARE; otherwise H.264 (always works).
+//   H264/Hevc/Av1: that codec if the phone advertises it and this PC can decode
+//         it (hardware or software), else H.264.
+// The choice is sent as SetParam(VideoCodec) before StartStream, only when it
+// differs from the phone's current value. If the phone rejects it, or decoding
+// it fails at runtime (decoder can't open / repeated errors / no output), the
+// client falls back to H.264 automatically and remembers that codec as
+// unusable for the rest of this Client's life (until disconnect()).
+enum class CodecPreference : uint8_t { Auto = 0, H264 = 1, Hevc = 2, Av1 = 3 };
+
+// What this PC can decode (Media Foundation), probed once per process.
+struct DecoderCapabilities {
+  struct Entry {
+    bool hardware = false;   // D3D11-accelerated MFT available
+    bool software = false;   // software MFT available
+    std::string mft_name;    // e.g. "Microsoft H264 Video Decoder MFT"
+    bool any() const { return hardware || software; }
+  };
+  Entry h264, hevc, av1;     // HEVC needs "HEVC Video Extensions", AV1 "AV1 Video Extension"
+  std::string adapter;       // default D3D11 adapter description
+  bool adapter_discrete = false;  // dedicated video memory >= 512 MB
+  uint64_t dedicated_video_memory = 0;
+  const Entry& get(Codec c) const { return c == Codec::Hevc ? hevc : c == Codec::Av1 ? av1 : h264; }
+};
+
 const char* toString(ClientState);
 const char* toString(DisconnectReason);
 const char* toString(DecoderMode);
@@ -160,8 +187,14 @@ struct ClientOptions {
   bool auto_reconnect = true;
   uint32_t reconnect_delay_ms = 1000;
 
-  // Send StartStream as soon as the session is up. Effect: next connect.
+  // Send StartStream as soon as the session is up (after Capabilities, so the
+  // codec can be negotiated first; at most 500 ms later). Effect: next connect.
   bool auto_start_stream = true;
+
+  // Codec negotiation (see CodecPreference). Effect: next connect / next
+  // Capabilities from the phone. Latency: HEVC/AV1 save bitrate at equal
+  // quality; on hardware decoders latency is the same as H.264.
+  CodecPreference codec_preference = CodecPreference::Auto;
 
   // Publish decoded frames to the shared-memory bus (owc_virtualcam / OBS
   // plugin read it). Only ONE producer per Windows session should publish.
@@ -300,6 +333,9 @@ struct ClientStats {
   std::string decoder_name;
   std::string decoder_error;     // e.g. "HEVC decoder not installed (HEVC Video Extensions)"
   std::string decoder_selection; // Auto-mode benchmark result, e.g. "auto: software 5.4 ms vs hardware 21.0 ms -> software"
+  std::string codec_selection;   // e.g. "auto: HEVC (hardware decoder present)",
+                                 // "auto: H.264 (no HEVC decoder: install 'HEVC Video Extensions')"
+  Codec requested_codec = Codec::H264;  // what the client asked the phone for
   double decoded_fps = 0;
   double published_fps = 0;
   uint64_t frames_decoded = 0;
@@ -314,6 +350,10 @@ struct ClientStats {
   double capture_to_publish_ms_avg = 0, capture_to_publish_ms_p95 = 0;  // end-to-end estimate
   double capture_to_arrival_ms_avg = 0;  // phone encode + send + network
   uint32_t jitter_buffer_frames = 0;     // frames currently held by the jitter buffer
+  // Latency-first overload handling (PC slower than the stream, e.g. 1080p120):
+  uint64_t frames_not_presented = 0;     // decoded but not published (a newer frame was ready)
+  uint64_t backlog_drops = 0;            // times the backlog (> 100 ms + jitter buffer) was
+                                         // dropped to the newest keyframe / an IDR request
 
   // shared-memory output
   bool shm_publishing = false;   // this client owns the bus and publishes
@@ -398,6 +438,13 @@ class Client {
   // Copies the newest output frame if its frame_number != lastSeen.
   // Requires options().keep_latest_frame. Returns false if nothing new.
   bool copyLatestFrame(FrameCopy& out, uint64_t lastSeen) const;
+
+  // What this PC can decode (probed once per process on first call, ~100-300
+  // ms; thread-safe; later calls return the cached result).
+  static DecoderCapabilities decoderCapabilities();
+  // TEST HOOK: replaces the probed capabilities (nullptr = back to the real
+  // probe). Affects codec negotiation of every Client in the process.
+  static void overrideDecoderCapabilitiesForTest(const DecoderCapabilities* caps);
 
   // Converts a phone capture timestamp to PC QPC using the current clock
   // offset (0 if not synced). Useful to compute latency at display time.

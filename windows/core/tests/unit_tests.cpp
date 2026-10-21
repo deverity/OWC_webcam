@@ -3,6 +3,7 @@
 #include "test_util.h"
 
 #include "annexb.h"
+#include "codec_select.h"
 #include "metrics.h"
 #include "transform.h"
 #include "util.h"
@@ -10,6 +11,8 @@
 #include "pattern.h"
 
 #include <owc/adb.h>
+#include <owc/discovery.h>
+#include <owc/firewall.h>
 #include <owc/presets.h>
 
 #include <cmath>
@@ -345,6 +348,77 @@ void testPresets() {
   for (auto& x : p) CHECK(x.name && x.name[0] && x.key && x.key[0]);
 }
 
+void testDiscoveryHelpers() {
+  auto h = Discovery::subnetHosts("192.168.0.77/24");
+  CHECK(h.size() == 254 && h.front() == "192.168.0.1" && h.back() == "192.168.0.254");
+  CHECK(Discovery::subnetHosts("10.1.4.9/22").size() == 1022);
+  CHECK(Discovery::subnetHosts("10.1.4.9/22").front() == "10.1.4.1");
+  CHECK(Discovery::subnetHosts("10.0.0.0/21").empty());  // too big
+  CHECK(Discovery::subnetHosts("127.0.0.0/29").size() == 6);
+  CHECK(Discovery::subnetHosts("1.2.3.4/32").size() == 1);
+  CHECK(Discovery::subnetHosts("garbage").empty());
+  CHECK(Discovery::subnetHosts("1.2.3.4/33").empty());
+  auto ip = [](int a, int b, int c, int d) {
+    return (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(b) << 16) |
+           (static_cast<uint32_t>(c) << 8) | static_cast<uint32_t>(d);
+  };
+  CHECK(Discovery::isPrivateIPv4(ip(192, 168, 0, 142)));
+  CHECK(Discovery::isPrivateIPv4(ip(10, 140, 29, 7)));
+  CHECK(Discovery::isPrivateIPv4(ip(172, 20, 47, 1)) && Discovery::isPrivateIPv4(ip(172, 31, 255, 1)));
+  CHECK(!Discovery::isPrivateIPv4(ip(172, 32, 0, 1)) && !Discovery::isPrivateIPv4(ip(8, 8, 8, 8)));
+  CHECK(Discovery::isVirtualAdapter("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter"));
+  CHECK(Discovery::isVirtualAdapter("Ethernet 3", "TAP-Windows Adapter V9"));
+  CHECK(Discovery::isVirtualAdapter("NordLynx", "NordLynx Tunnel"));
+  CHECK(!Discovery::isVirtualAdapter("Wi-Fi", "Intel(R) Wi-Fi 6 AX201 160MHz"));
+  CHECK(!Discovery::isVirtualAdapter("Ethernet", "Realtek PCIe GbE Family Controller"));
+  const std::string cmd = Firewall::addRuleCommandLine();
+  CHECK(cmd.find("netsh advfirewall firewall add rule") == 0);
+  CHECK(cmd.find("localport=47803") != std::string::npos && cmd.find("profile=private") != std::string::npos);
+  CHECK(cmd.find(Firewall::ruleName()) != std::string::npos);
+  std::printf("  firewall rule present: %d\n", Firewall::rulesPresent() ? 1 : 0);
+}
+
+void testCodecSelection() {
+  DecoderCapabilities none, hevcHw, hevcSw, all;
+  none.h264.software = none.h264.hardware = true;
+  hevcHw = none;
+  hevcHw.hevc.hardware = hevcHw.hevc.software = true;
+  hevcSw = none;
+  hevcSw.hevc.software = true;
+  all = hevcHw;
+  all.av1.hardware = true;
+  const uint32_t h264 = codecBit(Codec::H264), hevc = codecBit(Codec::Hevc), av1 = codecBit(Codec::Av1);
+  auto c = chooseCodec(CodecPreference::Auto, h264 | hevc, hevcHw, 0);
+  CHECK(c.codec == Codec::Hevc && c.reason == "auto: HEVC (hardware decoder present)");
+  c = chooseCodec(CodecPreference::Auto, h264 | hevc, none, 0);
+  CHECK(c.codec == Codec::H264);
+  CHECK_MSG(c.reason == "auto: H.264 (no HEVC decoder: install 'HEVC Video Extensions')", "%s", c.reason.c_str());
+  c = chooseCodec(CodecPreference::Auto, h264 | hevc, hevcSw, 0);  // SW-only HEVC: not in Auto
+  CHECK(c.codec == Codec::H264 && c.reason.find("software-only") != std::string::npos);
+  c = chooseCodec(CodecPreference::Auto, h264, all, 0);
+  CHECK(c.codec == Codec::H264 && c.reason == "auto: H.264 (phone encodes H.264 only)");
+  c = chooseCodec(CodecPreference::Auto, h264 | hevc | av1, all, 0);  // AV1 > HEVC
+  CHECK(c.codec == Codec::Av1);
+  c = chooseCodec(CodecPreference::Auto, h264 | hevc | av1, all, av1);  // AV1 failed -> HEVC
+  CHECK(c.codec == Codec::Hevc);
+  c = chooseCodec(CodecPreference::Auto, h264 | hevc, hevcHw, hevc);  // HEVC failed -> H.264
+  CHECK(c.codec == Codec::H264 && c.reason.find("failed earlier") != std::string::npos);
+  c = chooseCodec(CodecPreference::Hevc, h264 | hevc, hevcSw, 0);  // explicit: SW is fine
+  CHECK(c.codec == Codec::Hevc && c.reason == "user: HEVC (software decoder)");
+  c = chooseCodec(CodecPreference::Hevc, h264, hevcHw, 0);
+  CHECK(c.codec == Codec::H264 && c.reason.find("phone has no HEVC encoder") != std::string::npos);
+  c = chooseCodec(CodecPreference::Av1, h264 | av1, hevcHw, 0);
+  CHECK(c.codec == Codec::H264 && c.reason.find("AV1 Video Extension") != std::string::npos);
+  c = chooseCodec(CodecPreference::H264, h264 | hevc, all, 0);
+  CHECK(c.codec == Codec::H264 && c.reason == "user: H.264");
+  const DecoderCapabilities real = Client::decoderCapabilities();
+  std::printf("  this PC: H.264 hw %d sw %d | HEVC hw %d sw %d | AV1 hw %d sw %d | adapter '%s' discrete %d (%llu MB)\n",
+              real.h264.hardware, real.h264.software, real.hevc.hardware, real.hevc.software,
+              real.av1.hardware, real.av1.software, real.adapter.c_str(), real.adapter_discrete,
+              static_cast<unsigned long long>(real.dedicated_video_memory >> 20));
+  CHECK(real.h264.any());
+}
+
 void testQpcConversions() {
   for (int64_t us : {0LL, 1LL, 999999LL, 1000000LL, 123456789012LL}) {
     const int64_t q = usToQpc(us);
@@ -370,6 +444,8 @@ int main() {
   RUN(testCounterStrip);
   RUN(testPresets);
   RUN(testQpcConversions);
+  RUN(testDiscoveryHelpers);
+  RUN(testCodecSelection);
   std::printf("%s (%d failure(s))\n", owctest::failures() ? "FAILED" : "ALL PASSED", owctest::failures());
   return owctest::failures() ? 1 : 0;
 }

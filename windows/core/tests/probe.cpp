@@ -11,6 +11,7 @@
 //       --shm publishes to the shared-memory bus (off by default so the probe
 //       never fights the OWC app for it). Exit code 0 if frames were decoded.
 #include "decoder.h"
+#include "util.h"
 
 #include <owc/core.h>
 
@@ -26,6 +27,8 @@
 using namespace owc;
 
 namespace {
+
+void printCounters(const Discovery::Counters& c);
 
 int readOnlyProbe() {
   Adb adb;
@@ -49,7 +52,10 @@ int readOnlyProbe() {
     }
   }
   std::printf("discovery (2 s)...\n");
-  for (auto& d : Discovery::scanOnce(2000))
+  Discovery::Counters dc;
+  const auto found = Discovery::scanOnce(2000, Discovery::Options(), &dc);
+  printCounters(dc);
+  for (auto& d : found)
     std::printf("  %s:%u udp %u '%s' (%s)%s\n", d.ip.c_str(), d.control_port, d.udp_port,
                 d.name.c_str(), d.model.c_str(), d.busy ? " BUSY" : "");
   detail::MfThreadScope mf;
@@ -198,14 +204,68 @@ int connectMode(int argc, char** argv) {
   return frames > 0 ? 0 : 1;
 }
 
+void printCounters(const Discovery::Counters& c) {
+  std::printf("  counters: requests %llu | sweep rounds %llu sent %llu subnets %u last %lld ms | "
+              "send errors %llu (last WSA %d) | replies %llu announces %llu invalid %llu\n",
+              static_cast<unsigned long long>(c.requests_sent),
+              static_cast<unsigned long long>(c.sweep_rounds),
+              static_cast<unsigned long long>(c.sweep_sent), c.sweep_subnets,
+              static_cast<long long>(c.last_sweep_ms), static_cast<unsigned long long>(c.send_errors),
+              c.last_send_error, static_cast<unsigned long long>(c.replies),
+              static_cast<unsigned long long>(c.announces), static_cast<unsigned long long>(c.invalid));
+}
+
+// --discover N [--no-sweep] [--no-broadcast] [--no-announce] [--no-known]
+int discoverMode(int argc, char** argv) {
+  Discovery::Options o;
+  int seconds = 10;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--discover" && i + 1 < argc) seconds = atoi(argv[++i]);
+    else if (a == "--no-sweep") o.subnet_sweep = false;
+    else if (a == "--no-broadcast") o.broadcast = false;
+    else if (a == "--no-announce") o.listen_announcements = false;
+    else if (a == "--no-known") o.persist_known = false;
+  }
+  std::printf("sweep subnets:\n");
+  for (auto& s : Discovery::sweepSubnets(o.sweep_min_prefix))
+    std::printf("  %s on '%s' (this PC %s)\n", s.cidr.c_str(), s.adapter.c_str(), s.address.c_str());
+  std::printf("firewall rule '%s' present: %d\n", Firewall::ruleName(), Firewall::rulesPresent() ? 1 : 0);
+  Discovery d;
+  const int64_t t0 = detail::steadyMs();
+  if (!d.start(o, [t0](const std::vector<DiscoveredDevice>& v) {
+        std::printf("[+%lld ms] device list changed: %zu device(s)\n",
+                    static_cast<long long>(detail::steadyMs() - t0), v.size());
+      })) {
+    std::printf("start failed: %s\n", d.lastError().c_str());
+    return 1;
+  }
+  std::printf("announce listener: %s %s\n", d.announceListening() ? "on" : "OFF",
+              d.lastError().c_str());
+  for (int t = 1; t <= seconds; ++t) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::printf("[%2ds] %zu device(s)\n", t, d.devices().size());
+    for (auto& dev : d.devices())
+      std::printf("  %s:%u udp %u '%s' (%s)%s%s\n", dev.ip.c_str(), dev.control_port, dev.udp_port,
+                  dev.name.c_str(), dev.model.c_str(), dev.busy ? " BUSY" : "",
+                  dev.via_announce ? " [announce]" : "");
+    printCounters(d.counters());
+  }
+  const size_t n = d.devices().size();
+  d.stop();
+  return n ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  for (int i = 1; i < argc; ++i)
+  for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--connect") == 0) return connectMode(argc, argv);
+    if (std::strcmp(argv[i], "--discover") == 0) return discoverMode(argc, argv);
+  }
   if (argc > 1) {
-    std::fprintf(stderr, "usage: owc_core_probe [--connect host:port [--transport tcp|udp] "
+    std::fprintf(stderr, "usage: owc_core_probe [--discover N [--no-sweep] [--no-broadcast] [--no-announce] [--no-known]] [--connect host:port [--transport tcp|udp] "
                          "[--seconds N] [--set id=value]... [--decoder auto|hw|sw] [--shm] "
                          "[--no-patch] [--jitter MS]]\n");
     return 2;

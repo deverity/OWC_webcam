@@ -140,6 +140,7 @@ struct Scenario {
   const char* replay = nullptr;  // tests/data file: real-phone stream (no counter strip)
   uint32_t replayFps = 30;
   int16_t rotation = 0;          // VideoFormat rotation hint (output w/h swap for 90/270)
+  bool overload = false;         // stream faster than this PC can present: latency must stay bounded
 };
 
 std::string dataFile(const char* name) { return std::string(OWC_TEST_DATA_DIR) + "/" + name; }
@@ -250,10 +251,24 @@ ClientStats runScenario(const Scenario& sc) {
       // real-phone stream: every received frame must be decoded, no keyframe loop
       CHECK_MSG(static_cast<uint32_t>(rec.frames.load()) >= sc.needFrames, "only %d frames decoded",
                 rec.frames.load());
-      CHECK_MSG(st.frames_decoded + 3 >= st.frames_received, "decoded %llu of %llu received",
-                static_cast<unsigned long long>(st.frames_decoded),
-                static_cast<unsigned long long>(st.frames_received));
-      CHECK_MSG(st.keyframe_requests <= 2, "%u keyframe requests", st.keyframe_requests);
+      if (!sc.overload) {
+        CHECK_MSG(st.frames_decoded + 3 >= st.frames_received, "decoded %llu of %llu received",
+                  static_cast<unsigned long long>(st.frames_decoded),
+                  static_cast<unsigned long long>(st.frames_received));
+        CHECK_MSG(st.keyframe_requests <= 2, "%u keyframe requests", st.keyframe_requests);
+      } else {
+        // latency-first: bounded capture->publish even though the PC can't keep up
+        std::printf("  [%s] OVERLOAD rx %.1f fps, decoded %.1f fps, published %.1f fps, not presented "
+                    "%llu, backlog drops %llu, cap->pub avg %.1f p95 %.1f ms (decode %.1f ms)\n",
+                    sc.name, st.rx_fps, st.decoded_fps, st.published_fps,
+                    static_cast<unsigned long long>(st.frames_not_presented),
+                    static_cast<unsigned long long>(st.backlog_drops), st.capture_to_publish_ms_avg,
+                    st.capture_to_publish_ms_p95, st.decode_ms_avg);
+        CHECK_MSG(st.capture_to_publish_ms_p95 < 150.0 + 2 * st.decode_ms_avg,
+                  "capture->publish p95 %.1f ms (decode %.1f ms)", st.capture_to_publish_ms_p95,
+                  st.decode_ms_avg);
+        CHECK_MSG(st.published_fps >= 10.0, "published only %.1f fps", st.published_fps);
+      }
     }
   }
   if (sc.checkShm) {
@@ -293,6 +308,9 @@ void testDiscovery() {
   o.broadcast = false;
   o.extra_targets = {"127.0.0.1"};
   o.bind_address = "127.0.0.1";
+  o.listen_announcements = false;  // never touch the real 47803 / LAN / %APPDATA% in tests
+  o.subnet_sweep = false;
+  o.persist_known = false;
   auto devs = Discovery::scanOnce(600, o);
   CHECK(devs.size() == 1);
   if (!devs.empty()) {
@@ -464,6 +482,167 @@ void testTransformAndControls() {
   c.disconnect();
 }
 
+uint16_t freeUdpPort() {
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+  int l = sizeof(a);
+  getsockname(s, reinterpret_cast<sockaddr*>(&a), &l);
+  closesocket(s);
+  return ntohs(a.sin_port);
+}
+
+// Screen-off phones: only announcements (kind=3) and unicast sweeps reach them.
+void testDiscoveryAnnounceAndSweep() {
+  // (a) announce only: the phone does not answer requests at all
+  const uint16_t annPort = freeUdpPort();
+  fake::FakePhoneConfig pc;
+  pc.bind_address = "127.0.0.1";
+  pc.control_port = pc.udp_port = pc.discovery_port = 0;
+  pc.enable_discovery = false;
+  pc.device_name = "AnnouncePhone";
+  pc.announce_target = "127.0.0.1:" + std::to_string(annPort);
+  pc.announce_interval_ms = 200;
+  pc.logger = [](const std::string&) {};
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pc, err));
+  Discovery::Options o;
+  o.broadcast = false;
+  o.subnet_sweep = false;
+  o.persist_known = false;
+  o.bind_address = "127.0.0.1";
+  o.announce_bind_address = "127.0.0.1";
+  o.announce_port = annPort;
+  Discovery d;
+  CHECK(d.start(o));
+  CHECK(d.announceListening());
+  for (int i = 0; i < 200 && d.devices().empty(); ++i) sleepMs(10);
+  auto devs = d.devices();
+  CHECK(devs.size() == 1);
+  if (!devs.empty()) {
+    CHECK(devs[0].via_announce && devs[0].name == "AnnouncePhone" && devs[0].ip == "127.0.0.1");
+    CHECK(devs[0].control_port == phone.controlPort() && devs[0].udp_port == phone.udpPort());
+  }
+  auto known = d.knownAddresses();
+  CHECK(known.size() == 1 && known[0] == "127.0.0.1");
+  // a second listener on the same port (another OWC process) also works (SO_REUSEADDR)
+  Discovery d2;
+  CHECK(d2.start(o));
+  d2.stop();
+  d.stop();
+  phone.stop();
+
+  // (b) unicast sweep of a /29 on loopback: the phone answers unicast requests
+  // only (no broadcast, no extra targets, no announcements)
+  fake::FakePhoneConfig pc2 = pc;
+  pc2.enable_discovery = true;
+  pc2.announce_target.clear();
+  pc2.device_name = "SweepPhone";
+  fake::FakePhone phone2;
+  CHECK(phone2.start(pc2, err));
+  Discovery::Options s;
+  s.port = phone2.discoveryPort();
+  s.broadcast = false;
+  s.listen_announcements = false;
+  s.persist_known = false;
+  s.bind_address = "127.0.0.1";
+  s.subnet_sweep = true;
+  s.sweep_min_prefix = 32;  // ignore the real interfaces: only the explicit subnet
+  s.sweep_subnets = {"127.0.0.0/29"};
+  auto found = Discovery::scanOnce(600, s);
+  CHECK(found.size() == 1 && !found.empty() && found[0].name == "SweepPhone" && !found[0].via_announce);
+  // known-address path + file persistence
+  char tmp[MAX_PATH];
+  GetTempPathA(MAX_PATH, tmp);
+  const std::string file = std::string(tmp) + "owc_known_test_" + std::to_string(GetCurrentProcessId()) + ".txt";
+  CHECK(Discovery::saveKnownAddresses({"10.0.0.1", "127.0.0.1"}, file));
+  auto loaded = Discovery::loadKnownAddresses(file);
+  CHECK(loaded.size() == 2 && loaded[1] == "127.0.0.1");
+  Discovery::Options k = s;
+  k.subnet_sweep = false;
+  k.persist_known = true;
+  k.known_file = file;
+  auto viaKnown = Discovery::scanOnce(600, k);
+  CHECK(viaKnown.size() == 1);
+  DeleteFileA(file.c_str());
+  for (auto& sn : Discovery::sweepSubnets())
+    std::printf("  sweep subnet: %s on '%s' (%s)\n", sn.cidr.c_str(), sn.adapter.c_str(), sn.address.c_str());
+}
+
+// Codec negotiation with a fake HEVC-capable phone (its encoder is H.264 only).
+ClientStats codecRun(const char* tag, const DecoderCapabilities* caps, int hevcMode,
+                     Recorder& rec, uint64_t& logId, Client*& keep) {
+  (void)keep;
+  Client::overrideDecoderCapabilitiesForTest(caps);
+  fake::FakePhoneConfig pc;
+  pc.bind_address = "127.0.0.1";
+  pc.control_port = pc.udp_port = pc.discovery_port = 0;
+  pc.enable_discovery = false;
+  pc.width = 640;
+  pc.height = 480;
+  pc.codec_mask = codecBit(Codec::H264) | codecBit(Codec::Hevc);
+  pc.hevc_mode = hevcMode;
+  pc.logger = [](const std::string&) {};
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pc, err));
+  ClientOptions o;
+  o.auto_reconnect = false;
+  o.publish_to_shm = false;
+  Client c(&rec, o);
+  ConnectParams cp;
+  cp.port = phone.controlPort();
+  c.connect(cp);
+  for (int i = 0; i < 1600 && rec.frames < 40; ++i) sleepMs(5);
+  const ClientStats s = c.stats();
+  std::printf("  [%s] frames %d, requested %s, selection '%s'\n", tag, rec.frames.load(),
+              s.requested_codec == Codec::Hevc ? "HEVC" : "H.264", s.codec_selection.c_str());
+  for (const LogEntry& l : c.logs(logId))
+    if (l.text.find("codec") != std::string::npos || l.text.find("HEVC") != std::string::npos)
+      std::printf("    log: %s\n", l.text.c_str());
+  c.disconnect();
+  Client::overrideDecoderCapabilitiesForTest(nullptr);
+  return s;
+}
+
+void testCodecNegotiation() {
+  DecoderCapabilities hevcHw;  // pretend this PC has a hardware HEVC decoder
+  hevcHw.h264.hardware = hevcHw.h264.software = true;
+  hevcHw.hevc.hardware = hevcHw.hevc.software = true;
+  DecoderCapabilities noHevc = hevcHw;
+  noHevc.hevc = DecoderCapabilities::Entry();
+  uint64_t logId = 0;
+  Client* keep = nullptr;
+  {  // (a) PC can decode HEVC, phone advertises it but REJECTS SetParam -> H.264
+    Recorder rec;
+    const ClientStats s = codecRun("phone rejects HEVC", &hevcHw, 0, rec, logId, keep);
+    CHECK(rec.frames >= 40);
+    CHECK(s.requested_codec == Codec::H264);
+    CHECK_MSG(s.codec_selection.find("HEVC failed earlier") != std::string::npos, "%s",
+              s.codec_selection.c_str());
+  }
+  {  // (b) phone accepts HEVC but the stream can't be decoded as HEVC -> runtime fallback
+    Recorder rec;
+    const ClientStats s = codecRun("HEVC decode fails", &hevcHw, 1, rec, logId, keep);
+    CHECK_MSG(rec.frames >= 40, "frames %d", rec.frames.load());
+    CHECK(s.requested_codec == Codec::H264);
+    CHECK(s.has_format && s.format.codec == Codec::H264);
+    CHECK_MSG(s.codec_selection.find("HEVC failed earlier") != std::string::npos, "%s",
+              s.codec_selection.c_str());
+  }
+  {  // (c) no HEVC decoder on this PC: Auto stays on H.264 with the install hint
+    Recorder rec;
+    const ClientStats s = codecRun("no HEVC decoder", &noHevc, 1, rec, logId, keep);
+    CHECK(rec.frames >= 40);
+    CHECK(s.requested_codec == Codec::H264);
+    CHECK_MSG(s.codec_selection == "auto: H.264 (no HEVC decoder: install 'HEVC Video Extensions')",
+              "%s", s.codec_selection.c_str());
+  }
+}
+
 // Another producer owns the bus: the client keeps decoding, reports shm_error,
 // and takes over within ~2 s once the bus is released.
 void testShmBusOwnedByOther() {
@@ -513,9 +692,11 @@ int main() {
   SetEnvironmentVariableW(L"OWC_SHM_NAME", shmBus);
   std::printf("shm bus: %ls\n", shmName());
   RUN(testDiscovery);
+  RUN(testDiscoveryAnnounceAndSweep);
   RUN(testBusyAndNoResponse);
   RUN(testTransformAndControls);
   RUN(testShmBusOwnedByOther);
+  RUN(testCodecNegotiation);
 
   Scenario tcp;
   tcp.name = "TCP 720p30 sps-patch";
@@ -556,6 +737,22 @@ int main() {
     std::printf("SUMMARY real-phone replay: 720p60 decoder delay %.2f/%u, 1080p30 %.2f/%u frames\n",
                 rp1.decoder_delay_frames_avg, rp1.decoder_delay_frames_max,
                 rp2.decoder_delay_frames_avg, rp2.decoder_delay_frames_max);
+
+  // Regression: stream faster than the PC can present (phone 1080p120 @ 40 Mbps
+  // made capture->publish grow to 7-20 s). Real 1080p frames replayed at 120 fps.
+  Scenario ov = r2;
+  ov.name = "OVERLOAD replay 1080p at 120 fps TCP hardware";
+  ov.replayFps = 120;
+  ov.overload = true;
+  ov.decoder = DecoderMode::Hardware;  // ~21 ms/frame incl. read-back on the Iris Xe
+  ov.needFrames = 60;
+  ov.timeoutMs = 15000;
+  runScenario(ov);
+  Scenario ovu = ov;
+  ovu.name = "OVERLOAD replay 1080p at 120 fps UDP auto";
+  ovu.transport = VideoTransport::Udp;
+  ovu.decoder = DecoderMode::Auto;
+  runScenario(ovu);
 
   Scenario hd = tcp;
   hd.name = "TCP 1080p30 hardware";

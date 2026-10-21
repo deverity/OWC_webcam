@@ -57,12 +57,17 @@ class MfDecoder {
   // Feeds ONE access unit (Annex-B) and immediately drains every available
   // output through `sink` (synchronously, on this thread). Returns false on a
   // decode error (caller should flush + wait for / request a keyframe).
+  // readback=false: outputs are still drained (and `sink` called, for
+  // bookkeeping) but the D3D11 GPU->CPU copy is skipped: DecodedImage::y/uv
+  // are null. Used for frames that will not be presented (decoder backlog).
   bool decode(const uint8_t* au, size_t n, int64_t sample_time, int64_t duration, bool keyframe,
-              const Sink& sink);
+              const Sink& sink, bool readback = true);
   // Discards everything buffered inside the decoder.
   void flush();
 
   bool hardware() const;           // D3D11 manager accepted and DXGI output seen
+  bool d3dConfigured() const;      // D3D11 manager accepted by the MFT (after open)
+  std::string mftName() const;     // MFT friendly name
   std::string name() const;        // MFT friendly name + mode
   uint32_t streamChanges() const;  // MF_E_TRANSFORM_STREAM_CHANGE count since open
   // Duration of the GPU->CPU read-back (copy + Map) of the last output, µs.

@@ -119,7 +119,7 @@ struct FakePhone::Impl {
   std::atomic<bool> stopFlag{false};
   SOCKET lsock = INVALID_SOCKET, usock = INVALID_SOCKET, dsock = INVALID_SOCKET;
   uint16_t cport = 0, uport = 0, dport = 0;
-  std::thread acceptTh, udpTh, discTh, sessionTh, streamTh;
+  std::thread acceptTh, udpTh, discTh, sessionTh, streamTh, annTh;
 
   // session
   std::mutex sendMx;
@@ -135,6 +135,7 @@ struct FakePhone::Impl {
   mutable std::mutex pmx;
   uint32_t width = 0, height = 0, fps = 0, bitrate = 0, bframes = 0, kfMs = 0;
   int profile = 0, fec = 0;
+  int codec = 0;  // VideoCodec param (0 H.264, 1 HEVC label)
   float zoom = 1.0f;
   bool torch = false;
   std::string name;
@@ -220,9 +221,10 @@ struct FakePhone::Impl {
     cp.params.push_back(desc(ParamId::VideoWidth, ValueType::Int32, 160, 1920, 2, ParamValue::Int(static_cast<int32_t>(width)), true));
     cp.params.push_back(desc(ParamId::VideoHeight, ValueType::Int32, 120, 1080, 2, ParamValue::Int(static_cast<int32_t>(height)), true));
     cp.params.push_back(desc(ParamId::Fps, ValueType::Int32, 1, 60, 1, ParamValue::Int(static_cast<int32_t>(fps)), true));
-    ParamDesc codec = desc(ParamId::VideoCodec, ValueType::Enum, 0, 0, 1, ParamValue::EnumV(0), true);
-    codec.options.push_back(EnumOption{0, "H.264"});
-    cp.params.push_back(codec);
+    ParamDesc vc = desc(ParamId::VideoCodec, ValueType::Enum, 0, 2, 1, ParamValue::EnumV(codec), true);
+    vc.options.push_back(EnumOption{0, "H.264"});
+    if (cfg.codec_mask & codecBit(Codec::Hevc)) vc.options.push_back(EnumOption{1, "HEVC"});
+    cp.params.push_back(vc);
     cp.params.push_back(desc(ParamId::Bitrate, ValueType::Int32, 100000, 50000000, 100000, ParamValue::Int(static_cast<int32_t>(bitrate)), false));
     cp.params.push_back(desc(ParamId::KeyframeIntervalMs, ValueType::Int32, 0, 10000, 100, ParamValue::Int(static_cast<int32_t>(kfMs)), true));
     ParamDesc prof = desc(ParamId::EncoderProfile, ValueType::Enum, 0, 2, 1, ParamValue::EnumV(profile), true);
@@ -272,6 +274,15 @@ struct FakePhone::Impl {
         zoom = sp.value.f; break;
       case ParamId::Torch:
         torch = sp.value.i != 0; break;
+      case ParamId::VideoCodec:
+        if (v == 0 || (v == 1 && (cfg.codec_mask & codecBit(Codec::Hevc)) && cfg.hevc_mode == 1)) {
+          if (codec != static_cast<int>(v)) reconfigure = true;
+          codec = static_cast<int>(v);
+        } else {
+          ps.status = ParamStatus::Unsupported;
+        }
+        ps.value = ParamValue::EnumV(codec);
+        break;
       case ParamId::CameraIndex:
         if (v != 0) ps.status = ParamStatus::OutOfRange;
         ps.value = ParamValue::Int(0); break;
@@ -292,6 +303,7 @@ struct FakePhone::Impl {
     profile = cfg.bframes && cfg.profile == 0 ? 1 : cfg.profile;
     kfMs = cfg.keyframe_interval_ms;
     fec = cfg.fec_percent;
+    codec = 0;
     zoom = 1.0f;
     torch = false;
   }
@@ -363,7 +375,7 @@ struct FakePhone::Impl {
     }
     ack.model = cfg.model;
     ack.android_api = 34;
-    ack.codec_mask = codecBit(Codec::H264);
+    ack.codec_mask = cfg.codec_mask;
     {
       std::lock_guard<std::mutex> lk(sendMx);
       client = s;
@@ -547,6 +559,42 @@ struct FakePhone::Impl {
       sendto(usock, reinterpret_cast<const char*>(out), static_cast<int>(kUdpHeaderSize), 0,
              reinterpret_cast<sockaddr*>(&from), sizeof(from));
     }
+  }
+
+  void announceMain() {
+    const size_t colon = cfg.announce_target.rfind(':');
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(colon == std::string::npos
+                            ? kDefaultAnnouncePort
+                            : static_cast<uint16_t>(atoi(cfg.announce_target.c_str() + colon + 1)));
+    if (inet_pton(AF_INET, cfg.announce_target.substr(0, colon).c_str(), &to.sin_addr) != 1) {
+      log("bad --announce target %s", cfg.announce_target.c_str());
+      return;
+    }
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    BOOL on = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof(on));
+    int64_t next = 0;
+    while (!stopFlag) {
+      if (pcUs() >= next && !sessionActive) {
+        DiscoveryReply r;
+        r.announce = true;
+        r.control_port = cport;
+        r.udp_port = uport;
+        {
+          std::lock_guard<std::mutex> lk(pmx);
+          r.device_name = name;
+        }
+        r.model = cfg.model;
+        const std::vector<uint8_t> b = encode(r);
+        sendto(s, reinterpret_cast<const char*>(b.data()), static_cast<int>(b.size()), 0,
+               reinterpret_cast<sockaddr*>(&to), sizeof(to));
+        next = pcUs() + static_cast<int64_t>(cfg.announce_interval_ms) * 1000;
+      }
+      Sleep(20);
+    }
+    closesocket(s);
   }
 
   void discMain() {
@@ -847,7 +895,10 @@ struct FakePhone::Impl {
           if (csd.empty() || !key) return;  // wait for the first IDR with SPS/PPS
           VideoFormat vf;
           vf.epoch = ep;
-          vf.codec = Codec::H264;
+          {
+            std::lock_guard<std::mutex> lk(pmx);
+            vf.codec = static_cast<Codec>(codec);  // hevc_mode 1: deliberately mislabelled
+          }
           vf.width = static_cast<uint16_t>(w);
           vf.height = static_cast<uint16_t>(h);
           vf.fps = static_cast<uint16_t>(f);
@@ -915,6 +966,7 @@ bool FakePhone::start(const FakePhoneConfig& cfg, std::string& err) {
   m.acceptTh = std::thread([&m] { m.acceptMain(); });
   m.udpTh = std::thread([&m] { m.udpMain(); });
   if (m.dsock != INVALID_SOCKET) m.discTh = std::thread([&m] { m.discMain(); });
+  if (!cfg.announce_target.empty()) m.annTh = std::thread([&m] { m.announceMain(); });
   return true;
 }
 
@@ -927,6 +979,7 @@ void FakePhone::stop() {
   if (m.streamTh.joinable()) m.streamTh.join();
   if (m.udpTh.joinable()) m.udpTh.join();
   if (m.discTh.joinable()) m.discTh.join();
+  if (m.annTh.joinable()) m.annTh.join();
   if (m.lsock != INVALID_SOCKET) { closesocket(m.lsock); m.lsock = INVALID_SOCKET; }
   if (m.usock != INVALID_SOCKET) { closesocket(m.usock); m.usock = INVALID_SOCKET; }
   if (m.dsock != INVALID_SOCKET) { closesocket(m.dsock); m.dsock = INVALID_SOCKET; }

@@ -112,6 +112,7 @@ struct MfDecoder::Impl {
   ComPtr<IMFSample> outSample;     // when the MFT doesn't provide samples
   ComPtr<IMFMediaBuffer> outBuf;
   int64_t readbackUs = 0;
+  bool wantReadback = true;
   uint32_t mtMatrix = 0;
   int mtFullRange = -1;
   std::string lastErr;
@@ -167,7 +168,10 @@ struct MfDecoder::Impl {
   bool open(const DecoderConfig& c, std::string& err) {
     close();
     cfg = c;
-    const GUID sub = c.codec == Codec::H264 ? MFVideoFormat_H264 : MFVideoFormat_HEVC;
+    // MFVideoFormat_AV1 is defined by the 10.0.19041 SDK (mfapi.h, FCC 'AV01').
+    const GUID sub = c.codec == Codec::H264   ? MFVideoFormat_H264
+                     : c.codec == Codec::Hevc ? MFVideoFormat_HEVC
+                                              : MFVideoFormat_AV1;
     MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, sub};
     IMFActivate** acts = nullptr;
     UINT32 count = 0;
@@ -184,7 +188,10 @@ struct MfDecoder::Impl {
       err = c.codec == Codec::Hevc
                 ? "no HEVC decoder installed (install 'HEVC Video Extensions' from the "
                   "Microsoft Store, or use H.264)"
-                : "no H.264 decoder MFT found";
+                : c.codec == Codec::Av1
+                      ? "no AV1 decoder installed (install 'AV1 Video Extension' from the "
+                        "Microsoft Store, or use H.264)"
+                      : "no H.264 decoder MFT found";
       return false;
     }
     for (UINT32 i = 0; i < count && !mft; ++i) {
@@ -282,6 +289,16 @@ struct MfDecoder::Impl {
       return false;
     D3D11_TEXTURE2D_DESC td;
     tex->GetDesc(&td);
+    if (!wantReadback) {  // frame will not be presented: no GPU->CPU copy
+      DecodedImage img;
+      img.width = std::min<uint32_t>(dispW ? dispW : td.Width, td.Width) & ~1u;
+      img.height = std::min<uint32_t>(dispH ? dispH : td.Height, td.Height) & ~1u;
+      img.sample_time = t;
+      readbackUs = 0;
+      sink(img);
+      dxgiSeen = true;
+      return true;
+    }
     if (!staging || stagingDesc.Width != td.Width || stagingDesc.Height != td.Height ||
         stagingDesc.Format != td.Format) {
       staging.Reset();
@@ -410,8 +427,10 @@ struct MfDecoder::Impl {
     return true;
   }
 
-  bool decode(const uint8_t* au, size_t n, int64_t t, int64_t dur, bool key, const Sink& sink) {
+  bool decode(const uint8_t* au, size_t n, int64_t t, int64_t dur, bool key, const Sink& sink,
+              bool readback) {
     if (!mft || n == 0) return false;
+    wantReadback = readback;
     ComPtr<IMFMediaBuffer> mb;
     if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(n), &mb))) return false;
     BYTE* p = nullptr;
@@ -445,13 +464,15 @@ void MfDecoder::close() { impl_->close(); }
 bool MfDecoder::isOpen() const { return impl_->mft != nullptr; }
 const DecoderConfig& MfDecoder::config() const { return impl_->cfg; }
 bool MfDecoder::decode(const uint8_t* au, size_t n, int64_t t, int64_t dur, bool key,
-                       const Sink& sink) {
-  return impl_->decode(au, n, t, dur, key, sink);
+                       const Sink& sink, bool readback) {
+  return impl_->decode(au, n, t, dur, key, sink, readback);
 }
 void MfDecoder::flush() {
   if (impl_->mft) impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
 }
 bool MfDecoder::hardware() const { return impl_->d3dSet && impl_->dxgiSeen; }
+bool MfDecoder::d3dConfigured() const { return impl_->d3dSet; }
+std::string MfDecoder::mftName() const { return impl_->mftName; }
 std::string MfDecoder::name() const {
   if (!impl_->mft) return std::string();
   return impl_->mftName + (impl_->d3dSet ? " (D3D11)" : " (software)");

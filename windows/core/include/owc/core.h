@@ -5,4 +5,5 @@
 #include <owc/adb.h>
 #include <owc/client.h>
 #include <owc/discovery.h>
+#include <owc/firewall.h>
 #include <owc/presets.h>

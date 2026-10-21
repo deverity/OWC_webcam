@@ -19,6 +19,11 @@ struct FakePhoneConfig {
   uint16_t udp_port = 47801;       // 0 = ephemeral
   uint16_t discovery_port = 47802; // 0 = ephemeral
   bool enable_discovery = true;
+  // Unsolicited announcements (DiscoveryReply kind=3) like the real phone,
+  // sent every announce_interval_ms while no client is connected.
+  // "host:port", e.g. "255.255.255.255:47803" or "127.0.0.1:47803"; "" = off.
+  std::string announce_target;
+  uint32_t announce_interval_ms = 2000;
   uint32_t width = 1280, height = 720, fps = 30;
   uint32_t bitrate = 4000000;
   uint32_t bframes = 0;            // >0 => Main profile with B-frames
@@ -38,6 +43,13 @@ struct FakePhoneConfig {
   // restarts from the first AU (the file must start with an IDR).
   std::string replay_file;
   uint32_t replay_fps = 30;
+  // Codec negotiation tests. codec_mask goes into HelloAck (default H.264 only).
+  // hevc_mode: 0 = SetParam(VideoCodec=HEVC) rejected (Unsupported);
+  //            1 = accepted, but the stream is still H.264 labelled as HEVC in
+  //                VideoFormat (forces a decoder failure on the PC: tests the
+  //                runtime fallback). The encoder is always H.264.
+  uint32_t codec_mask = 1;  // codecBit(Codec::H264)
+  int hevc_mode = 0;
   bool verbose = false;
   std::function<void(const std::string&)> logger;  // default: stdout
 };

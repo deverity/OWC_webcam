@@ -36,6 +36,8 @@ void usage() {
       "  --name S           device name\n"
       "  --no-discovery     don't answer discovery broadcasts\n"
       "  --replay FILE      stream a recorded Annex-B H.264 file instead of the pattern\n"
+      "  --announce H:P     broadcast kind=3 announcements (e.g. 255.255.255.255:47803)\n"
+      "  --announce-ms N    announcement period (default 2000)\n"
       "  --replay-fps N     replay frame rate (default 30)\n"
       "  --rotation DEG     VideoFormat rotation hint\n"
       "  --strip-ps         send IDRs without inline SPS/PPS (csd only)\n"
@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
     else if (a == "--name") cfg.device_name = next("--name");
     else if (a == "--no-discovery") cfg.enable_discovery = false;
     else if (a == "--replay") cfg.replay_file = next("--replay");
+    else if (a == "--announce") cfg.announce_target = next("--announce");
+    else if (a == "--announce-ms") cfg.announce_interval_ms = u32("--announce-ms");
     else if (a == "--replay-fps") cfg.replay_fps = u32("--replay-fps");
     else if (a == "--rotation") cfg.rotation_deg = static_cast<int16_t>(atoi(next("--rotation")));
     else if (a == "--strip-ps") cfg.inline_param_sets = false;
