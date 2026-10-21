@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "util/clock.h"
+#include "util/debug_props.h"
 #include "util/log.h"
 #include "util/thread.h"
 
@@ -37,6 +38,7 @@ bool NetServer::start(uint16_t controlPort, uint16_t udpPort, uint16_t discovery
   int snd = kUdpSndBuf;
   setsockopt(udpFd_, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
   setDscpEf(udpFd_);
+
   discFd_ = createUdpSocket(discoveryPort, true, err);
   if (discFd_ < 0) {
     // Discovery is a convenience; the server still works without it.
@@ -47,8 +49,10 @@ bool NetServer::start(uint16_t controlPort, uint16_t udpPort, uint16_t discovery
     std::string aerr;
     announceFd_ = createUdpSocket(0, true, aerr);  // ephemeral port, SO_BROADCAST
     if (announceFd_ < 0) LOGW("announce disabled: %s", aerr.c_str());
+    else setDscpEf(announceFd_);  // also carries the keepalive (AC_VO)
   }
   nextAnnounceMs_ = 0;
+  keepaliveHz_ = static_cast<int>(std::clamp<long long>(debugProp("keepalive_hz", 10), 0, 50));
   wakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   rxBuf_.resize(64 * 1024);
   stop_ = false;
@@ -89,6 +93,8 @@ void NetServer::loop() {
     int timeoutMs = 1000;
     if (announceFd_ >= 0)
       timeoutMs = static_cast<int>(std::clamp<int64_t>(nextAnnounceMs_ - monoMs(), 0, 1000));
+    if (keepaliveHz_ > 0 && client_ && idle_)
+      timeoutMs = std::min(timeoutMs, static_cast<int>(std::clamp<int64_t>(nextKeepaliveMs_ - monoMs(), 0, 1000)));
     int r = ::poll(fds, static_cast<nfds_t>(n), timeoutMs);
     if (r < 0) {
       if (errno == EINTR) continue;
@@ -105,6 +111,10 @@ void NetServer::loop() {
     if (fds[1].revents & POLLIN) acceptClient();
     if (fds[2].revents & POLLIN) readUdpVideo();
     if (discIdx >= 0 && (fds[discIdx].revents & POLLIN)) readDiscovery();
+    if (keepaliveHz_ > 0 && client_ && idle_ && announceFd_ >= 0 && monoMs() >= nextKeepaliveMs_) {
+      sendKeepalive();
+      nextKeepaliveMs_ = monoMs() + 1000 / keepaliveHz_;
+    }
     if (announceFd_ >= 0 && monoMs() >= nextAnnounceMs_) {
       sendAnnounce();
       nextAnnounceMs_ = monoMs() + (client_ ? 5000 : 2000);
@@ -132,6 +142,7 @@ void NetServer::acceptClient() {
     return;
   }
   tuneTcpClient(fd);
+
   auto c = std::make_shared<ClientConn>();
   c->gen = nextGen_++;
   c->sock = std::make_shared<Socket>(fd);
@@ -142,6 +153,8 @@ void NetServer::acceptClient() {
   c->sender->start();
   parser_ = TcpFrameParser();
   client_ = c;
+  keepaliveHz_ = static_cast<int>(std::clamp<long long>(debugProp("keepalive_hz", keepaliveHz_), 0, 50));
+  nextKeepaliveMs_ = 0;
   LOGI("client connected: %s (gen %llu)", c->peerStr.c_str(),
        static_cast<unsigned long long>(c->gen));
   cb_->onClientConnected(std::move(c));
@@ -259,6 +272,16 @@ void NetServer::sendAnnounce() {
       if (++announceErrors_ <= 3) LOGD("announce to %s: %s", addrToString(a).c_str(), strerror(errno));
     }
   }
+}
+
+void NetServer::sendKeepalive() {
+  // 4 bytes "OWCK" to the client's IP on the announce port: any listener there
+  // drops it (no protocol magic); the point is the uplink frame itself.
+  if (client_->peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) return;  // USB: nothing to keep awake
+  static const uint8_t kPayload[4] = {'O', 'W', 'C', 'K'};
+  sockaddr_in a = client_->peer;
+  a.sin_port = htons(announcePort_);
+  ::sendto(announceFd_, kPayload, sizeof(kPayload), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&a), sizeof(a));
 }
 
 void NetServer::readDiscovery() {

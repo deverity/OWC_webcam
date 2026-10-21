@@ -48,6 +48,10 @@ class Pipeline : public CameraStream::Listener {
   }
   // Sensor timestamp (start of exposure) -> capture result, EWMA.
   float ispLatencyMs() const { return hsActive_ ? hs_->ispLatencyMs() : camera_.ispLatencyMs(); }
+  float exposureMs() const { return hsActive_ ? hs_->exposureMs() : camera_.exposureMs(); }
+  float frameDurationMs() const { return hsActive_ ? 0.0f : camera_.frameDurationMs(); }
+  int iso() const { return hsActive_ ? 0 : camera_.iso(); }
+  float pipelineDepth() const { return hsActive_ ? 0.0f : camera_.pipelineDepth(); }
   bool highSpeedActive() const { return hsActive_; }
   // High-speed session failed after start (polled by the worker).
   bool pollHighSpeedFailure(std::string& why) { return hsActive_ && hs_->failed(why); }

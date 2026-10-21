@@ -65,8 +65,13 @@ struct EncoderSettings {
   int profile = 0;             // protocol EncoderProfile: 0=Baseline 1=Main 2=High (HEVC 0/1=Main 2=Main10)
   int bframes = 0;
   int qpMin = 0, qpMax = 0;    // 0 = auto
-  int maxFpsToEncoder = 0;     // >0: drop surface frames above this rate (high-speed decimation)
+  int maxFpsToEncoder = 0;
+  int operatingRateMult = 2;   // operating-rate = fps x this, capped at 60 (Venus clock vote)
+  bool vendorLowLatency = true;  // vendor.qti-ext-enc-low-latency.enable     // >0: drop surface frames above this rate (high-speed decimation)
 };
+
+// Above this operating-rate / frame-rate OMX.qcom (SDM845) ignores request-sync.
+constexpr int kIdrSafeOperatingRate = 60;
 
 // MediaCodec constants (android.media.MediaCodecInfo.CodecProfileLevel).
 namespace mc {

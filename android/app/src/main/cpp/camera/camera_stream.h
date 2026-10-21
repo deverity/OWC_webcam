@@ -55,12 +55,19 @@ class CameraStream {
   uint32_t takeFrameCount() { return frames_.exchange(0); }
   // EWMA of sensor timestamp (start of exposure) -> capture result arrival.
   float ispLatencyMs() const { return ispUsEwma_.load() / 1000.0f; }
+  // EWMAs from capture results (P10): exposure, frame duration, ISO and the
+  // HAL-reported pipeline depth (requests in flight when the result left).
+  float exposureMs() const { return expUsEwma_.load() / 1000.0f; }
+  float frameDurationMs() const { return durUsEwma_.load() / 1000.0f; }
+  int iso() const { return static_cast<int>(isoEwma_.load()); }
+  float pipelineDepth() const { return depthX100_.load() / 100.0f; }
 
  private:
   bool createSession(std::string& err);
   void destroySession();
   bool buildRequest(const CameraControls& c, int fps, std::string& err);
   bool submitRepeating();
+
 
   static void onDisconnected(void* ctx, ACameraDevice* dev);
   static void onError(void* ctx, ACameraDevice* dev, int err);
@@ -96,6 +103,7 @@ class CameraStream {
   std::atomic<uint32_t> frames_{0};
   std::atomic<uint32_t> failures_{0};
   std::atomic<int64_t> ispUsEwma_{0};
+  std::atomic<int64_t> expUsEwma_{0}, durUsEwma_{0}, isoEwma_{0}, depthX100_{0};
   clockid_t sensorClock_ = CLOCK_MONOTONIC;  // REALTIME source -> CLOCK_BOOTTIME
 };
 

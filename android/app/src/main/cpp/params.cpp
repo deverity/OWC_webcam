@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdlib>
 
+#include "util/debug_props.h"
+
 namespace owc {
 
 const ParamId kAllParams[] = {
@@ -104,6 +106,13 @@ void ParamStore::init(const std::vector<CameraDesc>* cams, const EncoderCapsSet*
   // CBR may be unsupported (MediaCodecList said so): fall back to VBR.
   const EncoderCaps& ec = enc_->get(stream.codec);
   if (ec.bitrateModes && !(ec.bitrateModes & (1u << mc::kBitrateModeCBR))) stream.bitrateMode = 1;
+  // Profile: High (CABAC, still 0 B-frames) when available, else Main, else
+  // Baseline. Measured on the PC: +0.5 ms decode, decoder delay stays 0, and
+  // Baseline/CAVLC left ~7 % redundancy. HEVC: Main.
+  if (stream.codec == Codec::H264) {
+    stream.profile = ec.supportsProfile(mc::kAvcHigh) ? 2 : (ec.supportsProfile(mc::kAvcMain) ? 1 : 0);
+  }
+  stream.profile = static_cast<int>(debugProp("profile", stream.profile));
   controls = defaultControls(camera());
 }
 
@@ -618,6 +627,16 @@ EncoderSettings ParamStore::encoderSettings(int bitrateNow) const {
   s.qpMin = stream.qpMin;
   s.qpMax = stream.qpMax;
   if (stream.highSpeed && stream.fps < cameraFps()) s.maxFpsToEncoder = stream.fps;
+  // High-frame-rate encodes (measured SM-N9600, 720p@240):
+  //  - CABAC (Main/High) at > 20 Mbps cannot sustain 240 fps (217 fps, +105 ms
+  //    encoder backlog, camera drops); Baseline/CAVLC does (236 fps, +16 ms).
+  //  - request-sync is ignored above 60 fps, so a periodic IDR is the only
+  //    recovery: clamp the interval to <= 1 s.
+  if (s.codec == Codec::H264 && s.fps > 120 && stream.bitrate > 20000000) {
+    s.profile = 0;
+    s.bframes = 0;
+  }
+  if (s.fps > kIdrSafeOperatingRate && (s.keyframeMs == 0 || s.keyframeMs > 1000)) s.keyframeMs = 1000;
   return s;
 }
 

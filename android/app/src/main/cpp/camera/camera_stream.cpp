@@ -50,8 +50,19 @@ void CameraStream::onCaptureCompleted(void* ctx, ACameraCaptureSession*, ACaptur
   clock_gettime(self->sensorClock_, &now);
   const int64_t us = (static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec - e.data.i64[0]) / 1000;
   if (us < 0 || us > 2000000) return;  // clock mismatch: ignore
-  const int64_t prev = self->ispUsEwma_.load(std::memory_order_relaxed);
-  self->ispUsEwma_.store(prev == 0 ? us : prev + (us - prev) / 16, std::memory_order_relaxed);
+  auto ewma = [](std::atomic<int64_t>& a, int64_t v) {
+    const int64_t p = a.load(std::memory_order_relaxed);
+    a.store(p == 0 ? v : p + (v - p) / 16, std::memory_order_relaxed);
+  };
+  ewma(self->ispUsEwma_, us);
+  if (ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_EXPOSURE_TIME, &e) == ACAMERA_OK && e.count)
+    ewma(self->expUsEwma_, e.data.i64[0] / 1000);
+  if (ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_FRAME_DURATION, &e) == ACAMERA_OK && e.count)
+    ewma(self->durUsEwma_, e.data.i64[0] / 1000);
+  if (ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_SENSITIVITY, &e) == ACAMERA_OK && e.count)
+    ewma(self->isoEwma_, e.data.i32[0]);
+  if (ACameraMetadata_getConstEntry(result, ACAMERA_REQUEST_PIPELINE_DEPTH, &e) == ACAMERA_OK && e.count)
+    ewma(self->depthX100_, static_cast<int64_t>(e.data.u8[0]) * 100);
 }
 
 void CameraStream::onCaptureFailed(void* ctx, ACameraCaptureSession*, ACaptureRequest*,
@@ -70,6 +81,10 @@ bool CameraStream::open(const CameraDesc& d, ANativeWindow* encoder, ANativeWind
   frames_ = 0;
   failures_ = 0;
   ispUsEwma_ = 0;
+  expUsEwma_ = 0;
+  durUsEwma_ = 0;
+  isoEwma_ = 0;
+  depthX100_ = 0;
   sensorClock_ = d.timestampSource == ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME ? CLOCK_BOOTTIME
                                                                                  : CLOCK_MONOTONIC;
   encWin_ = encoder;

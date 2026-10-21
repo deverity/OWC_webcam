@@ -461,3 +461,215 @@ no PC): consistente com os +1–5 ms medidos. É o teto do que `adb forward` pod
   aparelho]. Semântica do `iso_exp_priority`: SnapdragonCamera `CaptureModule`
   [não verificado]. `msm_vidc` (kernel 4.9 `drivers/media/platform/msm/vidc`): operating
   rate → `msm_vidc_calc_freq`; low-latency → `VIDC_WORK_MODE_1` [não verificado].
+
+
+---
+
+## 7. Resultados medidos (Note 9 SM-N9600, 2026-10-20/21)
+
+Método: cada braço foi medido no aparelho com o app instalado (build do tree atual).
+**USB** = TCP via `adb forward` (127.0.0.1:47900) com `owc_probe_w.py` (cópia do
+`owc_probe.py` que descarta os 2 s iniciais do stream; latência por quadro
+captura→chegada no PC, offset por Ping/Pong de menor RTT). **Wi-Fi** = 2,4 GHz
+(phone 192.168.0.142, PC 192.168.0.108); UDP com `owc_core_probe.exe` (média por segundo
+de `cap->arr`, s ≥ 4). Os hops vêm do `latency breakdown` do phone (EWMA, 1ª linha
+descartada): **ISP** = sensor→resultado, **+enc** = até a saída do encoder, **+send** =
+até o socket. Braços intercalados (1–3 repetições), 20–40 s cada, mesma cena. A
+iluminação mudou durante a noite: só se comparam braços da mesma rodada. Os knobs
+foram trocados sem rebuild por `adb shell setprop debug.owc.<nome>` (lidos no início
+de cada stream; ver `util/debug_props.h`). Formato das células: `avg / p95` em ms;
+"r0 · r1" = repetições.
+
+### 7.1 Resumo
+
+| # | Proposta | Resultado | Decisão |
+|---|---|---|---|
+| P10 | Instrumentação (exposição, frameDuration, ISO, `PIPELINE_DEPTH`, "ISP efetivo") | Funciona. Achado: **ISP ≈ 70 ms + T_exp** a 30 fps (depth = 8): exp 33 → ISP 103; 16,7 → 87; 4 → 73. HS 720p: ISP ≈ 28 ms com exp 4,17 | **mantida** (log a cada 5 s + Stats) |
+| P2 | Usage do preview fantasma HS | Latência neutra; VSync hold eliminado (715 → 0 linhas/25 s). `USAGE_VIDEO_ENCODE` é recusado pelo framework | **mantida**: `COMPOSER_OVERLAY` (+ retry com `GPU_SAMPLED_IMAGE`) |
+| P4 | `operating-rate` > fps | 1080p30: +enc 23,5 → 12,6 ms (×2) / 10,3 (×4). **Mas >60 o OMX ignora `request-sync`** e ≥240 em 1080p não produz saída | **mantida com teto**: `max(fps, min(2×fps, 60))`, limitado por MB/s de 1080p@120 |
+| P4b | `vendor.qti-ext-enc-low-latency.enable` | desligar: +enc 23,5 → **69 ms** | **mantida** (essencial) |
+| P5 | Pacer UDP mais rápido / DSCP+`SO_PRIORITY` no TCP | Neutro no UDP (quadro P cabe no balde de 64 KB); DSCP no TCP inconclusivo (link instável) | **revertida** |
+| P3 | AE com prioridade de exposição (tags QTI) | Tags aceitas (`setEntry` OK), exposição **não muda** | **revertida** |
+| P1 | 60 fps em sessão normal | HAL fica em 33,33 ms em todos os braços | **descartada** (teto de 30 fps mantido) |
+| P6 | Intra-refresh em vez de IDR periódico | USB: latência igual, maior quadro 178 → 113 KB; Wi-Fi inconclusivo | **sem mudança de default** (preset no PC: `7=0, 9=30`) |
+| P7 | Keepalive phone→PC / BlackScreenActivity | Keepalive 10 Hz: RTT ocioso p95 **258–291 → 33–35 ms**. Activity: sem efeito (o Samsung continua "Dozing") | **keepalive mantido** (10 Hz); mudança Kotlin **revertida** |
+| P8 | 1 cópia em vez de 3; TCP por `iovec[3]` | +send USB ~3,0–3,6 → **1,3–1,9 ms** | **mantida** |
+| P14 | Fila HS pelo lote real (batch 4) | batch lido de `availableHighSpeedVideoConfigurations`; fila 60 fps: 8 → 2 quadros; 0 drops | **mantida** |
+| — | Perfil AVC High por padrão | +2,6 ms médios no phone (+enc +1,6) vs Baseline; o PC ganha ~7 % de bytes | **mantido** (pedido do coordenador; ver 7.10) |
+| — | Slow motion 240 fps (IDR ignorado; 220 fps) | causas: modo HFR do Venus e vazão do CABAC | **corrigido** (7.11) |
+
+Resultado líquido (USB, 1080p30, AE auto, mesma rodada, 2 rep.): defaults do início
+da rodada **111,8 · 111,0 / 120,3 · 120,8** → defaults finais **104,5 · 104,9 /
+113,0 · 114,9 ms** (−6,7 ms avg, −6,6 ms p95). HS 720p60: 48,7 · 48,8 → 50,5 · 50,2
+(custo do High), sem VSync hold.
+
+### 7.2 P10 — instrumentação
+
+`onCaptureCompleted` agora lê `SENSOR_EXPOSURE_TIME`, `SENSOR_FRAME_DURATION`,
+`SENSOR_SENSITIVITY` e `REQUEST_PIPELINE_DEPTH` (EWMA); o HS (Java) lê a exposição. O
+log mostra `exp X ms (eff ISP = ISP − exp/2) frameDur Y iso Z depth D`. Medido:
+`depth 8.0` constante na sessão normal; `frameDur 33.33` em todos os modos normais
+(prova o P1). O componente fixo de ~70 ms a 30 fps é o pipelining do CamX (≈2 períodos);
+só cai subindo o fps do sensor (HS).
+
+### 7.3 P2 — usage do preview fantasma (HS, USB)
+
+| Braço | 720p60 | 1080p60 | linhas VSync / 25 s |
+|---|---|---|---|
+| `GPU_SAMPLED_IMAGE` (antes) | 51,9 · 51,6 / 67,4 · 63,7 | 60,1 · 58,3 / 82,4 · 72,0 | 715 |
+| `VIDEO_ENCODE` | recusado: *"The 2 output surfaces must have different type"* → fallback normal | idem | — |
+| `COMPOSER_OVERLAY` | 52,0 · 52,0 / 65,9 · 64,7 | — | **0** |
+| `GPU_COLOR_OUTPUT` | 52,0 · 52,1 / 67,7 · 67,9 | — | 0 |
+
+A hipótese do hold atrasar o quadro do encoder não se confirmou (o quadro mantido
+pelo `max-fps-to-encoder` não espera o buffer de preview). Adotado `COMPOSER_OVERLAY`
+por ser neutro e eliminar o bloqueio das threads de callback do HAL.
+
+### 7.4 P4 — clock do encoder (USB)
+
+| Config | ×1 | ×2 | ×3 | ×4 | ×6 / ×8 |
+|---|---|---|---|---|---|
+| normal 1080p30 avg / p95 (+enc) | 117,7 · 116,7 / 127,8 · 125,8 (+23,5) | 106,8 · 106,9 / 117,6 · 118,6 (+12,6) | 122,2 / 130,6 (+10,0)¹ | 104,7 · 105,0 / 114,7 · 115,6 (+10,3) | ×6: 130,0 / 160,4 (+28,6); ×8 (240): **sem saída** |
+| `qti low-latency = 0` | 161,4 · 161,2 / 179,3 · 179,8 (+69,2) | — | — | 131,3 · 131,6 / 156,1 · 155,7 (+34,2) | — |
+| HS 1080p60 | 58,0 / 71,8 | 52,5 / 64,9 | — | **sem saída** (240) | — |
+| HS 720p60 | 51,9 / 66,7 | 43,7 / 58,3 | — | 44,2 / 57,9 | — |
+| 4K30 | 202,3 / 215,8 (+79,2) | 213,6 / 242,2 (+85,8) | — | — | — |
+
+¹ rodada já com cena escura (exp 33 ms); só o +enc é comparável.
+
+Teste de IDR sob demanda (`kf_test.py`: 1 `RequestKeyframe`/s, intervalo periódico 10 s):
+
+| operating-rate | 30 (1080p30 ×1) | 60 (×2) | 90 (×3) | 120 (×4) | 60 (HS60 ×1) | 120 (HS60 ×2) | 240 (HS240) |
+|---|---|---|---|---|---|---|---|
+| IDRs atendidos | 7/7 (61 ms) | 6/6 (50 ms) | **0/6** | **0/5** | 6/6 (39 ms) | **0/5** | **0/8** |
+
+→ acima de 60 o Venus entra no modo HFR e ignora `OMX_IndexConfigVideoIntraVOPRefresh`.
+Default final: `operating-rate = max(fps, min(2×fps, 60))` (1080p30 → 60), teto por MB/s
+(1080p@120); `kIdrSafeOperatingRate = 60` em `encoder_options.h`. O ganho de −8 ms do ×2
+no HS60 foi abandonado porque quebra o IDR sob demanda.
+
+### 7.5 P5 — pacer e DSCP (Wi-Fi)
+
+UDP 1080p30, 8 Mbps fixos (ABR off), 30 s:
+
+| Pacer (mult/piso/balde) | r0 avg / p95 | r1 avg / p95 | +send | perdas |
+|---|---|---|---|---|
+| 4×/20 M/64 KB (atual) | 127,1 / 131,0 | 126,7 / 127,5 | 3,1 | 0 · 0 |
+| 8×/40 M/64 KB | 137,5 / 152,7 | 127,7 / 135,3 | 2,7–3,0 | 2 · 0 |
+| 8×/100 M/128 KB | 138,9 / 191,1 | 126,1 / 128,2 | 3,0 | 7 · 0 |
+| 8×/40 M + `SO_PRIORITY 6` | 126,7 / 127,9 | 125,8 / 127,2 | 2,9–3,1 | 0 · 16 |
+
+Sem ganho: um quadro P de 33 KB cabe no balde de 64 KB e sai de uma vez; só IDRs são
+espaçados. TCP no Wi-Fi com DSCP EF + `SO_PRIORITY 6` (3 rep., duas rodadas): sem
+DSCP 139,7 · 223,4 · 203,0 e 140,9 · 143,6 · 151,4; com DSCP 197,0 · 147,0 · 153,6 e
+133,2 · 151,4 · 135,7 → inconclusivo (o link oscilava com RTT de 200–800 ms). **Achado
+novo:** com RTT ≈ 200 ms, o `SO_SNDBUF` de 64 KB limita o TCP a ~5 Mbps (BDP) — TCP
+em Wi-Fi com power-save desaba para 3–18 fps, o UDP não.
+
+### 7.6 P3 — AE com prioridade de exposição (USB, 1080p30)
+
+`ACameraManager_getTagFromName` **não existe** na `libcamera2ndk.so` deste Android 10
+Samsung (header do NDK diz API 29). Os IDs vieram de `dumpsys media.camera`
+(`use_iso_exp_priority` 0x80030000 i64, `select_priority` 0x80030002 i32) e foram
+passados por propriedade; `ACaptureRequest_setEntry_*` retornou OK.
+
+| Braço | r0 avg / p95 | r1 avg / p95 | exp (ms) | ISO |
+|---|---|---|---|---|
+| AE auto | 106,2 / 117,5 | 105,3 / 118,0 | 16,68 | 158 |
+| prioridade 4 ms | 104,3 / 117,1 | 104,5 / 116,5 | **16,68** | 156 |
+| AE off, 4 ms, ISO 800 (já disponível: `AeMode=0`) | 92,4 / 103,4 | 91,3 / 104,0 | 4,00 | 800 |
+
+Sem efeito → revertido. O caminho manual existente dá −14 ms (ISP 87 → 73).
+
+### 7.7 P1 — 60 fps na sessão normal (USB, 1080p)
+
+| Braço | avg / p95 | frameDur | exp |
+|---|---|---|---|
+| E1 AE [60,60] (não anunciado) | 105,2 / 115,8 | **33,33** | 16,67 |
+| E2 AE off + `SENSOR_FRAME_DURATION` 16,67 ms, exp 8 ms | 97,5 / 107,5 | **33,33** | 8,00 |
+| E2 com exp 4 ms | 92,4 · 91,3 / 103,4 · 104,0 | **33,33** | 4,00 |
+| E3 E1 + `recordingHint`, `samsungCamera`, `uniplugin.fps=60` | 105,1 / 116,7 | **33,33** | 16,67 |
+| E3b + `recordingMotionSpeedMode=1` | 105,5 / 115,1 | **33,33** | 16,67 |
+
+O HAL mantém 30 fps em todos os braços (sem session parameters no HAL 3.3) → **60 fps
+só no modo HS**. Código do experimento removido; teto `maxAeFps` mantido.
+
+### 7.8 P6 — intra-refresh (1080p30, 8 Mbps)
+
+| Braço | USB r0 avg / p95 / p99 | USB r1 avg / p95 / p99 | maior quadro |
+|---|---|---|---|
+| IDR a cada 2 s | 104,2 / 115,4 / 120,8 | 105,9 / 122,2 / 173,7 | 178–180 KB |
+| intra-refresh 30, sem IDR periódico | 104,6 / 115,6 / 119,9 | 105,8 / 117,7 / 145,9 | 113–115 KB |
+
+Wi-Fi UDP: 111,3 · 116,7 vs 115,2 · 111,0, com quedas de link (11,8 fps num braço) →
+inconclusivo. Sem mudança de default; o PC pode usar `KeyframeIntervalMs=0` +
+`IntraRefreshFrames=fps` no preset Wi-Fi. CBR no AVC não testado.
+
+### 7.9 P7 — Wi-Fi ocioso (RTT Ping/Pong a 4 Hz, 40 s, sem stream, tela apagada)
+
+| Estado | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| tela apagada (Dozing) | 11,8 · 19,2 | **257,9 · 291,0** | 337,5 · 478,2 | 588,9 · 541,3 |
+| + keepalive 10 Hz (UDP EF → PC:47803) | 12,5 · 9,8 | **32,8 · 35,1** | 44,4 · 63,6 | 51,4 · 72,7 |
+| BlackScreenActivity (resumida, tela continua Dozing) | 12,9 · 11,2 | 285,2 · 206,9 | 690,0 · 322,0 | 757,5 · 337,2 |
+| Activity + keepalive | 9,8 · 9,6 | 39,2 · 19,5 | 85,3 · 37,3 | 111,1 · 48,7 |
+
+O keepalive (4 bytes `OWCK`, DSCP EF, só com cliente conectado e sem vídeo, nunca em
+loopback/USB) resolve sozinho. A Activity foi aberta via `startActivity` (permitida por
+`SYSTEM_ALERT_WINDOW`), mas `setTurnScreenOn` não acorda este Samsung → sem ganho;
+mudança Kotlin revertida.
+
+### 7.10 P8, P14 e perfil High
+
+- **P8**: `buildFrame` copia o AU uma vez direto do buffer do codec (antes:
+  `tmp` → `EncodedFrame` → `tcpBuf_`); TCP envia `{TcpHeader, VideoFrameHeader (via
+  encodeVideoFrame), AU}` por `sendmsg`. +send USB 3,0–3,6 → 1,3–1,9 ms.
+  Callback assíncrono e `TCP_NOTSENT_LOWAT` não foram feitos (ganho esperado < 1 ms).
+- **P14**: `batch_size_max = 4` lido de `android.control.availableHighSpeedVideoConfigurations`
+  (chave crua `int[]`); fila HS = `max(MaxSendQueueFrames, ⌈4 × fps_enc / fps_sensor⌉)`.
+- **Perfil** (USB, 1080p30, operating-rate 60): High 104,5 · 104,9 / 113,0 · 114,9
+  (+enc 11,8–12,0) vs Baseline 101,5 · 102,7 / 110,6 · 112,0 (+enc 10,2–10,3) →
+  **High custa ~2,6 ms no phone**. Mantido como default (pedido do coordenador:
+  +0,5 ms de decode no PC, −7 % de redundância); revisar se a latência pesar mais.
+
+### 7.11 Slow motion 240 fps (pedido extra)
+
+1. **IDR sob demanda ignorado**: não é a guarda de 150 ms nem a flag "pending" (log
+   instrumentado: todo `request-sync` é enviado com status 0). O OMX.qcom ignora o
+   pedido sempre que o operating-rate passa de 60 (tabela 7.4); a 240 fps isso é
+   inevitável. Truques testados sem efeito: mudar `video-bitrate` junto com
+   `request-sync`, omitir `operating-rate`. Reiniciar o encoder custaria ≥ 1 s de
+   vídeo no HS (pior que esperar o IDR periódico). Correção: acima de 60 fps o
+   intervalo de IDR periódico é limitado a ≤ 1 s, e o PC recebe um aviso único
+   explicando que o pedido é ignorado.
+2. **220 vs 240 fps**: o sensor entrega 240 (espaçamento médio 3,85 ms nos resultados);
+   o gargalo é a vazão do CABAC do Venus em bitrate alto.
+
+| 720p, encoder 240 fps | fps no phone | +enc |
+|---|---|---|
+| High 40 Mbps | 211–219 | **+105,6 ms** (fila no encoder → câmera descarta) |
+| Baseline 40 Mbps | 233–238 | +16,4 |
+| High 20 Mbps | 234–236 | +18,7 |
+| High 10 Mbps | 234–236 | +18,9 |
+
+Correção: com fps > 120 e teto de bitrate > 20 Mbps o AVC usa Baseline (CAVLC)
+automaticamente. Reprodução do PC (`--prepare-slowmo 240`, 40 Mbps): **235,4 fps**
+gravados (antes 221,7), 0 descartados, +enc 15,7 ms (antes +104).
+
+### 7.12 Defaults finais (phone)
+
+| Item | Valor |
+|---|---|
+| Sessão | normal 1080p30, AE auto; HS opcional (720p/1080p, sensor 240) |
+| Perfil AVC | High (Main/Baseline se não houver); Baseline automático se fps > 120 e teto > 20 Mbps |
+| `operating-rate` | `max(fps, min(2×fps, 60))`, teto MB/s de 1080p@120 |
+| `vendor.qti-ext-enc-low-latency.enable` | 1 |
+| IDR periódico | `KeyframeIntervalMs` (2000); ≤ 1000 ms quando fps > 60 |
+| Preview fantasma HS | `COMPOSER_OVERLAY` (retry `GPU_SAMPLED_IMAGE`) |
+| Fila HS | `max(MaxSendQueueFrames, ⌈batch × fps_enc / fps_sensor⌉)`, batch do HAL (4) |
+| Pacer UDP | inalterado: `max(20 Mbps, 4 × bitrate)`, balde 64 KB |
+| Keepalive ocioso | 10 Hz, UDP EF para PC:47803 (não em USB) |
+| Overrides de teste | `debug.owc.{oprate_k, qti_ll, hs_usage, keepalive_hz, profile}` |
+
+Não feitos nesta rodada: P9 (knobs de processamento), P11 (HEVC preset), P12 (RNDIS),
+P13 (LTR), callback assíncrono / `TCP_NOTSENT_LOWAT` do P8, CBR no AVC (P6).

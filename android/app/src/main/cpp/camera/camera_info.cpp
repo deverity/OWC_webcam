@@ -45,6 +45,14 @@ std::pair<int, int> CameraDesc::hsRange(int w, int h) const {
   return best;
 }
 
+int CameraDesc::hsBatch(int w, int h) const {
+  const int f = hsCameraFps(w, h);
+  int b = std::max(1, f / 30);
+  for (const auto& c : hsConfigs)
+    if (c.width == w && c.height == h && c.fpsMax == f && c.batch > 0) b = std::min(b, c.batch);
+  return b;
+}
+
 std::vector<VideoSize> CameraDesc::hsSizes() const {
   std::vector<VideoSize> out;
   for (const auto& c : hsConfigs) {

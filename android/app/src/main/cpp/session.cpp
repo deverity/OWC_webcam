@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "util/clock.h"
+#include "util/debug_props.h"
 #include "util/log.h"
 
 namespace owc {
@@ -490,6 +491,12 @@ void Worker::onCommand(const std::vector<uint8_t>& payload) {
     case CommandId::RequestKeyframe:
       if (!streaming_) break;
       pipeline_->requestKeyframe(false);  // ignored if an IDR left < 150 ms ago
+      if (params_.stream.fps > kIdrSafeOperatingRate && !hfrIdrNoticeDone_) {
+        hfrIdrNoticeDone_ = true;
+        LOGW("encoder at %d fps runs in its high-frame-rate mode, which ignores on-demand IDR "
+             "requests; the next periodic IDR (every <= %d ms) recovers the stream",
+             params_.stream.fps, std::min(params_.stream.keyframeMs > 0 ? params_.stream.keyframeMs : 1000, 1000));
+      }
       keyReqs_.push_back(now);
       while (!keyReqs_.empty() && now - keyReqs_.front() > kKeyStormWindowMs) keyReqs_.pop_front();
       if (keyReqs_.size() >= kKeyStormCount && params_.stream.abr) {
@@ -643,6 +650,7 @@ void Worker::startStream(bool notify) {
     return;
   }
   streaming_ = true;
+  net_.setIdle(false);
   streamStartMs_ = monoMs();
   appliedVideoBitrate_ = currentBitrate_;
   lastEncFrames_ = lastEncBytes_ = 0;
@@ -650,6 +658,7 @@ void Worker::startStream(bool notify) {
   rcMeasuredBps_ = 0;
   encOutBpsEwma_ = 0;
   rcNoticeDone_ = false;
+  hfrIdrNoticeDone_ = false;
   applyQueuePolicy();
   bframeNoticeDone_ = false;
   pipeline_->takeCameraFrames();
@@ -671,6 +680,7 @@ void Worker::stopStream(bool notify) {
     pipeline_->stop();
     frameSender_ = nullptr;
     streaming_ = false;
+    net_.setIdle(true);
   }
   // notify=false: internal restart (reconfigure / camera loss), the app keeps
   // seeing "streaming" until the stream is really stopped or given up.
@@ -705,7 +715,14 @@ void Worker::applyQueuePolicy() {
   int q = params_.stream.maxQueue;
   // High-speed sessions deliver frames in bursts of sensorFps/30 (one burst
   // per 33 ms): a 2-frame queue would overflow on every burst.
-  if (streaming_ && pipeline_->highSpeedActive()) q = std::max(q, (params_.cameraFps() + 29) / 30);
+  // HS: the encoder receives batch x encFps / sensorFps frames per HAL batch
+  // (batch_size_max = 4 on SM-N9600 -> 1 frame per batch at 60 fps, 4 at 240).
+  if (streaming_ && pipeline_->highSpeedActive()) {
+    const CameraDesc& cd = params_.camera();
+    const int sensorFps = std::max(1, params_.cameraFps());
+    const int batch = cd.hsBatch(params_.stream.width, params_.stream.height);
+    q = std::max(q, (batch * params_.stream.fps + sensorFps - 1) / sensorFps);
+  }
   conn_->sender->setQueuePolicy(q, params_.stream.dropPolicy);
   queueAllowance_ = static_cast<uint32_t>(std::max(1, q - 1));
 }
@@ -766,11 +783,14 @@ void Worker::logLatencyBreakdown(const net::Sender::Stats& ss) {
   const float isp = pipeline_->ispLatencyMs();
   const float enc = pipeline_->encodeLatencyMs();
   const float sent = ss.sentLatencyUs / 1000.0f;
+  const float exp = pipeline_->exposureMs();
   LOGI_PC("latency breakdown (%s %dx%d@%d): sensor->ISP done %.1f ms | ->encoder out %.1f ms (+%.1f) | "
-          "->sent %.1f ms (+%.1f) | queue %u, dropped %u",
+          "->sent %.1f ms (+%.1f) | queue %u, dropped %u | exp %.2f ms (eff ISP %.1f) frameDur %.2f ms "
+          "iso %d depth %.1f",
           pipeline_->highSpeedActive() ? "high-speed" : "normal", params_.stream.width,
           params_.stream.height, params_.stream.fps, isp, enc, enc - isp, sent, sent - enc, ss.queued,
-          ss.dropped);
+          ss.dropped, exp, isp - exp / 2, pipeline_->frameDurationMs(), pipeline_->iso(),
+          pipeline_->pipelineDepth());
 }
 
 // Camera characteristics are re-read on every connection (no stream is running

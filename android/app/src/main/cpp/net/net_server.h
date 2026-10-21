@@ -65,6 +65,10 @@ class NetServer {
              Callbacks* cb, std::string& err);
   void stop();
   int udpFd() const { return udpFd_; }
+  // Phone->PC keepalive while a client is connected and idle (no video): a
+  // tiny UDP datagram with DSCP EF keeps the Wi-Fi radio from DTIM-skipping
+  // power save. Thread-safe.
+  void setIdle(bool idle) { idle_ = idle; }
 
  private:
   void loop();
@@ -74,14 +78,18 @@ class NetServer {
   void readUdpVideo();
   void readDiscovery();
   void sendAnnounce();
+  void sendKeepalive();
 
   Callbacks* cb_ = nullptr;
   int listenFd_ = -1, udpFd_ = -1, discFd_ = -1, wakeFd_ = -1, announceFd_ = -1;
   uint16_t controlPort_ = 0, udpPort_ = 0, announcePort_ = 0;
   int64_t nextAnnounceMs_ = 0;
+  int64_t nextKeepaliveMs_ = 0;
+  int keepaliveHz_ = 0;
   uint32_t announceErrors_ = 0;
   std::thread thread_;
   std::atomic<bool> stop_{false};
+  std::atomic<bool> idle_{true};
   // Net-thread-only state.
   std::shared_ptr<ClientConn> client_;
   TcpFrameParser parser_;

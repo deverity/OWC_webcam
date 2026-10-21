@@ -62,6 +62,7 @@ public final class HighSpeedCamera {
     private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final AtomicInteger frames = new AtomicInteger();
     private volatile long ispNsEwma;
+    private volatile long expNsEwma;
     private volatile String failure;
     private CameraDevice device;
     private CameraConstrainedHighSpeedCaptureSession session;
@@ -83,7 +84,11 @@ public final class HighSpeedCamera {
         return (CameraManager) appContext().getSystemService(Context.CAMERA_SERVICE);
     }
 
-    /** "id,w,h,fpsMin,fpsMax;" for every constrained high-speed configuration. */
+    /**
+     * "id,w,h,fpsMin,fpsMax,batch;" for every constrained high-speed configuration.
+     * batch = batch_size_max from android.control.availableHighSpeedVideoConfigurations
+     * (read through a raw int[] key; 0 when unavailable).
+     */
     public static String queryConfigs() {
         StringBuilder sb = new StringBuilder();
         try {
@@ -100,10 +105,22 @@ public final class HighSpeedCamera {
                 if (!hs) continue;
                 StreamConfigurationMap map = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
                 if (map == null) continue;
+                int[] raw = null;
+                try {
+                    raw = cc.get(new CameraCharacteristics.Key<>(
+                            "android.control.availableHighSpeedVideoConfigurations", int[].class));
+                } catch (Throwable ignored) {
+                }
                 for (Size s : map.getHighSpeedVideoSizes()) {
                     for (Range<Integer> r : map.getHighSpeedVideoFpsRangesFor(s)) {
+                        int batch = 0;
+                        for (int i = 0; raw != null && i + 4 < raw.length; i += 5) {
+                            if (raw[i] == s.getWidth() && raw[i + 1] == s.getHeight() && raw[i + 2] == r.getLower()
+                                    && raw[i + 3] == r.getUpper()) batch = raw[i + 4];
+                        }
                         sb.append(id).append(',').append(s.getWidth()).append(',').append(s.getHeight())
-                                .append(',').append(r.getLower()).append(',').append(r.getUpper()).append(';');
+                                .append(',').append(r.getLower()).append(',').append(r.getUpper())
+                                .append(',').append(batch).append(';');
                     }
                 }
             }
@@ -116,15 +133,25 @@ public final class HighSpeedCamera {
 
     /** Blocking open; returns null (see {@link #lastError()}) on failure. */
     public static HighSpeedCamera open(String cameraId, Surface target, int width, int height,
-                                       int fpsMin, int fpsMax, int[] controls) {
+                                       int fpsMin, int fpsMax, int[] controls, int previewUsage) {
         HighSpeedCamera c = null;
         try {
             CameraManager cm = cameraManager();
             Integer src = cm.getCameraCharacteristics(cameraId).get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
             c = new HighSpeedCamera(target, fpsMin, fpsMax,
                     src != null && src == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME);
-            if (c.start(cm, cameraId, width, height, controls)) return c;
+            if (c.start(cm, cameraId, width, height, controls, previewUsage)) return c;
             sLastError = c.failure != null ? c.failure : "unknown failure";
+            if (previewUsage != 0) {
+                // Default dummy-preview usage (COMPOSER_OVERLAY) refused on this device:
+                // retry with the texture usage that is known to work everywhere.
+                Log.w(TAG, "preview usage " + previewUsage + " failed (" + sLastError + "); retrying with GPU_SAMPLED_IMAGE");
+                c.shutdown(false);
+                c = new HighSpeedCamera(target, fpsMin, fpsMax,
+                        src != null && src == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME);
+                if (c.start(cm, cameraId, width, height, controls, 0)) return c;
+                sLastError = c.failure != null ? c.failure : "unknown failure";
+            }
         } catch (Throwable t) {
             sLastError = "open: " + t;
         }
@@ -149,7 +176,17 @@ public final class HighSpeedCamera {
 
     @SuppressLint("MissingPermission")
     @SuppressWarnings("deprecation")  // createConstrainedHighSpeedCaptureSession: fine on API 26+
-    private boolean start(CameraManager cm, String id, int width, int height, int[] controls) throws Exception {
+    private static long usageFor(int mode) {
+        switch (mode) {
+            case 1: return HardwareBuffer.USAGE_VIDEO_ENCODE;
+            case 2: return HardwareBuffer.USAGE_COMPOSER_OVERLAY;
+            case 3: return HardwareBuffer.USAGE_GPU_COLOR_OUTPUT;
+            default: return HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE;
+        }
+    }
+
+    private boolean start(CameraManager cm, String id, int width, int height, int[] controls,
+                          int previewUsage) throws Exception {
         final CountDownLatch opened = new CountDownLatch(1);
         cm.openCamera(id, new CameraDevice.StateCallback() {
             @Override public void onOpened(CameraDevice d) {
@@ -179,7 +216,8 @@ public final class HighSpeedCamera {
         List<Surface> outputs = new ArrayList<>();
         if (Build.VERSION.SDK_INT >= 29) {
             dummyPreview = ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 3,
-                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE);
+                    usageFor(previewUsage));
+            Log.i(TAG, "dummy preview usage mode " + previewUsage + " = 0x" + Long.toHexString(usageFor(previewUsage)));
             dummyPreview.setOnImageAvailableListener(r -> {
                 Image img = r.acquireLatestImage();
                 if (img != null) img.close();
@@ -238,6 +276,11 @@ public final class HighSpeedCamera {
             if (d <= 0 || d > 2_000_000_000L) return;
             long prev = ispNsEwma;
             ispNsEwma = prev == 0 ? d : prev + (d - prev) / 16;
+            Long exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+            if (exp != null) {
+                long pe = expNsEwma;
+                expNsEwma = pe == 0 ? exp : pe + (exp - pe) / 16;
+            }
         }
     };
 
@@ -305,13 +348,21 @@ public final class HighSpeedCamera {
         return ispNsEwma / 1e6f;
     }
 
+    public float exposureMs() {
+        return expNsEwma / 1e6f;
+    }
+
     /** Null while healthy. */
     public String failure() {
         return failure;
     }
 
-    /** Blocking close (<= ~2 s). Idempotent. */
+    /** Blocking close (<= ~2 s). Idempotent. Releases the target surface reference. */
     public synchronized void close() {
+        shutdown(true);
+    }
+
+    private synchronized void shutdown(boolean releaseTarget) {
         try {
             if (session != null) {
                 try {
@@ -338,6 +389,6 @@ public final class HighSpeedCamera {
             thread.join(1000);
         } catch (InterruptedException ignored) {
         }
-        target.release();  // drops the reference taken by ANativeWindow_toSurface
+        if (releaseTarget) target.release();  // drops the reference taken by ANativeWindow_toSurface
     }
 }

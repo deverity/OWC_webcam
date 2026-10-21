@@ -199,6 +199,7 @@ void VideoEncoder::requestKeyframe(bool force) {
   media_status_t st = AMediaCodec_setParameters(codec_, f);
   AMediaFormat_delete(f);
   if (st != AMEDIA_OK) LOGW_LOCAL("setParameters(request-sync) failed: %d", st);
+
 }
 
 int64_t VideoEncoder::toMonotonic(int64_t ptsUs) {
@@ -260,7 +261,7 @@ void VideoEncoder::handleConfig(const uint8_t* data, size_t len) {
   if (sink_) sink_->onVideoFormat(vf);
 }
 
-void VideoEncoder::handleFrame(const uint8_t* data, size_t len, int64_t ptsUs, uint32_t flags) {
+FramePtr VideoEncoder::buildFrame(const uint8_t* data, size_t len, int64_t ptsUs, uint32_t flags) {
   const Codec codec = params_.settings.codec;
   const bool key = (flags & kFlagKeyFrame) != 0;
   bool hasPs = false;
@@ -268,7 +269,7 @@ void VideoEncoder::handleFrame(const uint8_t* data, size_t len, int64_t ptsUs, u
   if (key) psLen = paramSetPrefix(codec, data, len, hasPs);
   if (!formatSent_) {
     // No CODEC_CONFIG buffer seen: derive the CSD from the IDR's prefix.
-    if (!key || !hasPs || psLen == 0) return;  // undecodable without config
+    if (!key || !hasPs || psLen == 0) return nullptr;  // undecodable without config
     handleConfig(data, psLen);
   }
   const int64_t now = monoUs();
@@ -297,8 +298,7 @@ void VideoEncoder::handleFrame(const uint8_t* data, size_t len, int64_t ptsUs, u
   const int32_t sample = static_cast<int32_t>((now - cap) / 10);  // ms * 100
   const int32_t prev = latencyMsX100_.load(std::memory_order_relaxed);
   latencyMsX100_.store(prev == 0 ? sample : prev + (sample - prev) / 8, std::memory_order_relaxed);
-
-  if (sink_ && sink_->onEncodedFrame(std::move(f))) requestKeyframe(true);
+  return f;
 }
 
 void VideoEncoder::outputLoop() {
@@ -319,10 +319,11 @@ void VideoEncoder::outputLoop() {
           handleConfig(d, n);
           AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(idx), false);
         } else {
-          // Copy out, release the codec buffer first, then deliver (delivery may block).
-          std::vector<uint8_t> tmp(d, d + n);
+          // One copy into the frame, release the codec buffer, then deliver
+          // (delivery may block under LatencyDropPolicy=queue).
+          FramePtr f = buildFrame(d, n, info.presentationTimeUs, flags);
           AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(idx), false);
-          handleFrame(tmp.data(), tmp.size(), info.presentationTimeUs, flags);
+          if (f && sink_ && sink_->onEncodedFrame(std::move(f))) requestKeyframe(true);
         }
       } else {
         AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(idx), false);

@@ -253,11 +253,15 @@ bool Sender::sendVideoTcp(const EncodedFrame& f, uint32_t seq) {
   h.frame_seq = seq;
   h.capture_ts_us = static_cast<uint64_t>(f.captureUs);
   h.flags = f.flags;
-  encodeVideoFrame(h, f.au.data(), f.au.size(), tcpBuf_);
+  // Frame header only (au_len 0) through the protocol encoder, then the AU in
+  // place: no per-frame copy of the access unit.
+  encodeVideoFrame(h, nullptr, 0, tcpBuf_);
   uint8_t hdr[kTcpHeaderSize];
-  writeTcpHeader(hdr, MsgType::VideoFrame, static_cast<uint32_t>(tcpBuf_.size()));
-  iovec iov[2] = {{hdr, kTcpHeaderSize}, {tcpBuf_.data(), tcpBuf_.size()}};
-  return sendAll(tcp_->fd(), iov, 2, kStallMs, &abort_) == SendResult::Ok;
+  writeTcpHeader(hdr, MsgType::VideoFrame, static_cast<uint32_t>(tcpBuf_.size() + f.au.size()));
+  iovec iov[3] = {{hdr, kTcpHeaderSize},
+                  {tcpBuf_.data(), tcpBuf_.size()},
+                  {const_cast<uint8_t*>(f.au.data()), f.au.size()}};
+  return sendAll(tcp_->fd(), iov, 3, kStallMs, &abort_) == SendResult::Ok;
 }
 
 namespace {

@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "util/clock.h"
+#include "util/debug_props.h"
 #include "util/log.h"
 #include "util/thread.h"
 
@@ -64,6 +65,8 @@ bool Pipeline::start(ParamStore& ps, int bitrate, ANativeWindow* preview,
   for (size_t si = 0; si < sizes.size() && !ok; ++si) {
     ps.setActualSize(sizes[si].width, sizes[si].height);
     p.settings = ps.encoderSettings(bitrate);
+    p.settings.operatingRateMult = static_cast<int>(debugProp("oprate_k", p.settings.operatingRateMult));
+    p.settings.vendorLowLatency = debugProp("qti_ll", 1) != 0;
     static const int kAllStages[] = {0, 1, 2, 3};
     static const int kDownsizeStages[] = {1, 3};
     const int* stages = si == 0 ? kAllStages : kDownsizeStages;
@@ -95,7 +98,7 @@ bool Pipeline::start(ParamStore& ps, int bitrate, ANativeWindow* preview,
     const auto range = cd.hsRange(ps.stream.width, ps.stream.height);
     if (preview) LOGW("local preview is not available in high-speed mode");
     if (!hs_->open(cd, encoder_.inputSurface(), ps.stream.width, ps.stream.height, range.first,
-                   range.second, ps.controls, e)) {
+                   range.second, ps.controls, static_cast<int>(debugProp("hs_usage", 2)), e)) {
       encoder_.stop();
       err = "high-speed session failed: " + e;
       return false;

@@ -144,6 +144,7 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   uint32_t queueAllowance_ = 1;   // frames the send queue may hold before it counts as growing
   double rcMeasuredBps_ = 0;
   bool rcNoticeDone_ = false;
+  bool hfrIdrNoticeDone_ = false;
 
   // Encoder output thread -> current sender (see app_core.h).
   net::Sender* frameSender_ = nullptr;

@@ -16,6 +16,7 @@ namespace owc {
 // getHighSpeedVideoSizes/FpsRangesFor, queried through Java).
 struct HsConfig {
   int width = 0, height = 0, fpsMin = 0, fpsMax = 0;
+  int batch = 0;  // batch_size_max (availableHighSpeedVideoConfigurations[4]); 0 = unknown
 };
 
 struct CameraDesc {
@@ -52,6 +53,8 @@ struct CameraDesc {
   std::vector<VideoSize> hsSizes() const;  // max_fps = hsCameraFps
   // Advertised range used for hsCameraFps (fixed [f,f] preferred).
   std::pair<int, int> hsRange(int w, int h) const;
+  // Frames per HAL batch for that size (fpsMax/30 capped by batch_size_max).
+  int hsBatch(int w, int h) const;
 };
 
 std::vector<CameraDesc> enumerateCameras(ACameraManager* mgr, bool verbose = true);

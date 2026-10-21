@@ -36,7 +36,8 @@ jmethodID g_onNativeEvent = nullptr;
 struct HsJava {
   jclass cls = nullptr;  // GlobalRef
   jmethodID queryConfigs = nullptr, open = nullptr, lastError = nullptr, apply = nullptr,
-            focusAt = nullptr, takeFrames = nullptr, ispLatencyMs = nullptr, failure = nullptr,
+            focusAt = nullptr, takeFrames = nullptr, ispLatencyMs = nullptr, exposureMs = nullptr,
+            failure = nullptr,
             close = nullptr;
 } g_hs;
 
@@ -52,16 +53,17 @@ void cacheHighSpeedClass(JNIEnv* env) {
   HsJava h;
   h.queryConfigs = env->GetStaticMethodID(c, "queryConfigs", "()Ljava/lang/String;");
   h.open = env->GetStaticMethodID(c, "open",
-                                  "(Ljava/lang/String;Landroid/view/Surface;IIII[I)Lcom/owc/webcam/hs/HighSpeedCamera;");
+                                  "(Ljava/lang/String;Landroid/view/Surface;IIII[II)Lcom/owc/webcam/hs/HighSpeedCamera;");
   h.lastError = env->GetStaticMethodID(c, "lastError", "()Ljava/lang/String;");
   h.apply = env->GetMethodID(c, "apply", "([I)Z");
   h.focusAt = env->GetMethodID(c, "focusAt", "(IIII)Z");
   h.takeFrames = env->GetMethodID(c, "takeFrames", "()I");
   h.ispLatencyMs = env->GetMethodID(c, "ispLatencyMs", "()F");
+  h.exposureMs = env->GetMethodID(c, "exposureMs", "()F");
   h.failure = env->GetMethodID(c, "failure", "()Ljava/lang/String;");
   h.close = env->GetMethodID(c, "close", "()V");
   if (clearExc(env) || !h.queryConfigs || !h.open || !h.lastError || !h.apply || !h.focusAt ||
-      !h.takeFrames || !h.ispLatencyMs || !h.failure || !h.close) {
+      !h.takeFrames || !h.ispLatencyMs || !h.exposureMs || !h.failure || !h.close) {
     LOGW_LOCAL("HighSpeedCamera helper has an unexpected shape: high-speed mode disabled");
     env->DeleteLocalRef(c);
     return;
@@ -111,7 +113,7 @@ jintArray hsControls(JNIEnv* env, const owc::CameraDesc& d, const owc::CameraCon
 class JniHighSpeed : public owc::HighSpeedBackend {
  public:
   bool open(const owc::CameraDesc& d, ANativeWindow* target, int width, int height, int fpsMin,
-            int fpsMax, const owc::CameraControls& c, std::string& err) override {
+            int fpsMax, const owc::CameraControls& c, int previewUsage, std::string& err) override {
     close();
     JNIEnv* env = hsEnv();
     if (!env || !g_hs.cls) {
@@ -121,7 +123,8 @@ class JniHighSpeed : public owc::HighSpeedBackend {
     jobject surface = ANativeWindow_toSurface(env, target);
     jstring id = env->NewStringUTF(d.info.id.c_str());
     jintArray ctl = hsControls(env, d, c);
-    jobject o = surface ? env->CallStaticObjectMethod(g_hs.cls, g_hs.open, id, surface, width, height, fpsMin, fpsMax, ctl)
+    jobject o = surface ? env->CallStaticObjectMethod(g_hs.cls, g_hs.open, id, surface, width, height, fpsMin, fpsMax, ctl,
+                                             previewUsage)
                         : nullptr;
     if (clearExc(env)) o = nullptr;
     if (o) {
@@ -178,6 +181,13 @@ class JniHighSpeed : public owc::HighSpeedBackend {
     JNIEnv* env = obj_ ? hsEnv() : nullptr;
     if (!env) return 0;
     jfloat v = env->CallFloatMethod(obj_, g_hs.ispLatencyMs);
+    return clearExc(env) ? 0.0f : v;
+  }
+
+  float exposureMs() override {
+    JNIEnv* env = obj_ ? hsEnv() : nullptr;
+    if (!env) return 0;
+    jfloat v = env->CallFloatMethod(obj_, g_hs.exposureMs);
     return clearExc(env) ? 0.0f : v;
   }
 
@@ -316,7 +326,8 @@ void queryHighSpeed(JNIEnv* env, owc::StartOptions& o) {
     pos = end + 1;
     char id[64] = {0};
     owc::HsConfig c;
-    if (sscanf(item.c_str(), "%63[^,],%d,%d,%d,%d", id, &c.width, &c.height, &c.fpsMin, &c.fpsMax) == 5)
+    if (sscanf(item.c_str(), "%63[^,],%d,%d,%d,%d,%d", id, &c.width, &c.height, &c.fpsMin, &c.fpsMax,
+               &c.batch) >= 5)
       o.hsConfigs.emplace_back(id, c);
   }
   o.hsBackend = &g_hsBackend;

@@ -86,7 +86,8 @@ class VideoEncoder {
  private:
   void outputLoop();
   void handleConfig(const uint8_t* data, size_t len);
-  void handleFrame(const uint8_t* data, size_t len, int64_t ptsUs, uint32_t flags);
+  // Builds the frame straight from the codec buffer (the only copy); nullptr = drop.
+  FramePtr buildFrame(const uint8_t* data, size_t len, int64_t ptsUs, uint32_t flags);
   int64_t toMonotonic(int64_t ptsUs);
   void release();
 

@@ -191,9 +191,21 @@ const FormatKey kFormatKeys[] = {
     // Meaningless with B-frames, so only set when bframes == 0.
     {"latency", KeyTier::Optional, Kind::I32,
      [](const EncoderSettings& s, const EncoderCaps&, int, double& v) { v = 1; return s.bframes == 0; }, nullptr},
-    // Clock the encoder for the real rate (not Short.MAX: may fail on encoders).
+    // Venus clock vote (msm_vidc scales with operating-rate). Measured on SM-N9600
+    // (docs/DEVICE_LATENCY_ADVANCED.md, P4): 2x fps cuts the encode hop at
+    // 1080p30 from ~23 to ~12 ms. BUT above 60 the component switches to its
+    // high-frame-rate mode and silently ignores request-sync (on-demand IDR),
+    // and above the 1080p@120 macroblock rate it stops producing output. So:
+    // max(fps, min(2 x fps, 60)), MB-capped. Above 60 fps it is just fps.
     {"operating-rate", KeyTier::Optional, Kind::I32,
-     [](const EncoderSettings& s, const EncoderCaps&, int, double& v) { v = s.fps; return true; }, nullptr},
+     [](const EncoderSettings& s, const EncoderCaps&, int, double& v) {
+       const int64_t mbs = static_cast<int64_t>((s.width + 15) / 16) * ((s.height + 15) / 16);
+       const int64_t cap = mbs > 0 ? 979200 / mbs : s.fps;  // 1080p (8160 MB) x 120
+       const int64_t want = std::min<int64_t>(static_cast<int64_t>(s.fps) * std::max(1, s.operatingRateMult),
+                                              kIdrSafeOperatingRate);
+       v = static_cast<double>(std::max<int64_t>(s.fps, std::min(want, cap)));
+       return s.operatingRateMult > 0;
+     }, nullptr},
     {"max-bframes", KeyTier::Optional, Kind::I32,
      [](const EncoderSettings& s, const EncoderCaps&, int api, double& v) {
        v = (s.codec == Codec::H264 && s.profile == 0) ? 0 : s.bframes;
@@ -226,7 +238,7 @@ const FormatKey kFormatKeys[] = {
     // ---- vendor keys (stage 1 removes). Guarded by codec name; when the probe
     // listed the component's vendor keys, also by presence in that list.
     {"vendor.qti-ext-enc-low-latency.enable", KeyTier::Vendor, Kind::I32,
-     [](const EncoderSettings&, const EncoderCaps&, int, double& v) { v = 1; return true; }, qcom},
+     [](const EncoderSettings& s, const EncoderCaps&, int, double& v) { v = s.vendorLowLatency ? 1 : 0; return true; }, qcom},
     {"vendor.qti-ext-enc-qp-range.qp-i-min", KeyTier::Vendor, Kind::I32,
      [](const EncoderSettings& s, const EncoderCaps&, int, double& v) { v = s.qpMin > 0 ? s.qpMin : 1; return qpOn(s); }, qcom},
     {"vendor.qti-ext-enc-qp-range.qp-i-max", KeyTier::Vendor, Kind::I32,
