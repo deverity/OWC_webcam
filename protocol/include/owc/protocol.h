@@ -77,7 +77,9 @@ enum class MsgType : uint16_t {
 };
 
 enum class VideoTransport : uint8_t { Tcp = 0, Udp = 1 };
-enum class Codec : uint8_t { H264 = 0, Hevc = 1 };
+// Append-only. Av1 is reserved for future hardware encoders ("video/av01");
+// a peer only uses a codec both sides advertise (codec_mask / PC decoder probe).
+enum class Codec : uint8_t { H264 = 0, Hevc = 1, Av1 = 2 };
 constexpr uint32_t codecBit(Codec c) { return 1u << static_cast<uint8_t>(c); }
 
 // ---------------------------------------------------------------- messages
