@@ -56,6 +56,7 @@ struct StartOptions {
   std::string deviceName, model;
   int apiLevel = 26;
   uint16_t controlPort = 47800, udpPort = 47801, discoveryPort = 47802;
+  uint16_t announcePort = kDefaultAnnouncePort;  // 0 = no announcements
   // Optional MediaCodecList info gathered on the Java side (javaInfo=true).
   EncoderCapsSet javaCaps;
   // TEST ONLY (owc_selftest): synthetic frames when the camera cannot be opened.

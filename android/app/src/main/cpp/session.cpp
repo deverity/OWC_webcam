@@ -45,7 +45,8 @@ Worker::~Worker() {
 }
 
 bool Worker::start(std::string& err) {
-  if (!net_.start(opts_.controlPort, opts_.udpPort, opts_.discoveryPort, this, err)) return false;
+  if (!net_.start(opts_.controlPort, opts_.udpPort, opts_.discoveryPort, opts_.announcePort, this, err))
+    return false;
   thread_ = std::thread(&Worker::run, this);
   return true;
 }
@@ -528,9 +529,10 @@ void Worker::onCommand(const std::vector<uint8_t>& payload) {
 void Worker::onReceiverReport(const std::vector<uint8_t>& payload) {
   ReceiverReport rr;
   if (!decode(payload.data(), payload.size(), rr)) return;
-  if (!params_.stream.abr || !streaming_ || !conn_) return;
-  const auto st = conn_->sender->stats();
-  if (abr_.onReceiverReport(rr, st.queued, params_.stream.fps, monoMs())) applyBitrate(false);
+  if (!streaming_ || !conn_) return;
+  // Always fed: the loss estimate also drives FecPercent=-1 (auto) without ABR.
+  const bool changed = abr_.onReceiverReport(rr, abrLocal(), monoMs());
+  if (changed && params_.stream.abr) applyBitrate(false);
   else if (params_.stream.fecPercent == -1 && effectiveFecPercent() != appliedFec_) applyBitrate(true);
 }
 
@@ -546,6 +548,8 @@ void Worker::sendStats(int64_t now) {
     s.encode_fps = static_cast<float>((ef - lastEncFrames_) / dt);
     s.bitrate_bps = static_cast<uint32_t>((eb - lastEncBytes_) * 8 / dt);
     rateControlCheck(s.bitrate_bps, now);
+    if (now - streamStartMs_ > 1500)
+      encOutBpsEwma_ = encOutBpsEwma_ == 0 ? s.bitrate_bps : 0.5 * encOutBpsEwma_ + 0.5 * s.bitrate_bps;
     s.encode_latency_ms = pipeline_->encodeLatencyMs();
     lastEncFrames_ = ef;
     lastEncBytes_ = eb;
@@ -579,6 +583,7 @@ void Worker::sendStats(int64_t now) {
     const bool overflow = ss.overflows != lastOverflows_;
     const bool backlog = ss.avgFrameBytes > 0 && ss.tcpOutq > 3 * ss.avgFrameBytes;
     if ((overflow || backlog) && abr_.onLocalCongestion(now)) applyBitrate(false);
+    else if (abr_.tick(abrLocal(), now)) applyBitrate(false);
   }
   lastOverflows_ = ss.overflows;
   updateStatus();
@@ -643,6 +648,7 @@ void Worker::startStream(bool notify) {
   lastEncFrames_ = lastEncBytes_ = 0;
   rcFactor_ = 1.0;
   rcMeasuredBps_ = 0;
+  encOutBpsEwma_ = 0;
   rcNoticeDone_ = false;
   applyQueuePolicy();
   bframeNoticeDone_ = false;
@@ -701,6 +707,17 @@ void Worker::applyQueuePolicy() {
   // per 33 ms): a 2-frame queue would overflow on every burst.
   if (streaming_ && pipeline_->highSpeedActive()) q = std::max(q, (params_.cameraFps() + 29) / 30);
   conn_->sender->setQueuePolicy(q, params_.stream.dropPolicy);
+  queueAllowance_ = static_cast<uint32_t>(std::max(1, q - 1));
+}
+
+Abr::Local Worker::abrLocal() {
+  Abr::Local l;
+  if (conn_) l.queued = conn_->sender->stats().queued;
+  l.queueAllowance = queueAllowance_;
+  // Compare like with like: the ABR target is the wire rate (video + FEC parity).
+  const int fec = std::max(0, appliedFec_);
+  l.encoderBps = static_cast<uint32_t>(encOutBpsEwma_ * (100 + fec) / 100);
+  return l;
 }
 
 void Worker::rateControlCheck(uint32_t measuredBps, int64_t now) {

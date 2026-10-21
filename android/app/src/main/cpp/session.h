@@ -93,6 +93,7 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   void fallbackToNormal(const std::string& why);
   void logLatencyBreakdown(const net::Sender::Stats& ss);
   void applyQueuePolicy();
+  Abr::Local abrLocal();
   void rateControlCheck(uint32_t measuredBps, int64_t now);
 
   void emit(int type, int i, const std::string& s);
@@ -139,6 +140,8 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   // Closed-loop correction for encoders that overshoot their target (seen in
   // high-speed mode on OMX.qcom): encoder bitrate = target x rcFactor_.
   double rcFactor_ = 1.0;
+  double encOutBpsEwma_ = 0;      // measured encoder output (ABR app-limited detection)
+  uint32_t queueAllowance_ = 1;   // frames the send queue may hold before it counts as growing
   double rcMeasuredBps_ = 0;
   bool rcNoticeDone_ = false;
 

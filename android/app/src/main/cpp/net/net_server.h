@@ -8,6 +8,9 @@
 //   - UDP video socket (udpPort): Punch -> validate session_id, remember the
 //     source address, reply PunchAck. The same fd is used by the Sender for video.
 //   - UDP discovery socket (discoveryPort): DiscoveryRequest -> DiscoveryReply.
+//   - Announce (DiscoveryReply kind=3) broadcast to announcePort every 2 s while
+//     idle, every 5 s (busy=1) while a client is connected: phones in doze drop
+//     incoming broadcasts (APF), but can still send them, so the PC listens.
 // The client socket is shared (shared_ptr<Socket>) with the Sender; whoever
 // wants to drop the client calls Socket::shutdownBoth(), this loop sees EOF
 // and reports onClientDisconnected() exactly once.
@@ -58,8 +61,8 @@ class NetServer {
 
   // Binds everything synchronously (so the caller learns about port errors),
   // then starts the thread.
-  bool start(uint16_t controlPort, uint16_t udpPort, uint16_t discoveryPort, Callbacks* cb,
-             std::string& err);
+  bool start(uint16_t controlPort, uint16_t udpPort, uint16_t discoveryPort, uint16_t announcePort,
+             Callbacks* cb, std::string& err);
   void stop();
   int udpFd() const { return udpFd_; }
 
@@ -70,10 +73,13 @@ class NetServer {
   void dropClient(const char* why);
   void readUdpVideo();
   void readDiscovery();
+  void sendAnnounce();
 
   Callbacks* cb_ = nullptr;
-  int listenFd_ = -1, udpFd_ = -1, discFd_ = -1, wakeFd_ = -1;
-  uint16_t controlPort_ = 0, udpPort_ = 0;
+  int listenFd_ = -1, udpFd_ = -1, discFd_ = -1, wakeFd_ = -1, announceFd_ = -1;
+  uint16_t controlPort_ = 0, udpPort_ = 0, announcePort_ = 0;
+  int64_t nextAnnounceMs_ = 0;
+  uint32_t announceErrors_ = 0;
   std::thread thread_;
   std::atomic<bool> stop_{false};
   // Net-thread-only state.

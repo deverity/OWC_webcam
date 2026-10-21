@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "abr.h"
 #include "app_core.h"
 #include "encoder/encoder_options.h"
 #include "encoder/video_encoder.h"
@@ -113,6 +114,83 @@ void runProbe() {
       }
     }
     CHECK(okStage >= 0, "%s configurable (stage %d)", c.what, okStage);
+  }
+}
+
+// ------------------------------------------------------------------ ABR simulation
+// Pure controller logic (no device features): 4 Hz ReceiverReports.
+void runAbrSim() {
+  printf("== ABR simulation\n");
+  const int ceiling = 8000000;
+  struct Sim {
+    Abr abr;
+    ReceiverReport rr;
+    int64_t t = 0;
+    int minAfter5s = 1 << 30;
+    // One 250 ms report: fragments at the current target, `loss` fraction lost.
+    void step(double loss, float grad, uint32_t queued, uint32_t encBps, uint32_t recvBps) {
+      t += 250;
+      const uint32_t frags = 20;
+      const uint32_t lost = static_cast<uint32_t>(frags * loss + 0.5);
+      rr.fragments_received += frags - lost;
+      rr.fragments_lost += lost;
+      if (lost >= 3) rr.frames_lost += 1;
+      rr.delay_gradient_ms = grad;
+      rr.recv_bitrate_bps = recvBps;
+      Abr::Local l;
+      l.queued = queued;
+      l.queueAllowance = 1;
+      l.encoderBps = encBps;
+      abr.onReceiverReport(rr, l, t);
+      if (t % 1000 == 0) abr.tick(l, t);
+      if (t > 5000) minAfter5s = std::min(minAfter5s, abr.target());
+    }
+  };
+  uint32_t rng = 1;
+  auto rnd = [&] { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % 1000; };
+
+  {  // A: static scene (VBR app-limited at 1.5 Mbps), zero loss, Wi-Fi power-save delay spikes
+    Sim s;
+    s.abr.reset(ceiling, 0);
+    for (int i = 0; i < 240; ++i) s.step(0, rnd() < 300 ? 20.0f + rnd() % 80 : 0.0f, 0, 1500000, 1500000);
+    CHECK(s.abr.target() == ceiling && s.minAfter5s >= ceiling * 85 / 100,
+          "A app-limited + delay spikes, 0 loss: final %d kbps, min after 5 s %d kbps", s.abr.target() / 1000,
+          s.minAfter5s / 1000);
+  }
+  {  // B: real queueing (delay overuse + queue growing), zero loss, encoder at target
+    Sim s;
+    s.abr.reset(ceiling, 0);
+    int minSeen = 1 << 30;
+    for (int i = 0; i < 80; ++i) {
+      s.step(0, 15.0f, 3, s.abr.target(), s.abr.target());
+      minSeen = std::min(minSeen, s.abr.target());
+    }
+    CHECK(minSeen >= static_cast<int>(ceiling * Abr::kDelayFloorFraction) - 1 && s.abr.target() < ceiling / 2,
+          "B queueing+delay: backs off to %d kbps (floor %d kbps)", s.abr.target() / 1000,
+          static_cast<int>(ceiling * Abr::kDelayFloorFraction) / 1000);
+    // D: pressure removed -> recovers to the ceiling within ~5 s
+    int64_t t0 = s.t, reached = -1;
+    for (int i = 0; i < 40 && reached < 0; ++i) {
+      s.step(0, 0, 0, s.abr.target(), s.abr.target());
+      if (s.abr.target() == ceiling) reached = s.t - t0;
+    }
+    CHECK(reached >= 0 && reached <= 5000, "D recovery to ceiling in %lld ms", static_cast<long long>(reached));
+  }
+  {  // C: 10 % real loss -> goes below the delay floor, towards 500 kbps
+    Sim s;
+    s.abr.reset(ceiling, 0);
+    for (int i = 0; i < 80; ++i) s.step(0.10 + (rnd() % 50) / 1000.0, 2.0f, 0, s.abr.target(), s.abr.target() * 9 / 10);
+    CHECK(s.abr.target() < static_cast<int>(ceiling * Abr::kDelayFloorFraction),
+          "C 10-15%% loss: target %d kbps (< delay floor), auto FEC %d%%", s.abr.target() / 1000,
+          s.abr.autoFecPercent());
+  }
+  {  // E: TCP client without ReceiverReports: tick() alone climbs back up
+    Abr a;
+    a.reset(ceiling, 0);
+    Abr::Local l;
+    l.queued = 0;
+    for (int64_t t = 1000; t <= 6000; t += 1000) a.tick(l, t);
+    CHECK(a.target() == ceiling, "E no reports, clean queue: %d kbps after 6 s", a.target() / 1000);
   }
 }
 
@@ -241,6 +319,7 @@ void runFull(int secs) {
   o.controlPort = kCtl;
   o.udpPort = kUdp;
   o.discoveryPort = kDisc;
+  o.announcePort = 47813;  // keep test announcements away from a real PC on 47803
   o.javaCaps.apiLevel = api;
   o.testSyntheticSource = true;
   std::string err;
@@ -248,6 +327,31 @@ void runFull(int secs) {
   CHECK(core.start(o, &sink, err), "core start %s", err.c_str());
   CHECK(!core.start(o, &sink, err), "second start rejected");
   printf("  status: %s\n", core.statusJson().c_str());
+
+  // --- announce (kind=3 broadcast every 2 s while idle)
+  {
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    int one = 1;
+    setsockopt(u, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(47813);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(u, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+    DiscoveryReply rep;
+    bool ok = false;
+    int64_t end = monoMs() + 3000;
+    while (!ok && monoMs() < end) {
+      pollfd p{u, POLLIN, 0};
+      if (poll(&p, 1, 500) <= 0) continue;
+      uint8_t b[512];
+      ssize_t n = recv(u, b, sizeof(b), 0);
+      ok = n > 0 && decode(b, static_cast<size_t>(n), rep) && rep.announce;
+    }
+    CHECK(ok && rep.control_port == kCtl && !rep.busy, "announce received (kind=3, name='%s', busy=%d)",
+          rep.device_name.c_str(), rep.busy);
+    close(u);
+  }
 
   // --- discovery
   {
@@ -588,6 +692,7 @@ int main(int argc, char** argv) {
   log::mirrorToStderr(argc > 2 && strcmp(argv[argc - 1], "-v") == 0);
   const std::string mode = argc > 1 ? argv[1] : "probe";
   if (mode == "probe") runProbe();
+  else if (mode == "abr") runAbrSim();
   else if (mode == "full") runFull(argc > 2 ? std::max(2, atoi(argv[2])) : 5);
   else {
     printf("usage: owc_selftest probe | full [secs] [-v]\n");

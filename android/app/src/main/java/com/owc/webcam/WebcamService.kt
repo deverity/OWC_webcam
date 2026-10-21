@@ -62,6 +62,7 @@ class WebcamService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var wifiLockLL: WifiManager.WifiLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var nativeStarted = false
     private var batteryReceiverRegistered = false
@@ -185,9 +186,15 @@ class WebcamService : Service() {
         } catch (t: Throwable) { Log.w(TAG, "wakelock", t) }
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            else @Suppress("DEPRECATION") WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            wifiLock = wm.createWifiLock(mode, "owc:wifi").apply {
+            if (Build.VERSION.SDK_INT >= 29) {
+                wifiLockLL = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "owc:wifi-ll").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+            // Mantem o radio sem power-save com a tela apagada (LOW_LATENCY so vale com tela ligada)
+            @Suppress("DEPRECATION")
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "owc:wifi").apply {
                 setReferenceCounted(false)
                 acquire()
             }
@@ -201,8 +208,9 @@ class WebcamService : Service() {
     private fun releaseLocks() {
         try { wakeLock?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
         try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
+        try { wifiLockLL?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
         try { multicastLock?.takeIf { it.isHeld }?.release() } catch (_: Throwable) {}
-        wakeLock = null; wifiLock = null; multicastLock = null
+        wakeLock = null; wifiLock = null; wifiLockLL = null; multicastLock = null
     }
 
     // ---------------------------------------------------- bateria / térmico
