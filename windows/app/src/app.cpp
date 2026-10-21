@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstring>
 
+#include <owc/firewall.h>
+
 #include "params_meta.h"
 #include "platform.h"
 
@@ -93,6 +95,7 @@ App::~App() {
   if (usb_th_.joinable()) usb_th_.join();
   if (adb_th_.joinable()) adb_th_.join();
   if (script_th_.joinable()) script_th_.join();
+  if (fw_th_.joinable()) fw_th_.join();
   if (persist) saveNow();
   if (frame_event_) CloseHandle(frame_event_);
 }
@@ -101,6 +104,29 @@ void App::startServices() {
   owc::Discovery::Options o;
   discovery.start(o);
   adb_th_ = std::thread([this] { adbLoop(); });
+  refreshFirewall();
+}
+
+std::string App::firewallCommand() const { return owc::Firewall::addRuleCommandLine(); }
+
+void App::refreshFirewall() {
+  if (fw_busy_.exchange(true)) return;
+  if (fw_th_.joinable()) fw_th_.join();
+  fw_th_ = std::thread([this] {
+    fw_state_ = owc::Firewall::rulesPresent() ? 1 : 0;
+    fw_busy_ = false;
+  });
+}
+
+void App::addFirewallRule() {
+  if (fw_busy_.exchange(true)) return;
+  if (fw_th_.joinable()) fw_th_.join();
+  fw_th_ = std::thread([this] {
+    const bool ok = owc::Firewall::addRulesElevated();
+    fw_state_ = owc::Firewall::rulesPresent() ? 1 : 0;
+    toast(ok ? "Regra de firewall criada." : "Regra de firewall não criada (UAC recusado ou falha).", !ok);
+    fw_busy_ = false;
+  });
 }
 
 void App::adbLoop() {
@@ -170,16 +196,22 @@ void App::beginFrame() {
   const ULONGLONG now = GetTickCount64();
   static ULONGLONG lastDisc = 0;
   if (now - lastDisc > 250) {
-    wifi_devices = discovery.devices();
+    wifi_devices = owc::Discovery::preferBestLink(discovery.devices());
+    std::stable_sort(wifi_devices.begin(), wifi_devices.end(), [](const auto& a, const auto& b) {
+      return (a.link == owc::LinkType::UsbTether) > (b.link == owc::LinkType::UsbTether);
+    });
     lastDisc = now;
   }
   if (now - probe_t_ > 2000) {
     probe_t_ = now;
+    tether_adapters = owc::Discovery::usbTetherAdapters();
     vcam_registered = virtualCamRegistered(&vcam_per_user);
     obs_installed = obsPluginInstalled();
   }
   const double t = static_cast<double>(now) / 1000.0;
-  if (t - last_graph_t_ >= 0.1) {
+  if (stats.state != owc::ClientState::Streaming || stats.session_uptime_ms < 1500) {
+    graph.clear();
+  } else if (t - last_graph_t_ >= 0.1) {
     last_graph_t_ = t;
     GraphPoint p;
     p.t = t;
@@ -202,6 +234,8 @@ void App::noteDisplayed(const PreviewFrame& f) {
   ++frames_shown;
   last_rotation = f.rotation;
   last_mirrored = f.mirrored;
+  color_matrix = static_cast<int>(f.color_matrix);
+  full_range = f.full_range;
   if (f.capture_qpc > 0) {
     LARGE_INTEGER q, fr;
     QueryPerformanceCounter(&q);
@@ -290,38 +324,94 @@ void App::onConnected(const owc::DeviceInfo& info) {
   std::lock_guard<std::mutex> l(mu_);
   dev_key_ = deviceKey(info.model, info.device_name);
   applied_ = false;
+  applied_cam_ = -1;
   pending_.clear();
+  auto it = settings.device_orient.find(dev_key_);
+  if (it != settings.device_orient.end()) {
+    owc::OutputTransform t = client.options().transform;
+    t.apply_phone_hints = it->second.first < 0;
+    t.rotation_deg = it->second.first < 0 ? 0 : it->second.first;
+    t.mirror = it->second.second;
+    client.setTransform(t);
+  }
+}
+
+std::string App::memKey(owc::ParamId id) {
+  const unsigned v = static_cast<unsigned>(id);
+  std::lock_guard<std::mutex> l(mu_);
+  if (v >= 20 && v < 60) return dev_key_ + "#cam" + std::to_string(cur_cam_);
+  return dev_key_;
+}
+
+void App::currentOrientation(int& mode, bool& mirror) {
+  owc::OutputTransform t = client.options().transform;
+  mode = t.apply_phone_hints ? -1 : (((t.rotation_deg % 360) + 360) % 360);
+  mirror = t.mirror;
+}
+
+void App::setOrientation(int mode, bool mirror) {
+  owc::ClientOptions o = client.options();
+  o.transform.apply_phone_hints = mode < 0;
+  o.transform.rotation_deg = mode < 0 ? 0 : mode;
+  o.transform.mirror = mirror;
+  applyOptions(o);
+  std::lock_guard<std::mutex> l(mu_);
+  if (!dev_key_.empty()) settings.device_orient[dev_key_] = {mode, mirror};
+  dirty_ = true;
 }
 
 void App::onCapabilities(const owc::Capabilities& c) {
   ParamList mem;
   int queued = -1;
+  bool deviceLevel = false;
   {
     std::lock_guard<std::mutex> l(mu_);
-    if (applied_) return;
-    applied_ = true;
-    queued = queued_preset_;
-    queued_preset_ = -1;
-    auto it = settings.device_params.find(dev_key_);
-    if (it != settings.device_params.end()) mem = it->second;
+    cur_cam_ = c.active_camera;
+    if (!applied_) {
+      applied_ = true;
+      deviceLevel = true;
+      queued = queued_preset_;
+      queued_preset_ = -1;
+      auto it = settings.device_params.find(dev_key_);
+      if (it != settings.device_params.end()) mem = it->second;
+    }
   }
   if (queued >= 0) {
     const owc::Preset& p = owc::builtinPreset(static_cast<owc::PresetId>(queued));
     owc::applyPreset(client, p);
     for (const auto& kv : p.phone) rememberParam(kv.first, kv.second);
+    applied_cam_ = c.active_camera;
     return;
   }
-  std::sort(mem.begin(), mem.end(), [](const auto& a, const auto& b) {
-    return static_cast<uint16_t>(a.first) < static_cast<uint16_t>(b.first);
-  });
+  auto byId = [](const auto& a, const auto& b) { return static_cast<uint16_t>(a.first) < static_cast<uint16_t>(b.first); };
+  std::sort(mem.begin(), mem.end(), byId);
   int sent = 0;
-  for (const auto& kv : mem) {
+  bool camChanging = false;
+  auto send = [&](const std::pair<owc::ParamId, owc::ParamValue>& kv) {
     const owc::ParamDesc* d = nullptr;
     for (const auto& pd : c.params)
       if (pd.id == kv.first) d = &pd;
-    if (!d || !(d->flags & owc::kParamSupported) || (d->flags & owc::kParamReadOnly)) continue;
-    if (d->current == kv.second) continue;
-    if (client.setParam(kv.first, kv.second)) ++sent;
+    if (!d || !(d->flags & owc::kParamSupported) || (d->flags & owc::kParamReadOnly)) return;
+    if (d->current == kv.second) return;
+    if (client.setParam(kv.first, kv.second)) {
+      ++sent;
+      if (kv.first == owc::ParamId::CameraIndex) camChanging = true;
+    }
+  };
+  if (deviceLevel)
+    for (const auto& kv : mem) send(kv);
+  // camera controls are remembered per camera index; skip while a camera switch is pending
+  // (new Capabilities will arrive and the right camera's controls are applied then)
+  if (!camChanging && applied_cam_ != c.active_camera) {
+    applied_cam_ = c.active_camera;
+    ParamList cam;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      auto it = settings.device_params.find(dev_key_ + "#cam" + std::to_string(c.active_camera));
+      if (it != settings.device_params.end()) cam = it->second;
+    }
+    std::sort(cam.begin(), cam.end(), byId);
+    for (const auto& kv : cam) send(kv);
   }
   if (sent > 0) toast("Parâmetros salvos deste aparelho reaplicados (" + std::to_string(sent) + ")", false, 3500);
 }
@@ -334,7 +424,8 @@ void App::onParamState(const owc::ParamState& ps) {
   auto it = pending_.find(key);
   if (rejected) {
     if (it != pending_.end()) pending_.erase(it);
-    auto dm = settings.device_params.find(dev_key_);
+    const unsigned idv = static_cast<unsigned>(ps.id);
+    auto dm = settings.device_params.find(idv >= 20 && idv < 60 ? dev_key_ + "#cam" + std::to_string(cur_cam_) : dev_key_);
     if (dm != settings.device_params.end()) {
       auto& v = dm->second;
       v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& e) { return e.first == ps.id; }), v.end());
@@ -373,6 +464,8 @@ void App::onFrame(const owc::DecodedFrame& f) {
       std::memcpy(p.uv.data() + static_cast<size_t>(r) * p.w, f.uv + static_cast<size_t>(r) * f.uv_stride, p.w);
     p.rotation = f.rotation_applied;
     p.mirrored = f.mirrored;
+    p.color_matrix = f.color_matrix;
+    p.full_range = f.full_range;
     p.capture_qpc = f.capture_qpc;
     p.seq = ++frame_seq_;
     frame_new_ = true;
@@ -390,7 +483,8 @@ std::string App::deviceKeyNow() {
 void App::rememberParam(owc::ParamId id, const owc::ParamValue& v) {
   std::lock_guard<std::mutex> l(mu_);
   if (dev_key_.empty()) return;
-  auto& list = settings.device_params[dev_key_];
+  const unsigned idv = static_cast<unsigned>(id);
+  auto& list = settings.device_params[idv >= 20 && idv < 60 ? dev_key_ + "#cam" + std::to_string(cur_cam_) : dev_key_];
   for (auto& e : list) {
     if (e.first == id) { e.second = v; dirty_ = true; return; }
   }
@@ -440,16 +534,7 @@ void App::resetParams() {
   if (!client.resetParams()) return;
   {
     std::lock_guard<std::mutex> l(mu_);
-    auto it = settings.device_params.find(dev_key_);
-    if (it != settings.device_params.end()) {
-      auto& v = it->second;
-      v.erase(std::remove_if(v.begin(), v.end(),
-                             [](const auto& e) {
-                               const unsigned id = static_cast<unsigned>(e.first);
-                               return id >= 20 && id < 60;
-                             }),
-              v.end());
-    }
+    settings.device_params.erase(dev_key_ + "#cam" + std::to_string(cur_cam_));
     pending_.clear();
     dirty_ = true;
   }

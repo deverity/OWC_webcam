@@ -25,6 +25,8 @@ struct PreviewFrame {
   uint32_t w = 0, h = 0;
   int rotation = 0;
   bool mirrored = false;
+  uint32_t color_matrix = 0;
+  bool full_range = false;
   int64_t capture_qpc = 0;
   uint64_t seq = 0;
 };
@@ -85,7 +87,8 @@ class App : public owc::ClientEvents {
   bool caps_valid = false;
   owc::DeviceInfo dev;
   bool dev_valid = false;
-  std::vector<owc::DiscoveredDevice> wifi_devices;
+  std::vector<owc::DiscoveredDevice> wifi_devices;  // all links, best link per phone, USB tether first
+  std::vector<owc::Discovery::UsbTetherAdapter> tether_adapters;
 
   // ---- preview hand-off
   HANDLE frameEvent() const { return frame_event_; }
@@ -96,6 +99,8 @@ class App : public owc::ClientEvents {
   uint64_t frames_shown = 0;
   double shown_fps = 0;
   double shown_lat_avg = 0, shown_lat_p95 = 0;
+  int color_matrix = 0;
+  bool full_range = false;
   int last_rotation = 0;
   bool last_mirrored = false;
   std::deque<GraphPoint> graph;
@@ -124,6 +129,9 @@ class App : public owc::ClientEvents {
   void setParam(owc::ParamId id, const owc::ParamValue& v, bool final = true);
   bool pending(owc::ParamId id, owc::ParamValue& out);
   void setDragging(owc::ParamId id, bool dragging);
+  void setOrientation(int mode, bool mirror);  // mode -1 auto, 0/90/180/270; remembered per device
+  void currentOrientation(int& mode, bool& mirror);
+  std::string memKey(owc::ParamId id);
   void resetParams();  // phone camera defaults + forget saved camera controls
   void applyPresetBuiltin(const owc::Preset& p);
   void applyUserPreset(const UserPreset& p);
@@ -146,6 +154,13 @@ class App : public owc::ClientEvents {
   // cached registry probes (refreshed every 2 s)
   bool vcam_registered = false, vcam_per_user = false, obs_installed = false;
   std::wstring findScript(const wchar_t* name);
+
+  // Windows Firewall rule for phone announcements (owc::Firewall)
+  int firewallState() const { return fw_state_.load(); }  // -1 unknown, 0 missing, 1 present
+  bool firewallBusy() const { return fw_busy_.load(); }
+  std::string firewallCommand() const;
+  void refreshFirewall();
+  void addFirewallRule();  // UAC prompt
 
   std::string stateMessage();
   std::string preset_active;  // name of last applied preset
@@ -183,6 +198,8 @@ class App : public owc::ClientEvents {
   // device identity / memory
   std::string dev_key_;
   bool applied_ = false;
+  int applied_cam_ = -1;
+  int cur_cam_ = 0;
   int queued_preset_ = -1;
 
   // params
@@ -210,6 +227,11 @@ class App : public owc::ClientEvents {
   std::vector<owc::AdbDevice> adb_devs_;
   std::string adb_err_;
   std::condition_variable adb_cv_;
+
+  // firewall
+  std::thread fw_th_;
+  std::atomic<int> fw_state_{-1};
+  std::atomic<bool> fw_busy_{false};
 
   // scripts
   std::thread script_th_;

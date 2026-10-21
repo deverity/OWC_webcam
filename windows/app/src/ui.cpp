@@ -112,6 +112,7 @@ const TabDef kTabs[] = {{"presets", "Presets"},   {"camera", "Câmera"}, {"encod
                         {"pc", "PC"},             {"device", "Dispositivo"}, {"outputs", "Saídas"},
                         {"logs", "Logs"}};
 int g_tab = 0;
+bool g_openHelp = false;
 
 char g_manual[96] = "";
 bool g_manualInit = false;
@@ -191,6 +192,62 @@ void drawUsbFlow(App& app) {
   endCard();
 }
 
+void helpStep(const char* n, const char* text) {
+  ImGui::TextColored(col::accent(), "%s", n);
+  ImGui::SameLine();
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextUnformatted(text);
+  ImGui::PopTextWrapPos();
+  ImGui::Spacing();
+}
+
+void drawHelp(App& app) {
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x / 2, vp->Pos.y + vp->Size.y / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(std::min(sc(620), vp->Size.x - sc(40)), 0));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(sc(18), sc(16)));
+  if (ImGui::BeginPopupModal("Como conectar##help", nullptr, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::BeginTabBar("##helptabs")) {
+      if (ImGui::BeginTabItem("Cabo USB (recomendado, sem modo desenvolvedor)")) {
+        ImGui::Spacing();
+        helpStep("1.", "Ligue o cabo USB entre o celular e o PC.");
+        helpStep("2.", "No app OWC do celular, toque em \"Abrir Ancoragem USB\" e ative a ancoragem (em Samsung: \"Ancoragem via USB\"; em outros Android: \"Ancoragem USB\").");
+        helpStep("3.", "O celular aparece aqui em Dispositivos. Clique em Conectar.");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(col::dim(), "Não precisa de adb nem de modo desenvolvedor. O celular vira um adaptador de rede (RNDIS) com baixa latência.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::TextColored(col::warn(), "Não aparece?");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted("O celular mostra \"Ancoragem ativa\" mas o PC não o encontra? Em computadores de empresa, políticas de segurança costumam bloquear adaptadores de rede USB. Use o Wi-Fi (mesma rede) ou, se tiver modo desenvolvedor, \"USB avançado (ADB)\".");
+        ImGui::PopTextWrapPos();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Wi-Fi")) {
+        ImGui::Spacing();
+        helpStep("1.", "Conecte o celular e o PC na mesma rede Wi-Fi (de preferência 5 GHz).");
+        helpStep("2.", "Abra o app OWC no celular: ele aparece em Dispositivos.");
+        helpStep("3.", "Se não aparecer, libere o firewall do Windows (aba Saídas > Liberar no firewall) ou use o endereço manual.");
+        if (ImGui::Button("Ir para Saídas")) { uiSelectTab("outputs"); ImGui::CloseCurrentPopup(); }
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("USB avançado (ADB)")) {
+        ImGui::Spacing();
+        helpStep("1.", "Para desenvolvedores: ative a depuração USB no celular e autorize este PC.");
+        helpStep("2.", "Abra \"USB avançado (ADB)\" na barra lateral e clique em \"Conectar via USB\".");
+        helpStep("3.", "O OWC instala o app (se houver APK), concede permissões, abre o app e conecta por TCP via adb forward.");
+        ImGui::TextColored(col::dim(), "adb: %s", app.adbAvailable() ? "encontrado" : "não encontrado");
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
+    ImGui::Dummy(ImVec2(0, sc(8)));
+    if (ImGui::Button("Fechar", ImVec2(sc(110), 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+  ImGui::PopStyleVar();
+}
+
 void drawSidebar(App& app) {
   ImGui::PushFont(fontTitle);
   ImGui::TextColored(col::accent(), "OWC");
@@ -207,9 +264,17 @@ void drawSidebar(App& app) {
   sectionTitle("Dispositivos");
 
   // ---- Wi-Fi
-  ImGui::TextColored(col::dim(), "Wi-Fi (descoberta automática)");
+  for (const auto& ta : app.tether_adapters) {
+    if (!ta.may_carry_internet) continue;
+    ImGui::PushStyleColor(ImGuiCol_Text, col::warn());
+    ImGui::TextWrapped("O Windows pode estar usando a internet móvel do celular. Mantenha o Wi-Fi do celular ligado ou desligue os dados móveis.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    break;
+  }
+  ImGui::TextColored(col::dim(), "Cabo USB e Wi-Fi (descoberta automática)");
   if (app.wifi_devices.empty()) {
-    ImGui::TextWrapped("Nenhum celular encontrado. Abra o app OWC no celular (mesma rede Wi-Fi) ou use USB / IP manual.");
+    ImGui::TextWrapped("Nenhum celular encontrado. Ligue o cabo e use \"Abrir Ancoragem USB\" no app OWC, ou abra o app na mesma rede Wi-Fi. Veja \"Como conectar\".");
   }
   for (const auto& d : app.wifi_devices) {
     std::string id = "wifi_" + d.key();
@@ -222,35 +287,56 @@ void drawSidebar(App& app) {
       ImGui::TextColored(col::warn(), "ocupado");
       tip("Este celular já está conectado a outro PC.");
     }
+    const bool tether = d.link == owc::LinkType::UsbTether;
+    if (tether) ImGui::TextColored(col::accent(), "[USB] Cabo USB (ancoragem)");
+    else if (d.link == owc::LinkType::Ethernet) ImGui::TextColored(col::dim(), "Rede cabeada (Ethernet)");
+    else if (d.link == owc::LinkType::Wifi) ImGui::TextColored(col::dim(), "Wi-Fi");
     ImGui::TextColored(col::dim(), "%s  -  %s:%u", d.model.c_str(), d.ip.c_str(), d.control_port);
     const bool here = connectedTo(app, d.ip);
     if (here) ImGui::TextColored(col::good(), "Conectado (%s)", app.stats.transport == owc::VideoTransport::Udp ? "UDP" : "TCP");
     const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
-    if (primaryButton("Conectar TCP", ImVec2(w, 0)))
-      app.connectNet(d.ip, d.control_port, owc::VideoTransport::Tcp, d.name.empty() ? d.ip : d.name);
-    tip("TCP: entrega confiável, bom para Wi-Fi estável. Latência um pouco maior se houver perdas.");
-    ImGui::SameLine();
-    if (ImGui::Button("Conectar UDP", ImVec2(w, 0)))
-      app.connectNet(d.ip, d.control_port, owc::VideoTransport::Udp, d.name.empty() ? d.ip : d.name);
-    tip("UDP: menor latência, tolera perdas com FEC e keyframes. Recomendado em Wi-Fi 5 GHz.");
+    const std::string label = d.name.empty() ? d.ip : d.name;
+    const char* tcpTip = "TCP: entrega confiável, bom para Wi-Fi estável. Latência um pouco maior se houver perdas.";
+    const char* udpTip = "UDP: menor latência, tolera perdas com FEC e keyframes. Recomendado em cabo USB (ancoragem) e Wi-Fi 5 GHz.";
+    // Over the tether (a real network link) UDP is the default (primary) choice.
+    auto tcpBtn = [&](bool prim) {
+      if (prim ? primaryButton("Conectar TCP", ImVec2(w, 0)) : ImGui::Button("Conectar TCP", ImVec2(w, 0)))
+        app.connectNet(d.ip, d.control_port, owc::VideoTransport::Tcp, label);
+      tip(tcpTip);
+    };
+    auto udpBtn = [&](bool prim) {
+      if (prim ? primaryButton("Conectar UDP", ImVec2(w, 0)) : ImGui::Button("Conectar UDP", ImVec2(w, 0)))
+        app.connectNet(d.ip, d.control_port, owc::VideoTransport::Udp, label);
+      tip(udpTip);
+    };
+    if (tether) { udpBtn(true); ImGui::SameLine(); tcpBtn(false); }
+    else { tcpBtn(true); ImGui::SameLine(); udpBtn(false); }
     endCard();
   }
 
   // ---- USB
   ImGui::Dummy(ImVec2(0, sc(6)));
-  ImGui::TextColored(col::dim(), "USB (adb)");
   auto devs = app.adbDevices();
   std::string aerr = app.adbError();
-  if (!aerr.empty() && devs.empty()) {
+  static bool adbOpenedOnce = false;
+  if (!devs.empty() && !adbOpenedOnce) {
+    adbOpenedOnce = true;
+    ImGui::SetNextItemOpen(true, ImGuiCond_Always);  // first adb device seen: expand once
+  } else {
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);   // collapsed by default without adb devices
+  }
+  const bool adbOpen = ImGui::CollapsingHeader("USB avançado (ADB)");
+  if (adbOpen && !aerr.empty() && devs.empty()) {
     ImGui::PushStyleColor(ImGuiCol_Text, col::warn());
     ImGui::TextWrapped("%s", aerr.c_str());
     ImGui::PopStyleColor();
-  } else if (devs.empty()) {
-    ImGui::TextWrapped("Nenhum aparelho USB. Conecte o cabo e ative a depuração USB.");
+  } else if (adbOpen && devs.empty()) {
+    ImGui::TextWrapped("Nenhum aparelho USB. Para desenvolvedores: conecte o cabo e ative a depuração USB.");
   }
   const auto usbPhase = app.usbPhase();
   const bool usbBusy = usbPhase == UsbPhase::Running || usbPhase == UsbPhase::AwaitInstall;
   for (const auto& d : devs) {
+    if (!adbOpen) break;
     std::string id = "usb_" + d.serial;
     if (!beginCard(id.c_str())) { endCard(); continue; }
     std::string model = d.model;
@@ -272,6 +358,12 @@ void drawSidebar(App& app) {
     endCard();
   }
   drawUsbFlow(app);
+
+  // ---- help
+  ImGui::Dummy(ImVec2(0, sc(6)));
+  if (ImGui::Button("Como conectar", ImVec2(-1, 0)) || g_openHelp) ImGui::OpenPopup("Como conectar##help");
+  g_openHelp = false;
+  drawHelp(app);
 
   // ---- manual
   ImGui::Dummy(ImVec2(0, sc(6)));
@@ -356,9 +448,19 @@ void drawHud(App& app, ImDrawList* dl, ImVec2 imgMin, ImVec2 imgMax) {
   dl->AddRectFilled(ImVec2(g0.x - sc(6), g0.y - sc(18)), ImVec2(g1.x + sc(6), g1.y + sc(6)), IM_COL32(8, 10, 14, 175),
                     sc(6));
   dl->AddText(ImVec2(g0.x, g0.y - sc(16)), IM_COL32(170, 180, 195, 255), "Latência (10 s)");
-  float peak = 40;
-  for (const auto& p : app.graph) peak = std::max(peak, std::max(p.e2e, p.shown));
-  peak *= 1.15f;
+  float peak = 20;
+  {
+    std::vector<float> vals;
+    for (const auto& p : app.graph) {
+      if (p.e2e > 0.01f) vals.push_back(p.e2e);
+      if (p.shown > 0.01f) vals.push_back(p.shown);
+    }
+    if (!vals.empty()) {
+      std::sort(vals.begin(), vals.end());
+      peak = std::max(peak, vals[std::min(vals.size() - 1, static_cast<size_t>(static_cast<double>(vals.size()) * 0.98))]);
+    }
+    peak *= 1.15f;
+  }
   auto plot = [&](bool shown, ImU32 color) {
     ImVec2 prev(0, 0);
     bool have = false;
@@ -366,7 +468,7 @@ void drawHud(App& app, ImDrawList* dl, ImVec2 imgMin, ImVec2 imgMax) {
     for (const auto& p : app.graph) {
       const float v = shown ? p.shown : p.e2e;
       if (v <= 0.01f) { have = false; continue; }
-      ImVec2 q(g1.x - static_cast<float>((tn - p.t) / 10.0) * gw, g1.y - (v / peak) * gh);
+      ImVec2 q(g1.x - static_cast<float>((tn - p.t) / 10.0) * gw, g1.y - std::min(v / peak, 1.0f) * gh);
       if (q.x < g0.x) { have = false; continue; }
       if (have) dl->AddLine(prev, q, color, sc(1.6f));
       prev = q;
@@ -491,6 +593,49 @@ void drawStatusBar(App& app) {
   ImGui::EndTable();
 }
 
+void drawOrientationRow(App& app) {
+  const owc::ClientStats& st = app.stats;
+  int mode;
+  bool mirror;
+  app.currentOrientation(mode, mirror);
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextColored(col::dim(), "Orientação");
+  ImGui::SameLine();
+  static const char* items[] = {"Auto (celular)", "0°", "90°", "180°", "270°"};
+  int idx = mode < 0 ? 0 : mode / 90 + 1;
+  bool changed = false;
+  ImGui::SetNextItemWidth(sc(128));
+  if (ImGui::Combo("##orient", &idx, items, 5)) {
+    mode = idx == 0 ? -1 : (idx - 1) * 90;
+    changed = true;
+  }
+  tip("Auto aplica a rotação informada pelo celular (a imagem sai em pé). Os outros valores ignoram a dica e giram o quadro cru do sensor. Lembrado por aparelho. Vale também para a webcam virtual e o OBS.");
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Espelhar", &mirror)) changed = true;
+  tip("Espelha a imagem na horizontal (útil com a câmera frontal).");
+  if (changed) app.setOrientation(mode, mirror);
+  if (st.output_width > 0 && app.live()) {
+    ImGui::SameLine();
+    ImGui::TextColored(col::dim(), "%ux%u", st.output_width, st.output_height);
+  }
+  // high-speed quick toggle
+  const owc::ParamDesc* hs = nullptr;
+  if (app.caps_valid)
+    for (const auto& d : app.caps.params)
+      if (d.id == owc::ParamId::HighSpeedMode) hs = &d;
+  if (hs && (hs->flags & owc::kParamSupported) && app.sessionUp()) {
+    owc::ParamValue cur = hs->current;
+    app.client.paramValue(hs->id, cur);
+    owc::ParamValue pv;
+    if (app.pending(hs->id, pv)) cur = pv;
+    bool on = cur.i != 0;
+    ImGui::SameLine(0, sc(18));
+    if (ImGui::Checkbox("Alta velocidade", &on))
+      app.setParam(hs->id, hs->type == owc::ValueType::Bool ? owc::ParamValue::Bool(on) : owc::ParamValue::EnumV(on ? 1 : 0));
+    tip("sensor a 240 fps: ~50 ms em vez de ~110 ms; desativa controles manuais. Reinicia o stream e troca a lista de resoluções/fps.");
+  }
+}
+
 void drawCenter(App& app, Renderer& r) {
   const owc::ClientStats& st = app.stats;
   ImGui::PushFont(fontTitle);
@@ -517,6 +662,7 @@ void drawCenter(App& app, Renderer& r) {
     tip("Pede um quadro-chave (IDR) imediatamente, útil se a imagem estiver corrompida.");
     ImGui::EndDisabled();
   }
+  drawOrientationRow(app);
   if (app.dev_valid && app.live())
     ImGui::TextColored(col::dim(), "%s  -  Android API %u  -  %s", app.dev.model.c_str(), app.dev.android_api,
                        app.stateMessage().empty() ? stateText(st.state) : app.stateMessage().c_str());
@@ -692,6 +838,7 @@ bool uiSelectTab(const std::string& name) {
   static const struct { const char* k; int i; } alias[] = {
       {"presets", 0}, {"preset", 0}, {"camera", 1}, {"câmera", 1}, {"encoder", 2}, {"stream", 2}, {"encoder/stream", 2},
       {"pc", 3}, {"device", 4}, {"dispositivo", 4}, {"outputs", 5}, {"saidas", 5}, {"saídas", 5}, {"logs", 6}};
+  if (n == "help") { g_openHelp = true; return true; }
   for (const auto& a : alias)
     if (n == a.k) { g_tab = a.i; return true; }
   return false;

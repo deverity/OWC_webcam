@@ -57,6 +57,7 @@ static Json optionsToJson(const owc::ClientOptions& o) {
   j.set("rotation_deg", Json::number(o.transform.rotation_deg));
   j.set("mirror", Json::boolean(o.transform.mirror));
   j.set("apply_phone_hints", Json::boolean(o.transform.apply_phone_hints));
+  j.set("codec_preference", Json::number(static_cast<double>(o.codec_preference)));
   j.set("auto_reconnect", Json::boolean(o.auto_reconnect));
   j.set("reconnect_delay_ms", Json::number(o.reconnect_delay_ms));
   j.set("auto_start_stream", Json::boolean(o.auto_start_stream));
@@ -76,6 +77,8 @@ static void optionsFromJson(const Json& j, owc::ClientOptions& o) {
   o.jitter_buffer_ms = u32("jitter_buffer_ms", o.jitter_buffer_ms);
   int dm = static_cast<int>(j.num("decoder_mode", static_cast<double>(o.decoder_mode)));
   if (dm >= 0 && dm <= 2) o.decoder_mode = static_cast<owc::DecoderMode>(dm);
+  int cp = static_cast<int>(j.num("codec_preference", 0));
+  if (cp >= 0 && cp <= 3) o.codec_preference = static_cast<owc::CodecPreference>(cp);
   o.low_latency_decode = j.flag("low_latency_decode", o.low_latency_decode);
   o.keyframe_request_min_interval_ms = u32("keyframe_request_min_interval_ms", o.keyframe_request_min_interval_ms);
   o.udp_recv_buffer_bytes = u32("udp_recv_buffer_bytes", o.udp_recv_buffer_bytes);
@@ -117,6 +120,10 @@ bool loadSettings(AppSettings& s) {
       if (!l.empty()) s.device_params[kv.first] = std::move(l);
     }
   }
+  if (const Json* d = j.find("orient"); d && d->isObj()) {
+    for (const auto& kv : d->o)
+      s.device_orient[kv.first] = {static_cast<int>(kv.second.num("m", -1)), kv.second.flag("x", false)};
+  }
   if (s.window_w < 900) s.window_w = 900;
   if (s.window_h < 600) s.window_h = 600;
   return true;
@@ -138,6 +145,14 @@ bool saveSettings(const AppSettings& s) {
   Json d = Json::object();
   for (const auto& kv : s.device_params) d.set(kv.first, paramsToJson(kv.second));
   j.set("devices", std::move(d));
+  Json orient = Json::object();
+  for (const auto& kv : s.device_orient) {
+    Json e = Json::object();
+    e.set("m", Json::number(kv.second.first));
+    e.set("x", Json::boolean(kv.second.second));
+    orient.set(kv.first, std::move(e));
+  }
+  j.set("orient", std::move(orient));
   return writeTextFileAtomic(settingsPath(), j.dump(2));
 }
 

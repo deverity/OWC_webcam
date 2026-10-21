@@ -197,8 +197,9 @@ void renderFrame() {
   static PreviewFrame frame;
   if (g_app->takePreview(frame)) {
     YuvParams yp;
-    yp.bt709 = frame.h >= 720;  // auto: BT.709 for HD, BT.601 below (no color info in DecodedFrame yet)
-    yp.full_range = false;
+    // color_matrix: 0 unknown (709 for >= 720p, else 601), 1 = BT.601, 2 = BT.709
+    yp.bt709 = frame.color_matrix == 2 || (frame.color_matrix == 0 && frame.h >= 720);
+    yp.full_range = frame.full_range;
     if (g_renderer.uploadNv12(frame.y.data(), frame.uv.data(), frame.w, frame.h, yp)) g_app->noteDisplayed(frame);
   }
 

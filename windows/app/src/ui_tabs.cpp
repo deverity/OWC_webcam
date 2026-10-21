@@ -143,6 +143,26 @@ void tabOutputs(App& app) {
   ImGui::EndDisabled();
   ImGui::EndDisabled();
 
+  sectionTitle("Firewall (descoberta de celulares)");
+  if (app.firewallState() == 1) {
+    ImGui::TextColored(col::good(), "Regra de entrada presente (UDP 47803)");
+  } else {
+    ImGui::PushStyleColor(ImGuiCol_Text, col::warn());
+    ImGui::TextWrapped("O Windows Firewall pode bloquear os anúncios dos celulares (UDP 47803). Sem a regra, aparelhos podem não aparecer na lista Wi-Fi.");
+    ImGui::PopStyleColor();
+    ImGui::BeginDisabled(app.firewallBusy());
+    if (primary("Liberar no firewall", ImVec2(sc(180), 0))) app.addFirewallRule();
+    tip("Executa netsh elevado (pede confirmação do UAC) para criar a regra de entrada no perfil Privado.");
+    ImGui::SameLine();
+    if (ImGui::Button("Verificar", ImVec2(sc(90), 0))) app.refreshFirewall();
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Ou, em um prompt de administrador:");
+    std::string cmd = app.firewallCommand();
+    ImGui::PushStyleColor(ImGuiCol_Text, col::dim());
+    ImGui::TextWrapped("%s", cmd.c_str());
+    ImGui::PopStyleColor();
+  }
+
   sectionTitle("Como usar");
   ImGui::PushStyleColor(ImGuiCol_Text, col::dim());
   ImGui::TextWrapped("Zoom, Teams, Chrome, Discord e outros apps: escolha a câmera \"OWC Webcam\" nas configurações de vídeo.");
@@ -197,22 +217,21 @@ void tabLogs(App& app) {
   ImGui::TextDisabled("%zu linhas", shown.size());
 
   ImGui::Separator();
-  ImGui::BeginChild("##logs", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
-  ImGuiListClipper clip;
-  clip.Begin(static_cast<int>(shown.size()));
-  while (clip.Step()) {
-    for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
-      const LogLine& l = *shown[static_cast<size_t>(i)];
-      ImVec4 c = l.level == owc::LogLevel::Error ? col::bad()
-                 : l.level == owc::LogLevel::Warn ? col::warn()
-                 : l.level == owc::LogLevel::Debug ? col::dim() : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-      ImGui::TextColored(col::dim(), "%s", l.time.c_str());
-      ImGui::SameLine();
-      ImGui::TextColored(l.source == owc::LogSource::Phone ? col::accent() : col::dim(), "%s",
-                         l.source == owc::LogSource::Phone ? "CEL" : "PC ");
-      ImGui::SameLine();
-      ImGui::TextColored(c, "%s", l.text.c_str());
-    }
+  ImGui::BeginChild("##logs", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+  const size_t first = shown.size() > 600 ? shown.size() - 600 : 0;  // keep wrapped rendering cheap
+  if (first > 0) ImGui::TextDisabled("(%zu linhas anteriores ocultas; use Copiar para ver tudo)", first);
+  for (size_t i = first; i < shown.size(); ++i) {
+    const LogLine& l = *shown[i];
+    ImVec4 c = l.level == owc::LogLevel::Error ? col::bad()
+               : l.level == owc::LogLevel::Warn ? col::warn()
+               : l.level == owc::LogLevel::Debug ? col::dim() : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ImGui::TextColored(col::dim(), "%s %s", l.time.c_str() + 0, l.source == owc::LogSource::Phone ? "CEL" : "PC");
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, c);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(l.text.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
   }
   if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
   ImGui::EndChild();

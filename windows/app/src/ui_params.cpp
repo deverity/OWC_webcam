@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <future>
 #include <set>
 
 #include "ui_internal.h"
@@ -363,6 +365,7 @@ void streamSelectors(App& app) {
   if (cam)
     for (const auto& fr : cam->fps_ranges)
       if (maxfps == 0 || fr.second <= maxfps) fpsSet.insert(fr.second);
+  if (maxfps > 0) fpsSet.insert(maxfps);
   fpsSet.insert(static_cast<int>(vf.i));
   ImGui::Spacing();
   ImGui::TextUnformatted("Quadros por segundo");
@@ -465,6 +468,46 @@ void tabPc(App& app) {
   }
   if (o.jitter_buffer_ms > 0 && st.state == owc::ClientState::Streaming)
     ImGui::TextDisabled("Quadros retidos agora: %u", st.jitter_buffer_frames);
+
+  sectionTitle("Codec");
+  optLabel("Codec do vídeo", "Auto: usa AV1 ou HEVC se o celular oferecer E este PC decodificar em hardware; senão H.264. Os demais forçam aquele codec (se o celular e o PC suportarem), com volta automática para H.264 em caso de falha. HEVC/AV1 economizam bitrate com a mesma qualidade; em decoder de hardware a latência é igual. Vale na próxima conexão.");
+  {
+    static const char* items[] = {"Auto", "H.264", "HEVC (H.265)", "AV1"};
+    int idx = static_cast<int>(o.codec_preference);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##codecpref", &idx, items, 4)) { o.codec_preference = static_cast<owc::CodecPreference>(idx); commit = true; }
+  }
+  if (!st.codec_selection.empty()) {
+    ImGui::PushStyleColor(ImGuiCol_Text, col::dim());
+    ImGui::TextWrapped("%s", st.codec_selection.c_str());
+    ImGui::PopStyleColor();
+  }
+  {
+    static owc::DecoderCapabilities caps;
+    static bool have = false;
+    static std::future<owc::DecoderCapabilities> fut;
+    if (!have && !fut.valid()) fut = std::async(std::launch::async, [] { return owc::Client::decoderCapabilities(); });
+    if (!have && fut.valid() && fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+      caps = fut.get();
+      have = true;
+    }
+    if (!have) {
+      ImGui::TextDisabled("Detectando decoders deste PC...");
+    } else {
+      ImGui::TextColored(col::dim(), "Decoders neste PC (%s):", caps.adapter.c_str());
+      auto line = [](const char* name, const owc::DecoderCapabilities::Entry& e) {
+        ImGui::Text("  %-6s", name);
+        ImGui::SameLine();
+        if (!e.any()) ImGui::TextColored(col::bad(), "não instalado");
+        else ImGui::TextColored(e.hardware ? col::good() : col::warn(), "%s%s%s", e.hardware ? "hardware" : "",
+                                e.hardware && e.software ? " + " : "", e.software ? "software" : "");
+      };
+      line("H.264", caps.h264);
+      line("HEVC", caps.hevc);
+      line("AV1", caps.av1);
+      if (!caps.hevc.any()) ImGui::TextDisabled("HEVC: instale \"HEVC Video Extensions\" na Microsoft Store.");
+    }
+  }
 
   sectionTitle("Decodificação");
   optLabel("Decoder", "Automático: começa em hardware (D3D11/DXVA), mede ms/quadro no stream ao vivo, testa o software e fica com o mais rápido. Hardware: só GPU. Software: CPU, mais carga porém muitas vezes 2 a 10 ms mais rápido em 1080p. Aplicado no próximo keyframe (pedido automaticamente).");

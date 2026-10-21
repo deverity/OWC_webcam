@@ -37,6 +37,8 @@ struct AppSettings {
   owc::ClientOptions opts;
   // per-device parameter memory, key = "model|name"
   std::map<std::string, ParamList> device_params;
+  // per-device orientation: mode -1 = auto (phone hint), else 0/90/180/270; mirror
+  std::map<std::string, std::pair<int, bool>> device_orient;
 };
 
 std::wstring settingsPath();
