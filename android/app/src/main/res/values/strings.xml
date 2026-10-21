@@ -45,16 +45,16 @@
     <string name="net_hint">Conecte via USB ou na mesma rede Wi-Fi do PC</string>
     <string name="net_mobile">(dados móveis — não use)</string>
     <string name="usb_title">CONECTAR PELO CABO USB (SEM MODO DESENVOLVEDOR)</string>
-    <string name="usb_steps">1. Ligue o cabo USB no PC.\n2. Toque em \"Abrir Ancoragem USB\".\n3. Ative \"Ancoragem USB\".\n4. Abra o OWC no Windows: o celular aparece como \"USB (ancoragem)\".</string>
+    <string name="usb_steps">1. Ligue o cabo USB no PC.\n2. Toque em \"Abrir Ancoragem USB\".\n3. Ative \"Ancoragem via USB\" (em alguns aparelhos: \"Ancoragem USB\").\n4. Abra o OWC no Windows: o celular aparece como \"USB (ancoragem)\".</string>
     <string name="usb_open">Abrir Ancoragem USB</string>
-    <string name="usb_samsung">Samsung: Configurações › Conexões › Roteador Wi-Fi e Ancoragem › Ancoragem USB</string>
+    <string name="usb_samsung">Samsung: Configurações › Conexões › Roteador Wi-Fi e Ancoragem › Ancoragem via USB</string>
     <string name="usb_inactive">Ancoragem USB inativa</string>
     <string name="usb_active">USB (ancoragem) ativa — IP %1$s</string>
     <string name="net_usb_label">Cabo USB (ancoragem)</string>
     <string name="usb_warn">Atenção: com a ancoragem ligada o Windows pode usar a internet móvel do celular. Para evitar consumo do plano: mantenha o Wi-Fi do celular ligado (a ancoragem passa a compartilhar o Wi-Fi) ou desligue os dados móveis.</string>
     <string name="help_btn">Ajuda: como conectar</string>
     <string name="help_title">Como conectar</string>
-    <string name="help_body">1. Wi-Fi: o celular e o PC na mesma rede Wi-Fi. O OWC no Windows encontra o celular sozinho.\n\n2. Cabo USB (ancoragem) — recomendado, sem modo desenvolvedor: ligue o cabo, ative \"Ancoragem USB\" nas configurações do celular e o celular aparece no Windows como \"USB (ancoragem)\".\n\n3. Cabo USB avançado (ADB): para quem já usa o modo desenvolvedor e a depuração USB; o OWC no Windows configura tudo com um clique.</string>
+    <string name="help_body">1. Wi-Fi: o celular e o PC na mesma rede Wi-Fi. O OWC no Windows encontra o celular sozinho.\n\n2. Cabo USB (ancoragem) — recomendado, sem modo desenvolvedor: ligue o cabo, ative \"Ancoragem via USB\" nas configurações do celular e o celular aparece no Windows como \"USB (ancoragem)\".\n\n3. Cabo USB avançado (ADB): para quem já usa o modo desenvolvedor e a depuração USB; o OWC no Windows configura tudo com um clique.</string>
     <string name="close">Fechar</string>
     <string name="usb_toast_fail">Não foi possível abrir as configurações de ancoragem</string>
 </resources>
