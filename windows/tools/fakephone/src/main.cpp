@@ -1,0 +1,111 @@
+// owc_fakephone: emulates the Android phone side of the OWC protocol.
+//   owc_fakephone [--port 47800] [--udp-port 47801] [--discovery-port 47802]
+//                 [--bind 0.0.0.0] [--width 1280] [--height 720] [--fps 30]
+//                 [--bitrate 4000000] [--bframes 0] [--profile 0] [--gop-ms 2000]
+//                 [--loss 0] [--fec 0] [--name FakePhone] [--no-discovery] [--verbose]
+// Runs until Ctrl+C / Enter.
+#include "fake_phone.h"
+
+#include <windows.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+namespace {
+std::atomic<bool> g_quit{false};
+BOOL WINAPI onCtrl(DWORD) {
+  g_quit = true;
+  return TRUE;
+}
+void usage() {
+  printf(
+      "owc_fakephone - OWC phone emulator\n"
+      "  --port N           TCP control port (default 47800, 0 = any)\n"
+      "  --udp-port N       UDP video port (default 47801)\n"
+      "  --discovery-port N UDP discovery port (default 47802)\n"
+      "  --bind ADDR        bind address (default 0.0.0.0)\n"
+      "  --width/--height/--fps/--bitrate N   initial stream settings\n"
+      "  --bframes N        B-frames (0..2, implies Main profile)\n"
+      "  --profile N        0 Baseline, 1 Main, 2 High\n"
+      "  --gop-ms N         periodic keyframe interval (0 = on request only)\n"
+      "  --loss P           drop P%% of UDP datagrams\n"
+      "  --fec P            Reed-Solomon parity P%% on UDP (-1 = auto 20%%)\n"
+      "  --name S           device name\n"
+      "  --no-discovery     don't answer discovery broadcasts\n"
+      "  --replay FILE      stream a recorded Annex-B H.264 file instead of the pattern\n"
+      "  --replay-fps N     replay frame rate (default 30)\n"
+      "  --rotation DEG     VideoFormat rotation hint\n"
+      "  --strip-ps         send IDRs without inline SPS/PPS (csd only)\n"
+      "  --verbose\n");
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  owc::fake::FakePhoneConfig cfg;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto next = [&](const char* name) -> const char* {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", name);
+        exit(2);
+      }
+      return argv[++i];
+    };
+    auto u16 = [&](const char* name) { return static_cast<uint16_t>(atoi(next(name))); };
+    auto u32 = [&](const char* name) { return static_cast<uint32_t>(strtoul(next(name), nullptr, 10)); };
+    if (a == "--port") cfg.control_port = u16("--port");
+    else if (a == "--udp-port") cfg.udp_port = u16("--udp-port");
+    else if (a == "--discovery-port") cfg.discovery_port = u16("--discovery-port");
+    else if (a == "--bind") cfg.bind_address = next("--bind");
+    else if (a == "--width") cfg.width = u32("--width");
+    else if (a == "--height") cfg.height = u32("--height");
+    else if (a == "--fps") cfg.fps = u32("--fps");
+    else if (a == "--bitrate") cfg.bitrate = u32("--bitrate");
+    else if (a == "--bframes") cfg.bframes = u32("--bframes");
+    else if (a == "--profile") cfg.profile = atoi(next("--profile"));
+    else if (a == "--gop-ms") cfg.keyframe_interval_ms = u32("--gop-ms");
+    else if (a == "--loss") cfg.loss_percent = atof(next("--loss"));
+    else if (a == "--fec") cfg.fec_percent = atoi(next("--fec"));
+    else if (a == "--name") cfg.device_name = next("--name");
+    else if (a == "--no-discovery") cfg.enable_discovery = false;
+    else if (a == "--replay") cfg.replay_file = next("--replay");
+    else if (a == "--replay-fps") cfg.replay_fps = u32("--replay-fps");
+    else if (a == "--rotation") cfg.rotation_deg = static_cast<int16_t>(atoi(next("--rotation")));
+    else if (a == "--strip-ps") cfg.inline_param_sets = false;
+    else if (a == "--verbose") cfg.verbose = true;
+    else if (a == "--help" || a == "-h") { usage(); return 0; }
+    else { fprintf(stderr, "unknown argument %s\n", a.c_str()); usage(); return 2; }
+  }
+  owc::fake::FakePhone phone;
+  std::string err;
+  if (!phone.start(cfg, err)) {
+    fprintf(stderr, "start failed: %s\n", err.c_str());
+    return 1;
+  }
+  printf("fakephone '%s': TCP %u, UDP %u, discovery %u, %ux%u@%u %u bps, bframes %u, loss %.1f%%, fec %d%%\n",
+         cfg.device_name.c_str(), phone.controlPort(), phone.udpPort(), phone.discoveryPort(),
+         cfg.width, cfg.height, cfg.fps, cfg.bitrate, cfg.bframes, cfg.loss_percent, cfg.fec_percent);
+  printf("Ctrl+C to quit\n");
+  fflush(stdout);
+  SetConsoleCtrlHandler(onCtrl, TRUE);
+  uint64_t lastFrames = 0;
+  while (!g_quit) {
+    Sleep(1000);
+    if (cfg.verbose) {
+      auto c = phone.counters();
+      if (c.frames_sent != lastFrames)
+        printf("sent %llu frames (%llu key), %llu dgrams (%llu dropped, %llu fec), kf req %llu, rr jitter %.2f ms grad %.2f ms\n",
+               static_cast<unsigned long long>(c.frames_sent), static_cast<unsigned long long>(c.keyframes),
+               static_cast<unsigned long long>(c.datagrams_sent), static_cast<unsigned long long>(c.datagrams_dropped),
+               static_cast<unsigned long long>(c.fec_datagrams), static_cast<unsigned long long>(c.keyframe_requests),
+               c.last_rr_jitter_ms, c.last_rr_delay_gradient_ms);
+      lastFrames = c.frames_sent;
+      fflush(stdout);
+    }
+  }
+  phone.stop();
+  return 0;
+}
