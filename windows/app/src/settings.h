@@ -35,6 +35,14 @@ struct AppSettings {
   bool hud = true;
   int log_level = 1;
   owc::ClientOptions opts;
+  // recording choices
+  int rec_mode = 0;           // 0 real time, 1 slow motion
+  int rec_priority = 0;       // 0 quality, 1 latency
+  int rec_slowmo_h = 720;     // 720 (1280x720) or 1080 (1920x1080)
+  int rec_slowmo_out_fps = 30;// 30 (8x) or 60 (4x)
+  bool rec_keep_current = true;  // real time: keep current resolution/fps
+  int rec_rt_w = 0, rec_rt_h = 0, rec_rt_fps = 0;
+  std::string rec_dir;        // "" = %USERPROFILE%\Videos\OWC
   // per-device parameter memory, key = "model|name"
   std::map<std::string, ParamList> device_params;
   // per-device orientation: mode -1 = auto (phone hint), else 0/90/180/270; mirror

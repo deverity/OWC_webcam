@@ -51,6 +51,10 @@ struct GraphPoint {
   float shown = 0;    // capture -> on screen (ms)
 };
 
+// Recording flow driven by App::tick(): Idle -> Preparing (setup applied, waiting for
+// the stream to reflect it) -> Recording -> Idle (stop) ; Done keeps the file list.
+enum class RecPhase { Idle, Preparing, Recording };
+
 enum class UsbPhase { Idle, Running, AwaitInstall, Done, Failed };
 
 struct PendingParam {
@@ -139,6 +143,24 @@ class App : public owc::ClientEvents {
   void deleteUserPreset(size_t idx);
   void applyOptions(const owc::ClientOptions& o);  // setOptions + persist
   std::string deviceKeyNow();
+
+  // ---- recording (app_record.cpp). All on the UI thread; never blocks (except
+  // recStop(), which waits for the MP4 to finalize, typically < 1 s).
+  RecPhase rec_phase = RecPhase::Idle;
+  owc::RecordStatus rec_status;        // live while recording, final after stop
+  owc::RecordSetupStatus rec_setup;
+  std::string rec_error;               // last start/stop problem (pt-BR)
+  std::vector<std::string> rec_files;  // files of the last finished recording
+  owc::RecordStatus rec_final;         // status returned by the last stopRecording()
+  bool rec_has_final = false;
+  ULONGLONG rec_t0 = 0;                // tick when media started (phase Recording)
+  bool rec_preview_available = true;
+  bool recStart();                     // begins the flow (false + rec_error if it can't)
+  void recStop();
+  void recTick();
+  bool recActive() const { return rec_phase != RecPhase::Idle; }
+  std::string recDir() const;          // resolved destination folder (UTF-8)
+  owc::RecordPreset recPreset() const;
 
   // ---- toasts / logs
   void toast(const std::string& text, bool error = false, unsigned ms = 4000);
@@ -238,6 +260,11 @@ class App : public owc::ClientEvents {
   bool script_busy_ = false;
   std::string script_out_;
   ULONGLONG probe_t_ = 0;
+
+  // recording flow
+  ULONGLONG rec_prep_t_ = 0;
+  std::string rec_path_;
+  owc::RecordPreset rec_req_;
 };
 
 const char* reasonText(owc::DisconnectReason r);

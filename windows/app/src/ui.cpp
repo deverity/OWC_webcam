@@ -109,7 +109,7 @@ struct TabDef {
   const char* title;
 };
 const TabDef kTabs[] = {{"presets", "Presets"},   {"camera", "Câmera"}, {"encoder", "Encoder/Stream"},
-                        {"pc", "PC"},             {"device", "Dispositivo"}, {"outputs", "Saídas"},
+                        {"pc", "PC"},             {"device", "Dispositivo"}, {"record", "Gravação"}, {"outputs", "Saídas"},
                         {"logs", "Logs"}};
 int g_tab = 0;
 bool g_openHelp = false;
@@ -496,6 +496,22 @@ void drawPreview(App& app, Renderer& r, ImVec2 size) {
   g_hasVideo = r.previewSrv() && r.previewWidth() > 0 && g_lastShown > 0 &&
                GetTickCount64() - g_lastShownTick < 2500 && (cs == owc::ClientState::Streaming);
 
+  if (app.rec_phase == RecPhase::Recording && !app.rec_preview_available) {
+    const char* l1 = "Gravando em HEVC";
+    const char* l2 = "preview indisponível neste PC (instale HEVC Video Extensions para ver)";
+    ImGui::PushFont(fontTitle);
+    ImVec2 s1 = ImGui::CalcTextSize(l1);
+    dl->AddText(ImVec2(base.x + (size.x - s1.x) / 2, base.y + size.y / 2 - s1.y - sc(4)), IM_COL32(235, 90, 90, 255), l1);
+    ImGui::PopFont();
+    ImGui::PushTextWrapPos(0);
+    ImVec2 s2 = ImGui::CalcTextSize(l2, nullptr, false, size.x - sc(20));
+    dl->AddText(nullptr, 0.0f, ImVec2(base.x + std::max(sc(10), (size.x - s2.x) / 2), base.y + size.y / 2 + sc(8)),
+                IM_COL32(170, 178, 190, 255), l2, nullptr, size.x - sc(20));
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(size);
+    return;
+  }
+
   if (!g_hasVideo) {
     const char* l1 = "Sem vídeo";
     const char* l2 = app.live() ? "Aguardando o stream do celular..."
@@ -645,11 +661,14 @@ void drawCenter(App& app, Renderer& r) {
   ImGui::PopFont();
   {
     const float bw = sc(104);
-    const float total = bw * 2 + ImGui::GetStyle().ItemSpacing.x * 3 + sc(64);
+    const float recW = sc(138);
+    const float total = bw * 2 + recW + ImGui::GetStyle().ItemSpacing.x * 4 + sc(64);
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + sc(8), ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - total));
     ImGui::Checkbox("HUD", &app.settings.hud);
     if (ImGui::IsItemDeactivatedAfterEdit()) app.markDirty();
     tip("Mostra estatísticas e o gráfico de latência sobre a imagem.");
+    ImGui::SameLine();
+    recordButton(app, recW);
     ImGui::SameLine();
     ImGui::BeginDisabled(!app.sessionUp());
     if (st.state == owc::ClientState::Streaming) {
@@ -716,8 +735,9 @@ void drawRight(App& app) {
     case 2: tabEncoder(app); break;
     case 3: tabPc(app); break;
     case 4: tabDevice(app); break;
-    case 5: tabOutputs(app); break;
-    case 6: tabLogs(app); break;
+    case 5: tabRecord(app); break;
+    case 6: tabOutputs(app); break;
+    case 7: tabLogs(app); break;
     default: break;
   }
   ImGui::EndChild();
@@ -837,7 +857,8 @@ bool uiSelectTab(const std::string& name) {
   for (char ch : name) n += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   static const struct { const char* k; int i; } alias[] = {
       {"presets", 0}, {"preset", 0}, {"camera", 1}, {"câmera", 1}, {"encoder", 2}, {"stream", 2}, {"encoder/stream", 2},
-      {"pc", 3}, {"device", 4}, {"dispositivo", 4}, {"outputs", 5}, {"saidas", 5}, {"saídas", 5}, {"logs", 6}};
+      {"pc", 3}, {"device", 4}, {"dispositivo", 4}, {"outputs", 6}, {"saidas", 6}, {"saídas", 6}, {"logs", 7},
+      {"record", 5}, {"gravacao", 5}, {"gravação", 5}};
   if (n == "help") { g_openHelp = true; return true; }
   for (const auto& a : alias)
     if (n == a.k) { g_tab = a.i; return true; }

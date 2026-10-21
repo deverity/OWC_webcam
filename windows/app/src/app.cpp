@@ -173,6 +173,7 @@ void App::saveNow() {
 
 void App::tick() {
   const ULONGLONG now = GetTickCount64();
+  recTick();
   {
     std::lock_guard<std::mutex> l(mu_);
     for (auto it = pending_.begin(); it != pending_.end();) {
@@ -286,6 +287,7 @@ void App::connectNet(const std::string& host, int port, owc::VideoTransport t, c
 }
 
 void App::disconnect() {
+  recStop();  // finalize the MP4 and restore the pre-recording setup
   usbCancel();
   client.disconnect();
 }

@@ -112,6 +112,15 @@ bool loadSettings(AppSettings& s) {
   s.window_h = static_cast<int>(j.num("window_h", s.window_h));
   s.hud = j.flag("hud", s.hud);
   s.log_level = static_cast<int>(j.num("log_level", s.log_level));
+  s.rec_mode = static_cast<int>(j.num("rec_mode", s.rec_mode)) == 1 ? 1 : 0;
+  s.rec_priority = static_cast<int>(j.num("rec_priority", s.rec_priority)) == 1 ? 1 : 0;
+  s.rec_slowmo_h = static_cast<int>(j.num("rec_slowmo_h", s.rec_slowmo_h)) == 1080 ? 1080 : 720;
+  s.rec_slowmo_out_fps = static_cast<int>(j.num("rec_slowmo_out_fps", s.rec_slowmo_out_fps)) == 60 ? 60 : 30;
+  s.rec_keep_current = j.flag("rec_keep_current", s.rec_keep_current);
+  s.rec_rt_w = static_cast<int>(j.num("rec_rt_w", s.rec_rt_w));
+  s.rec_rt_h = static_cast<int>(j.num("rec_rt_h", s.rec_rt_h));
+  s.rec_rt_fps = static_cast<int>(j.num("rec_rt_fps", s.rec_rt_fps));
+  s.rec_dir = j.str("rec_dir", s.rec_dir);
   if (const Json* o = j.find("options")) optionsFromJson(*o, s.opts);
   if (const Json* d = j.find("devices"); d && d->isObj()) {
     for (const auto& kv : d->o) {
@@ -141,6 +150,15 @@ bool saveSettings(const AppSettings& s) {
   j.set("window_h", Json::number(s.window_h));
   j.set("hud", Json::boolean(s.hud));
   j.set("log_level", Json::number(s.log_level));
+  j.set("rec_mode", Json::number(s.rec_mode));
+  j.set("rec_priority", Json::number(s.rec_priority));
+  j.set("rec_slowmo_h", Json::number(s.rec_slowmo_h));
+  j.set("rec_slowmo_out_fps", Json::number(s.rec_slowmo_out_fps));
+  j.set("rec_keep_current", Json::boolean(s.rec_keep_current));
+  j.set("rec_rt_w", Json::number(s.rec_rt_w));
+  j.set("rec_rt_h", Json::number(s.rec_rt_h));
+  j.set("rec_rt_fps", Json::number(s.rec_rt_fps));
+  j.set("rec_dir", Json::string(s.rec_dir));
   j.set("options", optionsToJson(s.opts));
   Json d = Json::object();
   for (const auto& kv : s.device_params) d.set(kv.first, paramsToJson(kv.second));

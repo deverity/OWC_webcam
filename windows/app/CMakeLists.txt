@@ -21,6 +21,8 @@ target_compile_definitions(owc_imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 add_executable(OWC WIN32
   src/main.cpp
   src/app.cpp
+  src/app_record.cpp
+  src/ui_record.cpp
   src/platform.cpp
   src/settings.cpp
   src/params_meta.cpp

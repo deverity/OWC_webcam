@@ -41,6 +41,11 @@ void tabPc(App& app);
 void tabDevice(App& app);
 void tabOutputs(App& app);
 void tabLogs(App& app);
+void tabRecord(App& app);  // ui_record.cpp
+// Header record button (red + time/size while recording).
+void recordButton(App& app, float width);
+std::string fmtBytes(uint64_t b);
+std::string fmtClock(double seconds);  // mm:ss (h:mm:ss above 1 h)
 
 const char* thermalName(int status);
 ImVec4 thermalColor(int status);

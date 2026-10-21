@@ -43,6 +43,10 @@ struct Args {
   bool help = false;
   bool colortest = false;
   bool idle = false;  // self-test without a phone: only screenshot the idle UI
+  double record = 0;          // --record N: record N seconds through the UI flow
+  bool slowmo = false;        // --slowmo
+  std::string rec_priority;   // --rec-priority quality|latency
+  std::wstring rec_dir;       // --rec-dir
   std::vector<std::string> sets;  // --set id:value (self-test: send a param, report the outcome)
 };
 
@@ -112,6 +116,10 @@ bool parseArgs(Args& a) {
     else if (s == L"--colortest") a.colortest = true;
     else if (s == L"--idle") a.idle = true;
     else if (s == L"--set") a.sets.push_back(toUtf8(next()));
+    else if (s == L"--record") a.record = _wtof(next().c_str());
+    else if (s == L"--slowmo") a.slowmo = true;
+    else if (s == L"--rec-priority") a.rec_priority = toUtf8(next());
+    else if (s == L"--rec-dir") a.rec_dir = next();
     else if (s == L"--host") a.host = toUtf8(next());
     else if (s == L"--port") a.port = _wtoi(next().c_str());
     else if (s == L"--transport") a.transport = toUtf8(next());
@@ -344,10 +352,74 @@ struct SelfTest {
   ULONGLONG t_first = 0;
   uint64_t shown_first = 0;
   bool shot_requested = false;
+  int rec_stage = 0;  // 0 idle, 1 waiting for Recording, 2 recording, 3 stopped
+  ULONGLONG rec_t = 0;
   bool done = false;
   int exit_code = 1;
 };
 SelfTest g_st;
+
+// --record: drive the same UI flow (App::recStart -> recTick -> recStop) and report.
+void recordSelftest(ULONGLONG now) {
+  App& app = *g_app;
+  auto fail = [&](const char* why, int code) {
+    emitf("SELFTEST RECORD FAIL: %s%s%s\n", why, app.rec_error.empty() ? "" : " - ", app.rec_error.c_str());
+    g_st.exit_code = code;
+    g_st.done = true;
+  };
+  if (g_st.rec_stage == 0) {
+    app.settings.rec_mode = g_args.slowmo ? 1 : 0;
+    if (g_args.rec_priority == "latency") app.settings.rec_priority = 1;
+    else if (g_args.rec_priority == "quality") app.settings.rec_priority = 0;
+    if (!g_args.rec_dir.empty()) app.settings.rec_dir = toUtf8(g_args.rec_dir);
+    if (!app.recStart()) return fail("recStart", 5);
+    emitf("SELFTEST RECORD: preparando (%s, %s)\n", g_args.slowmo ? "camera lenta" : "tempo real",
+          app.settings.rec_priority ? "latencia" : "qualidade");
+    g_st.rec_stage = 1;
+    g_st.rec_t = now;
+    return;
+  }
+  if (g_st.rec_stage == 1) {
+    if (app.rec_phase == RecPhase::Recording) {
+      emitf("SELFTEST RECORD: gravando. %s\n", app.rec_setup.summary.c_str());
+      g_st.rec_stage = 2;
+      g_st.rec_t = now;
+    } else if (app.rec_phase == RecPhase::Idle) {
+      return fail("gravacao nao iniciou", 5);
+    } else if (now - g_st.rec_t > 30000) {
+      return fail("timeout preparando", 5);
+    }
+    return;
+  }
+  if (g_st.rec_stage == 2) {
+    const double el = static_cast<double>(now - g_st.rec_t) / 1000.0;
+    if (app.rec_phase != RecPhase::Recording) return fail("gravacao parou sozinha", 6);
+    if (!g_st.shot_requested && !g_args.screenshot.empty() && el >= g_args.record * 0.5) {
+      g_renderer.requestScreenshot(g_args.screenshot);
+      g_st.shot_requested = true;
+    }
+    if (el < g_args.record || (g_st.shot_requested && g_renderer.screenshotPending())) return;
+    app.recStop();
+    g_st.rec_stage = 3;
+    const owc::RecordStatus& f = app.rec_final;
+    bool ok = !app.rec_files.empty() && f.frames_written > 0 && f.frames_dropped == 0;
+    for (const std::string& file : app.rec_files) {
+      WIN32_FILE_ATTRIBUTE_DATA fa{};
+      unsigned long long sz = 0;
+      if (GetFileAttributesExW(fromUtf8(file).c_str(), GetFileExInfoStandard, &fa))
+        sz = (static_cast<unsigned long long>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+      else ok = false;
+      emitf("RECFILE %s frames_written=%llu frames_dropped=%llu frames_missing=%llu media_duration=%.2fs bytes_on_disk=%llu\n",
+            file.c_str(), static_cast<unsigned long long>(f.frames_written), static_cast<unsigned long long>(f.frames_dropped),
+            static_cast<unsigned long long>(f.frames_missing), f.media_duration_s, sz);
+    }
+    emitf("  capture_fps=%.1f slowmo_factor=%.2f gaps=%u files=%zu error=%s\n", f.capture_fps, f.slowmo_factor, f.gaps,
+          app.rec_files.size(), app.rec_error.empty() ? "-" : app.rec_error.c_str());
+    emitf("SELFTEST RECORD %s\n", ok ? "PASS" : "FAIL");
+    g_st.exit_code = ok ? 0 : 7;
+    g_st.done = true;
+  }
+}
 
 void selftestTick() {
   const ULONGLONG now = GetTickCount64();
@@ -396,6 +468,10 @@ void selftestTick() {
       }
       g_app->setParam(id, pv);
     }
+  }
+  if (g_args.record > 0) {
+    if (elapsed >= 1.5) recordSelftest(now);
+    return;
   }
   if (!g_st.shot_requested && !g_args.screenshot.empty() && elapsed >= g_args.seconds * 0.75) {
     g_renderer.requestScreenshot(g_args.screenshot);
@@ -457,7 +533,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   parseArgs(g_args);
   g_logPath = g_args.logfile;
   if (g_args.help) {
-    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]]\n");
+    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]]\n");
     return 0;
   }
 
