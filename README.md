@@ -46,11 +46,11 @@ Medição do sensor ao PC num Samsung Galaxy Note 9 (valores típicos, sujeitos 
 3. **Webcam virtual:** na aba **"Saídas"**, clique em **"Instalar"** (instala para o usuário atual, sem administrador).
    Alternativa por script, a partir da pasta do pacote:
    ```powershell
-   .\install-virtualcam.ps1 -PerUser -Dll64 .\vcam\x64\owc_virtualcam.dll -Dll32 .\vcam\x86\owc_virtualcam.dll
+   .\install-virtualcam.ps1 -PerUser
    ```
    Para instalar para todas as contas (máquina inteira), omita `-PerUser` e aceite o UAC.
    Para remover: `.\uninstall-virtualcam.ps1 -PerUser`.
-4. **OBS (opcional):** feche o OBS e rode `.\install-obs-plugin.ps1 -BuildDir .\obs-plugin`
+4. **OBS (opcional):** feche o OBS e rode `.\install-obs-plugin.ps1`
    (requer permissão de escrita em `%ProgramData%\obs-studio\plugins`; use PowerShell como administrador se necessário).
    Depois abra o OBS e adicione a fonte **"OWC Phone Camera"**.
 
