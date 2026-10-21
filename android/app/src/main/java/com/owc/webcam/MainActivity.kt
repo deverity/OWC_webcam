@@ -2,6 +2,8 @@ package com.owc.webcam
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -36,6 +38,9 @@ class MainActivity : Activity() {
     private lateinit var btnService: Button
     private lateinit var btnBattery: Button
     private lateinit var btnOverlay: Button
+    private lateinit var txtUsbState: TextView
+    private lateinit var txtUsbWarn: TextView
+    private var tick = 0
     private lateinit var swPreview: Switch
     private lateinit var swKeepOn: Switch
     private lateinit var surface: SurfaceView
@@ -47,6 +52,7 @@ class MainActivity : Activity() {
     private val poll = object : Runnable {
         override fun run() {
             refreshStatus()
+            if (tick++ % 4 == 0) refreshNetwork()
             handler.postDelayed(this, 500)
         }
     }
@@ -74,6 +80,16 @@ class MainActivity : Activity() {
             startActivity(Intent(this, BlackScreenActivity::class.java))
         }
         btnBattery.setOnClickListener { requestBatteryExemption() }
+        txtUsbState = findViewById(R.id.txtUsbState)
+        txtUsbWarn = findViewById(R.id.txtUsbWarn)
+        findViewById<Button>(R.id.btnUsb).setOnClickListener { openTetherSettings() }
+        findViewById<Button>(R.id.btnHelp).setOnClickListener {
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle(R.string.help_title)
+                .setMessage(R.string.help_body)
+                .setPositiveButton(R.string.close, null)
+                .show()
+        }
         btnOverlay = findViewById(R.id.btnOverlay)
         btnOverlay.setOnClickListener {
             try {
@@ -227,9 +243,29 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ UI
 
+    private fun openTetherSettings() {
+        val candidates = listOf(
+            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.TetherSettings")),
+            Intent("android.settings.TETHER_SETTINGS"),
+            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.Settings\$TetherSettingsActivity")),
+            Intent(Settings.ACTION_WIRELESS_SETTINGS)
+        )
+        for (i in candidates) {
+            try {
+                startActivity(i)
+                return
+            } catch (_: Throwable) {
+                // tenta o proximo
+            }
+        }
+        Toast.makeText(this, R.string.usb_toast_fail, Toast.LENGTH_LONG).show()
+    }
+
+    private fun isUsbIf(n: String) = n.startsWith("rndis") || n.startsWith("usb") || n.startsWith("ncm")
+
     private fun netRank(n: String): Int = when {
+        isUsbIf(n) -> -1
         n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("wifi") -> 0
-        n.startsWith("rndis") || n.startsWith("usb") || n.startsWith("ncm") -> 1
         n.startsWith("eth") || n.startsWith("en") -> 2
         n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("pdp") || n.startsWith("v4-rmnet") ||
             n.startsWith("clat") || n.startsWith("ppp") || n.startsWith("tun") -> 9
@@ -251,8 +287,14 @@ class MainActivity : Activity() {
         rows.sortBy { it.first }
         val sb = StringBuilder()
         var usable = false
+        var usbIp: String? = null
         for ((rank, name, addr) in rows) {
-            sb.append(name).append("  ").append(addr)
+            if (isUsbIf(name)) {
+                usbIp = addr
+                sb.append(getString(R.string.net_usb_label)).append("  ").append(addr)
+            } else {
+                sb.append(name).append("  ").append(addr)
+            }
             if (rank >= 9) sb.append("  ").append(getString(R.string.net_mobile)) else usable = true
             sb.append('\n')
         }
@@ -260,6 +302,15 @@ class MainActivity : Activity() {
         if (!usable) sb.append(getString(R.string.net_hint)).append('\n')
         sb.append(getString(R.string.ports_fmt, prefs.controlPort, prefs.udpPort, prefs.discoveryPort))
         txtNetwork.text = sb.toString()
+        if (usbIp != null) {
+            txtUsbState.text = getString(R.string.usb_active, usbIp)
+            txtUsbState.setTextColor(0xFF81C784.toInt())
+            txtUsbWarn.visibility = View.VISIBLE
+        } else {
+            txtUsbState.text = getString(R.string.usb_inactive)
+            txtUsbState.setTextColor(getColor(R.color.muted))
+            txtUsbWarn.visibility = View.GONE
+        }
     }
 
     private fun refreshStatus() {
