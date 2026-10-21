@@ -1,9 +1,11 @@
 // owc_core unit tests: transforms, clock sync, jitter/delay trend, keyframe
-// policy, adb parsing, process exec, Annex-B helpers, counter strip, presets.
+// policy, adb parsing, process exec, Annex-B helpers, counter strip, presets,
+// colour grading (.cube parsing, YUV table bake/apply, export).
 #include "test_util.h"
 
 #include "annexb.h"
 #include "codec_select.h"
+#include "color_grade.h"
 #include "record_setup.h"
 #include "metrics.h"
 #include "transform.h"
@@ -12,13 +14,18 @@
 #include "pattern.h"
 
 #include <owc/adb.h>
+#include <owc/color_grade.h>
 #include <owc/discovery.h>
 #include <owc/firewall.h>
 #include <owc/presets.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
 
 using namespace owc;
@@ -609,6 +616,592 @@ void testQpcConversions() {
   }
 }
 
+// ------------------------------------------------------------------ colour grading
+std::string tempPath(const char* name) {
+  wchar_t buf[MAX_PATH];
+  GetTempPathW(MAX_PATH, buf);
+  return wideToUtf8(buf) + name;
+}
+
+bool writeText(const std::string& path, const std::string& text) {
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, utf8ToWide(path).c_str(), L"wb") != 0 || !f) return false;
+  const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+  fclose(f);
+  return ok;
+}
+
+const char* kIdentityCube2 =
+    "# identity, size 2\n"
+    "TITLE \"Ident\"\n"
+    "\n"
+    "LUT_3D_SIZE 2\n"
+    "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+    "0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+
+Img randomNv12(uint32_t w, uint32_t h, uint32_t seed) {
+  std::mt19937 rng(seed);
+  Img im(w, h);
+  for (auto& b : im.y) b = static_cast<uint8_t>(rng());
+  for (auto& b : im.uv) b = static_cast<uint8_t>(rng());
+  return im;
+}
+
+// Horizontal luma ramp, chroma ramps in both directions (covers every code).
+Img gradientNv12(uint32_t w, uint32_t h) {
+  Img im(w, h);
+  for (uint32_t r = 0; r < h; ++r)
+    for (uint32_t x = 0; x < w; ++x) im.y[r * w + x] = static_cast<uint8_t>(x * 255 / (w - 1));
+  for (uint32_t r = 0; r < h / 2; ++r)
+    for (uint32_t x = 0; x < w / 2; ++x) {
+      im.uv[r * w + 2 * x] = static_cast<uint8_t>(x * 255 / (w / 2 - 1));
+      im.uv[r * w + 2 * x + 1] = static_cast<uint8_t>(r * 255 / (h / 2 - 1));
+    }
+  return im;
+}
+
+// In-gamut image: random RGB per 2x2 block, converted with the given matrix/range.
+Img rgbBlocksNv12(uint32_t w, uint32_t h, uint32_t matrix, bool full, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> d(0, 1);
+  const float kr = matrix == 1 ? 0.299f : 0.2126f, kb = matrix == 1 ? 0.114f : 0.0722f;
+  Img im(w, h);
+  for (uint32_t r = 0; r < h / 2; ++r)
+    for (uint32_t x = 0; x < w / 2; ++x) {
+      const float R = d(rng), G = d(rng), B = d(rng);
+      const float Y = kr * R + (1 - kr - kb) * G + kb * B;
+      const float cb = (B - Y) / (2 * (1 - kb)), cr = (R - Y) / (2 * (1 - kr));
+      const uint8_t yc = static_cast<uint8_t>(std::lround(full ? Y * 255 : 16 + Y * 219));
+      im.y[2 * r * w + 2 * x] = im.y[2 * r * w + 2 * x + 1] = yc;
+      im.y[(2 * r + 1) * w + 2 * x] = im.y[(2 * r + 1) * w + 2 * x + 1] = yc;
+      im.uv[r * w + 2 * x] = static_cast<uint8_t>(std::min(255L, std::lround(128 + cb * (full ? 255 : 224))));
+      im.uv[r * w + 2 * x + 1] = static_cast<uint8_t>(std::min(255L, std::lround(128 + cr * (full ? 255 : 224))));
+    }
+  return im;
+}
+
+void copyOut(const uint8_t* y, uint32_t ys, const uint8_t* uv, uint32_t uvs, Img& out) {
+  for (uint32_t r = 0; r < out.h; ++r) memcpy(&out.y[r * out.w], y + static_cast<size_t>(r) * ys, out.w);
+  for (uint32_t r = 0; r < out.h / 2; ++r)
+    memcpy(&out.uv[r * out.w], uv + static_cast<size_t>(r) * uvs, out.w);
+}
+
+// One frame through the grader, waiting (bounded) for the bake of `g`.
+bool gradeFrame(ColorGrader& gr, const ColorGrade& g, uint32_t matrix, bool full, const Img& in,
+                Img& out, std::vector<uint8_t>& buf) {
+  const uint8_t* y = in.y.data();
+  const uint8_t* uv = in.uv.data();
+  uint32_t ys = in.w, uvs = in.w;
+  gr.apply(g, matrix, full, y, ys, uv, uvs, in.w, in.h, buf);  // requests the bake
+  if (!gr.waitBaked(10000)) return false;
+  y = in.y.data();
+  uv = in.uv.data();
+  ys = uvs = in.w;
+  if (!gr.apply(g, matrix, full, y, ys, uv, uvs, in.w, in.h, buf)) return false;
+  copyOut(y, ys, uv, uvs, out);
+  return true;
+}
+
+void maxDiff(const Img& a, const Img& b, int& dy, int& duv) {
+  dy = duv = 0;
+  for (size_t i = 0; i < a.y.size(); ++i) dy = std::max(dy, std::abs(a.y[i] - b.y[i]));
+  for (size_t i = 0; i < a.uv.size(); ++i) duv = std::max(duv, std::abs(a.uv[i] - b.uv[i]));
+}
+
+void testCubeParse() {
+  CubeLut c;
+  std::string err;
+  // 3D size 2 identity with comments, blank lines and a quoted title
+  CHECK(parseCube(kIdentityCube2, c, err));
+  CHECK(c.is3d && c.size == 2 && c.title == "Ident" && c.rgb.size() == 24);
+  CHECK(c.rgb[3] == 1 && c.rgb[4] == 0 && c.rgb[23] == 1);
+  // CRLF, BOM, unquoted title, inline comment, 1D with DOMAIN
+  CHECK(parseCube("\xEF\xBB\xBFTITLE plain name\r\nLUT_1D_SIZE 3\r\nDOMAIN_MIN 0 0 0\r\n"
+                  "DOMAIN_MAX 2 2 4 # wide\r\n0 0 0\r\n0.5 0.25 1e-1\r\n+1 1 1\r\n",
+                  c, err));
+  CHECK(!c.is3d && c.size == 3 && c.title == "plain name" && c.rgb.size() == 9);
+  CHECK(c.domain_max[0] == 2 && c.domain_max[2] == 4 && c.domain_min[1] == 0);
+  CHECK(std::fabs(c.rgb[5] - 0.1f) < 1e-7f);
+  // LUT_3D_INPUT_RANGE sets every channel's domain
+  CHECK(parseCube("LUT_3D_SIZE 2\nLUT_3D_INPUT_RANGE -0.5 1.5\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+                  "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+                  c, err));
+  CHECK(c.domain_min[2] == -0.5f && c.domain_max[0] == 1.5f);
+  // malformed -> false + line number
+  auto bad = [&](const char* text, const char* expect) {
+    CubeLut x;
+    std::string e;
+    const bool ok = parseCube(text, x, e);
+    CHECK_MSG(!ok && e.find(expect) != std::string::npos, "err='%s' expected '%s'", e.c_str(), expect);
+  };
+  bad("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n", "linha 8");  // 7 of 8
+  bad("LUT_3D_SIZE 2\n0 0 0\n1 x 0\n", "linha 3: número inválido");
+  bad("# c\nLUT_3D_SIZE 300\n", "linha 2");
+  bad("LUT_1D_SIZE 1\n", "linha 1");
+  bad("LUT_3D_SIZE 2\n0 0\n", "linha 2: esperados 3");
+  bad("LUT_3D_SIZE 2\n0 0 0 0\n", "linha 2: esperados 3");
+  bad("0 0 0\n", "linha 1");
+  bad("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n1 1 1\n", "linha 4");
+  bad("TITLE \"x\"\n", "ausente");
+  bad("LUT_1D_SIZE 2\nDOMAIN_MAX 0 1 1\n0 0 0\n1 1 1\n", "DOMAIN");
+  // file loading
+  CHECK(!loadCubeFile(tempPath("owc_does_not_exist_42.cube"), c, err) && !err.empty());
+}
+
+void testLutLookup() {
+  // 1D, domain 0..2: input 1 -> middle entry
+  CubeLut l1;
+  std::string err;
+  CHECK(parseCube("LUT_1D_SIZE 3\nDOMAIN_MAX 2 2 2\n0 0 0\n0.2 0.4 0.6\n1 1 1\n", l1, err));
+  float in[3] = {1, 1, 0.5f}, out[3];
+  lookupLut(l1, in, out);
+  CHECK(std::fabs(out[0] - 0.2f) < 1e-6f && std::fabs(out[1] - 0.4f) < 1e-6f &&
+        std::fabs(out[2] - 0.3f) < 1e-6f);
+  // 3D of an affine map: tetrahedral interpolation reproduces it exactly
+  CubeLut l3;
+  l3.size = 5;
+  auto f = [](const float* c, float* o) {
+    o[0] = 0.1f + 0.5f * c[0] + 0.2f * c[1] + 0.1f * c[2];
+    o[1] = 0.3f * c[0] + 0.6f * c[1];
+    o[2] = 0.9f - 0.4f * c[2] + 0.05f * c[0];
+  };
+  for (int b = 0; b < 5; ++b)
+    for (int g = 0; g < 5; ++g)
+      for (int r = 0; r < 5; ++r) {
+        const float c[3] = {r / 4.0f, g / 4.0f, b / 4.0f};
+        float o[3];
+        f(c, o);
+        l3.rgb.insert(l3.rgb.end(), o, o + 3);
+      }
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> d(0, 1);
+  float worst = 0;
+  for (int i = 0; i < 2000; ++i) {
+    const float c[3] = {d(rng), d(rng), d(rng)};
+    float o[3], e[3];
+    lookupLut(l3, c, o);
+    f(c, e);
+    for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(o[k] - e[k]));
+  }
+  CHECK_MSG(worst < 1e-5f, "worst %g", worst);
+  // every built-in look exists, 33^3, values in 0..1
+  for (const BuiltinLook& lk : builtinLooks()) {
+    auto lut = builtinLookLut(lk.key);
+    CHECK_MSG(lut && lut->is3d && lut->size == 33, "%s", lk.key);
+    if (!lut) continue;
+    float mn = 1, mx = 0;
+    for (float v : lut->rgb) {
+      mn = std::min(mn, v);
+      mx = std::max(mx, v);
+    }
+    CHECK_MSG(mn >= 0 && mx <= 1 && mx - mn > 0.5f, "%s range %g..%g", lk.key, mn, mx);
+  }
+  CHECK(!builtinLookLut("nope"));
+}
+
+void testGradeCurvesMonotonic() {
+  // neutral pipeline: exact identity, out-of-range values included
+  GradePipeline p0;
+  p0.prepare(ColorGrade(), nullptr);
+  CHECK(p0.noop());
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> d(-1, 2);
+  bool exact = true;
+  for (int i = 0; i < 1000; ++i) {
+    float c[3] = {d(rng), d(rng), d(rng)};
+    const float o[3] = {c[0], c[1], c[2]};
+    p0.run(c);
+    exact = exact && c[0] == o[0] && c[1] == o[1] && c[2] == o[2];
+  }
+  CHECK(exact);
+  // every tone control keeps a grey ramp monotonic (no inversion at the extremes)
+  struct Case {
+    const char* name;
+    float ev, con, hi, sh, temp;
+  } cases[] = {{"contrast+1", 0, 1, 0, 0, 0},   {"contrast-1", 0, -1, 0, 0, 0},
+               {"shadows+1", 0, 0, 0, 1, 0},    {"shadows-1", 0, 0, 0, -1, 0},
+               {"highlights+1", 0, 0, 1, 0, 0}, {"highlights-1", 0, 0, -1, 0, 0},
+               {"ev+3", 3, 0, 0, 0, 0},         {"ev+0.3", 0.3f, 0, 0, 0, 0},
+               {"ev-3", -3, 0, 0, 0, 0},        {"temp+1", 0, 0, 0, 0, 1},
+               {"temp-1 ev+1", 1, 0, 0, 0, -1}, {"all", 1, 1, -1, 1, 0.5f}};
+  for (const Case& cs : cases) {
+    ColorGrade g;
+    g.exposure_ev = cs.ev;
+    g.contrast = cs.con;
+    g.highlights = cs.hi;
+    g.shadows = cs.sh;
+    g.temperature = cs.temp;
+    GradePipeline p;
+    p.prepare(g, nullptr);
+    float prev[3] = {-1, -1, -1};
+    bool mono = true;
+    for (int i = 0; i <= 1000; ++i) {
+      float c[3] = {i / 1000.0f, i / 1000.0f, i / 1000.0f};
+      p.run(c);
+      for (int k = 0; k < 3; ++k) {
+        mono = mono && c[k] >= prev[k] - 1e-5f;
+        prev[k] = c[k];
+      }
+    }
+    CHECK_MSG(mono, "%s", cs.name);
+  }
+  // exposure +3 keeps white at white (shoulder, no hard clip of the mids)
+  ColorGrade g;
+  g.exposure_ev = 1;
+  GradePipeline p;
+  p.prepare(g, nullptr);
+  float w[3] = {1, 1, 1}, m[3] = {0.5f, 0.5f, 0.5f};
+  p.run(w);
+  p.run(m);
+  CHECK(std::fabs(w[0] - 1) < 1e-3f && m[0] > 0.62f && m[0] < 0.75f);
+  // out-of-gamut input: a neutral grade (identity LUT) keeps it, B&W greys it
+  CubeLut ident;
+  std::string err;
+  CHECK(parseCube(kIdentityCube2, ident, err));
+  ColorGrade lg;
+  GradePipeline pid, pbw;
+  pid.prepare(lg, std::make_shared<CubeLut>(ident));
+  pbw.prepare(lg, builtinLookLut("bw"));
+  const float oog[][3] = {{1.2f, -0.1f, 0.3f}, {-0.2f, 0.4f, 1.3f}, {1.1f, 1.0f, 1.0f}, {0.1f, -0.05f, 0.0f}};
+  for (const auto& v : oog) {
+    float a[3] = {v[0], v[1], v[2]}, b[3] = {v[0], v[1], v[2]};
+    pid.run(a);
+    pbw.run(b);
+    CHECK_MSG(std::fabs(a[0] - v[0]) < 1e-4f && std::fabs(a[1] - v[1]) < 1e-4f && std::fabs(a[2] - v[2]) < 1e-4f,
+              "identity (%g %g %g) -> (%g %g %g)", v[0], v[1], v[2], a[0], a[1], a[2]);
+    CHECK_MSG(std::fabs(b[0] - b[1]) < 2e-3f && std::fabs(b[1] - b[2]) < 2e-3f, "bw (%g %g %g) -> (%g %g %g)",
+              v[0], v[1], v[2], b[0], b[1], b[2]);
+  }
+  // saturation -1 = grey
+  g = ColorGrade();
+  g.saturation = -1;
+  p.prepare(g, nullptr);
+  float c[3] = {0.9f, 0.3f, 0.1f};
+  p.run(c);
+  CHECK(std::fabs(c[0] - c[1]) < 1e-5f && std::fabs(c[1] - c[2]) < 1e-5f);
+}
+
+void testGradeIdentity() {
+  const std::string path = tempPath("owc_test_identity.cube");
+  CHECK(writeText(path, kIdentityCube2));
+  ColorGrade g;
+  g.enabled = true;
+  g.lut = path;
+  g.lut_strength = 1;
+  CHECK(!isIdentity(g));
+  const struct {
+    uint32_t matrix;
+    bool full;
+  } cases[] = {{1, false}, {2, true}, {2, false}, {1, true}};
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  for (const auto& cs : cases) {
+    const Img imgs[] = {randomNv12(320, 180, 11), gradientNv12(512, 512)};
+    for (const Img& in : imgs) {
+      Img out(in.w, in.h);
+      const bool ok = gradeFrame(gr, g, cs.matrix, cs.full, in, out, buf);
+      CHECK(ok);
+      int dy, duv;
+      maxDiff(in, out, dy, duv);
+      CHECK_MSG(dy <= 1 && duv <= 2, "matrix %u full %d %ux%u: max |dY| %d |dUV| %d", cs.matrix,
+                cs.full, in.w, in.h, dy, duv);
+    }
+  }
+  const ColorGrader::Status st = gr.status();
+  CHECK(st.active && st.lutSize == 2 && st.lutTitle == "Ident" && st.error.empty());
+  CHECK(st.bakeMs > 0 && st.applyMsAvg > 0);
+}
+
+void testGradeStrengthZeroAndDisabled() {
+  const Img in = randomNv12(256, 144, 5);
+  ColorGrade a;
+  a.enabled = true;
+  a.contrast = 0.4f;
+  a.saturation = 0.3f;
+  a.temperature = 0.2f;
+  a.lut = "builtin:teal_orange";
+  a.lut_strength = 0;
+  ColorGrade b = a;
+  b.lut.clear();
+  b.lut_strength = 1;
+  Img oa(in.w, in.h), ob(in.w, in.h), oc(in.w, in.h);
+  ColorGrader ga, gb, gc;
+  std::vector<uint8_t> ba, bb, bc;
+  CHECK(gradeFrame(ga, a, 2, false, in, oa, ba));
+  CHECK(gradeFrame(gb, b, 2, false, in, ob, bb));
+  CHECK(oa.y == ob.y && oa.uv == ob.uv);
+  ColorGrade c = a;
+  c.lut_strength = 1;
+  CHECK(gradeFrame(gc, c, 2, false, in, oc, bc));
+  CHECK(oc.y != ob.y);
+  CHECK(oa.y != in.y);
+  // disabled / neutral / LUT at strength 0: pointers untouched, no copy
+  ColorGrade off = c;
+  off.enabled = false;
+  ColorGrade neutral;
+  neutral.enabled = true;
+  ColorGrade lut0 = neutral;
+  lut0.lut = "builtin:bw";
+  lut0.lut_strength = 0;
+  for (const ColorGrade* g : {&off, &neutral, &lut0}) {
+    CHECK(isIdentity(*g));
+    ColorGrader gr;
+    std::vector<uint8_t> buf;
+    const uint8_t* y = in.y.data();
+    const uint8_t* uv = in.uv.data();
+    uint32_t ys = in.w, uvs = in.w;
+    CHECK(!gr.apply(*g, 2, false, y, ys, uv, uvs, in.w, in.h, buf));
+    CHECK(y == in.y.data() && uv == in.uv.data() && ys == in.w && uvs == in.w && buf.empty());
+    CHECK(!gr.status().active);
+  }
+  // switching an active grader off frees the table and passes through
+  const uint8_t* y = in.y.data();
+  const uint8_t* uv = in.uv.data();
+  uint32_t ys = in.w, uvs = in.w;
+  CHECK(!gc.apply(off, 2, false, y, ys, uv, uvs, in.w, in.h, bc) && y == in.y.data());
+  CHECK(!gc.status().active);
+}
+
+void testGradeBwLook() {
+  for (const char* look : {"builtin:bw", "builtin:bw_contrast"}) {
+    for (int m = 1; m <= 2; ++m) {
+      const Img in = rgbBlocksNv12(320, 180, static_cast<uint32_t>(m), m == 2, 9);
+      ColorGrade g;
+      g.enabled = true;
+      g.lut = look;
+      ColorGrader gr;
+      std::vector<uint8_t> buf;
+      Img out(in.w, in.h);
+      CHECK(gradeFrame(gr, g, static_cast<uint32_t>(m), m == 2, in, out, buf));
+      int worst = 0, ymin = 255, ymax = 0;
+      for (uint8_t v : out.uv) worst = std::max(worst, std::abs(v - 128));
+      for (uint8_t v : out.y) {
+        ymin = std::min<int>(ymin, v);
+        ymax = std::max<int>(ymax, v);
+      }
+      CHECK_MSG(worst <= 2, "%s matrix %d: max |UV-128| %d", look, m, worst);
+      CHECK(ymax - ymin > 100);
+      CHECK(gr.status().lutSize == 33 && !gr.status().lutTitle.empty());
+      // random NV12: mostly out of gamut, the excess chroma is greyed too
+      const Img rnd = randomNv12(320, 180, 13);
+      CHECK(gradeFrame(gr, g, static_cast<uint32_t>(m), m == 2, rnd, out, buf));
+      worst = 0;
+      for (uint8_t v : out.uv) worst = std::max(worst, std::abs(v - 128));
+      CHECK_MSG(worst <= 2, "%s matrix %d random: max |UV-128| %d", look, m, worst);
+    }
+  }
+}
+
+void testGradeCompareSplit() {
+  const Img in = randomNv12(322, 64, 21);
+  const uint32_t x0 = (in.w / 2) & ~1u;  // 160
+  ColorGrade g;
+  g.enabled = true;
+  g.contrast = 0.6f;
+  g.saturation = 0.5f;
+  g.compare_split = true;
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  Img out(in.w, in.h);
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  bool leftSame = true, rightDiff = false;
+  for (uint32_t r = 0; r < in.h; ++r)
+    for (uint32_t x = 0; x < in.w; ++x) {
+      if (x < x0) leftSame = leftSame && out.Y(x, r) == in.Y(x, r);
+      else rightDiff = rightDiff || out.Y(x, r) != in.Y(x, r);
+    }
+  for (uint32_t r = 0; r < in.h / 2; ++r)
+    for (uint32_t x = 0; x < x0; ++x) leftSame = leftSame && out.uv[r * in.w + x] == in.uv[r * in.w + x];
+  CHECK(leftSame && rightDiff);
+  // in place (the frame is already our own copy, e.g. the transform output)
+  std::vector<uint8_t> own(in.y);
+  own.insert(own.end(), in.uv.begin(), in.uv.end());
+  const uint8_t* y = own.data();
+  const uint8_t* uv = own.data() + in.y.size();
+  uint32_t ys = in.w, uvs = in.w;
+  CHECK(gr.apply(g, 2, false, y, ys, uv, uvs, in.w, in.h, own));
+  CHECK(y == own.data() && uv == own.data() + in.y.size());
+  CHECK(memcmp(own.data(), out.y.data(), out.y.size()) == 0 &&
+        memcmp(own.data() + in.y.size(), out.uv.data(), out.uv.size()) == 0);
+}
+
+void testGradeCoalesce() {
+  // a slider dragged continuously: only the latest value matters
+  const Img in = randomNv12(128, 72, 4);
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  ColorGrade g;
+  g.enabled = true;
+  for (int i = 1; i <= 300; ++i) {
+    g.contrast = static_cast<float>(i) / 400.0f;
+    const uint8_t* y = in.y.data();
+    const uint8_t* uv = in.uv.data();
+    uint32_t ys = in.w, uvs = in.w;
+    gr.apply(g, 1, false, y, ys, uv, uvs, in.w, in.h, buf);
+  }
+  g.contrast = 0.7f;
+  Img a(in.w, in.h), b(in.w, in.h);
+  CHECK(gradeFrame(gr, g, 1, false, in, a, buf));
+  ColorGrader fresh;
+  std::vector<uint8_t> buf2;
+  CHECK(gradeFrame(fresh, g, 1, false, in, b, buf2));
+  CHECK(a.y == b.y && a.uv == b.uv);
+}
+
+void testGradeLutFileErrorAndReload() {
+  const Img in = gradientNv12(256, 64);
+  // missing file: error reported, adjustments still applied
+  ColorGrade g;
+  g.enabled = true;
+  g.contrast = 0.3f;
+  g.lut = tempPath("owc_missing_lut_42.cube");
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  Img out(in.w, in.h), ref(in.w, in.h);
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  const ColorGrader::Status st = gr.status();
+  CHECK_MSG(st.error.find("não foi possível abrir") != std::string::npos, "'%s'", st.error.c_str());
+  CHECK(st.lutSize == 0);
+  ColorGrade adj = g;
+  adj.lut.clear();
+  ColorGrader gr2;
+  std::vector<uint8_t> buf2;
+  CHECK(gradeFrame(gr2, adj, 2, false, in, ref, buf2));
+  CHECK(out.y == ref.y && out.uv == ref.uv);
+  // reload when the file changes (polled ~1 Hz by the bake thread)
+  const std::string path = tempPath("owc_test_reload.cube");
+  CHECK(writeText(path, kIdentityCube2));
+  ColorGrade lg;
+  lg.enabled = true;
+  lg.lut = path;
+  Img dark(64, 16);  // near black, neutral chroma
+  std::fill(dark.y.begin(), dark.y.end(), static_cast<uint8_t>(40));
+  std::fill(dark.uv.begin(), dark.uv.end(), static_cast<uint8_t>(128));
+  Img darkOut(dark.w, dark.h);
+  ColorGrader gl;
+  std::vector<uint8_t> bl;
+  CHECK(gradeFrame(gl, lg, 2, false, dark, darkOut, bl));
+  CHECK(darkOut.y == dark.y && darkOut.uv == dark.uv);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(writeText(path, "TITLE \"Invert\"\nLUT_3D_SIZE 2\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n"
+                        "1 1 0\n0 1 0\n1 0 0\n0 0 0\n"));
+  bool reloaded = false;
+  const auto t0 = std::chrono::steady_clock::now();
+  while (!reloaded && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const uint8_t* y = dark.y.data();
+    const uint8_t* uv = dark.uv.data();
+    uint32_t ys = dark.w, uvs = dark.w;
+    if (gl.apply(lg, 2, false, y, ys, uv, uvs, dark.w, dark.h, bl)) reloaded = y[0] > 200;  // inverted
+  }
+  CHECK_MSG(reloaded, "title '%s' error '%s'", gl.status().lutTitle.c_str(), gl.status().error.c_str());
+  CHECK(gl.status().lutTitle == "Invert");
+}
+
+void testExportCube() {
+  const std::string path = tempPath("owc_test_export.cube");
+  std::string err;
+  ColorGrade g;  // neutral (enabled is ignored)
+  CHECK(exportCube(g, path, 17, err));
+  CubeLut c;
+  CHECK_MSG(loadCubeFile(path, c, err), "%s", err.c_str());
+  CHECK(c.is3d && c.size == 17 && c.title == "OWC grade" && c.rgb.size() == 17 * 17 * 17 * 3);
+  float worst = 0;
+  for (int b = 0, i = 0; b < 17; ++b)
+    for (int gg = 0; gg < 17; ++gg)
+      for (int r = 0; r < 17; ++r, i += 3) {
+        worst = std::max(worst, std::fabs(c.rgb[i] - r / 16.0f));
+        worst = std::max(worst, std::fabs(c.rgb[i + 1] - gg / 16.0f));
+        worst = std::max(worst, std::fabs(c.rgb[i + 2] - b / 16.0f));
+      }
+  CHECK_MSG(worst < 1e-5f, "identity worst %g", worst);
+  // a real grade round-trips to the same values as the live pipeline
+  ColorGrade g2;
+  g2.contrast = 0.2f;
+  g2.vibrance = 0.4f;
+  g2.temperature = -0.3f;
+  g2.lut = "builtin:film";
+  g2.lut_strength = 0.7f;
+  CHECK(exportCube(g2, path, 9, err));
+  CHECK(loadCubeFile(path, c, err) && c.size == 9);
+  GradePipeline p;
+  p.prepare(g2, builtinLookLut("film"));
+  worst = 0;
+  for (int b = 0, i = 0; b < 9; ++b)
+    for (int gg = 0; gg < 9; ++gg)
+      for (int r = 0; r < 9; ++r, i += 3) {
+        float e[3] = {r / 8.0f, gg / 8.0f, b / 8.0f};
+        p.run(e);
+        for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(c.rgb[i + k] - e[k]));
+      }
+  CHECK_MSG(worst < 1e-5f, "graded worst %g", worst);
+  CHECK(!exportCube(g, path, 1, err) && !err.empty());
+  ColorGrade bad;
+  bad.lut = "builtin:nope";
+  CHECK(!exportCube(bad, path, 17, err) && !err.empty());
+}
+
+void testGradeBenchmark() {
+  // 1080p, natural-ish content (ramps + noise); prints, does not assert a time.
+  const uint32_t w = 1920, h = 1080;
+  Img in(w, h);
+  std::mt19937 rng(1);
+  for (uint32_t r = 0; r < h; ++r)
+    for (uint32_t x = 0; x < w; ++x)
+      in.y[r * w + x] = static_cast<uint8_t>(std::min<uint32_t>(235, 16 + (x + r) * 219 / (w + h) + rng() % 8));
+  for (uint32_t r = 0; r < h / 2; ++r)
+    for (uint32_t x = 0; x < w / 2; ++x) {
+      in.uv[r * w + 2 * x] = static_cast<uint8_t>(96 + x * 64 / (w / 2) + rng() % 4);
+      in.uv[r * w + 2 * x + 1] = static_cast<uint8_t>(160 - r * 64 / (h / 2) + rng() % 4);
+    }
+  ColorGrade g;
+  g.enabled = true;
+  g.contrast = 0.2f;
+  g.vibrance = 0.3f;
+  g.shadows = 0.2f;
+  g.lut = "builtin:teal_orange";
+  g.lut_strength = 0.8f;
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  Img out(w, h);
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  const double firstBake = gr.status().bakeMs;
+  g.contrast = 0.25f;  // steady-state bake (look LUT cached)
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  const double bake = gr.status().bakeMs;
+  auto timeIt = [&](bool inPlace) {
+    std::vector<uint8_t> own;
+    const int frames = 60;
+    double total = 0, best = 1e9;
+    for (int i = 0; i < frames + 5; ++i) {
+      const uint8_t* y = in.y.data();
+      const uint8_t* uv = in.uv.data();
+      uint32_t ys = w, uvs = w;
+      std::vector<uint8_t>* dst = &buf;
+      if (inPlace) {
+        own = in.y;
+        own.insert(own.end(), in.uv.begin(), in.uv.end());
+        y = own.data();
+        uv = own.data() + in.y.size();
+        dst = &own;
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      gr.apply(g, 2, false, y, ys, uv, uvs, w, h, *dst);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (i >= 5) {
+        total += ms;
+        best = std::min(best, ms);
+      }
+    }
+    std::printf("  1080p grade apply (%s): avg %.2f ms, best %.2f ms\n", inPlace ? "in place" : "copy",
+                total / frames, best);
+  };
+  timeIt(false);
+  timeIt(true);
+  std::printf("  bake: %.1f ms (first, incl. look generation %.1f ms), %u hw threads\n", bake, firstBake,
+              std::thread::hardware_concurrency());
+}
+
 }  // namespace
 
 int main() {
@@ -631,6 +1224,17 @@ int main() {
   RUN(testCodecSelection);
   RUN(testLinkClassification);
   RUN(testRecordSetupPlanner);
+  RUN(testCubeParse);
+  RUN(testLutLookup);
+  RUN(testGradeCurvesMonotonic);
+  RUN(testGradeIdentity);
+  RUN(testGradeStrengthZeroAndDisabled);
+  RUN(testGradeBwLook);
+  RUN(testGradeCompareSplit);
+  RUN(testGradeCoalesce);
+  RUN(testGradeLutFileErrorAndReload);
+  RUN(testExportCube);
+  RUN(testGradeBenchmark);
   std::printf("%s (%d failure(s))\n", owctest::failures() ? "FAILED" : "ALL PASSED", owctest::failures());
   return owctest::failures() ? 1 : 0;
 }

@@ -36,6 +36,7 @@ std::string escapePct(const std::string& s);
 // tabs (ui_tabs.cpp / ui_params.cpp)
 void tabPresets(App& app);
 void tabCamera(App& app);
+void tabColor(App& app);  // ui_color.cpp
 void tabEncoder(App& app);
 void tabPc(App& app);
 void tabDevice(App& app);

@@ -18,6 +18,14 @@ std::wstring findNearExe(const std::wstring& rel);
 bool readTextFile(const std::wstring& path, std::string& out);
 bool writeTextFileAtomic(const std::wstring& path, const std::string& data);
 
+// Native file dialogs (COM must be initialised on the calling thread). `filterName`
+// / `filterSpec` are e.g. L"LUT (*.cube)" / L"*.cube". Paths are UTF-8. Return false
+// on cancel or failure.
+bool pickOpenFile(void* owner, const wchar_t* title, const wchar_t* filterName, const wchar_t* filterSpec,
+                  std::string& out);
+bool pickSaveFile(void* owner, const wchar_t* title, const wchar_t* filterName, const wchar_t* filterSpec,
+                  const wchar_t* defaultExt, const std::wstring& defaultName, std::string& out);
+
 // DirectShow virtual camera registered (HKCU or HKLM Instance key)?
 bool virtualCamRegistered(bool* perUser = nullptr);
 // OBS plugin folder present?

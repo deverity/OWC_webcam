@@ -2,6 +2,7 @@
 
 #include "annexb.h"
 #include "codec_select.h"
+#include "color_grade.h"
 #include "decoder.h"
 #include "metrics.h"
 #include "record_setup.h"
@@ -339,6 +340,9 @@ struct Client::Impl {
   FrameCopy latest;
   bool haveLatest = false;
   std::atomic<uint64_t> publishCounter{0};
+
+  // ---- colour grading (applied in present(), on the decode thread)
+  ColorGrader grader;
 
   std::thread netThread, decThread;
 
@@ -1307,6 +1311,7 @@ struct Client::Impl {
     uint32_t streamChangesInWindow = 0;
     std::vector<uint8_t> auBuf;
     std::vector<uint8_t> xform;
+    std::vector<uint8_t> graded;  // colour-graded copy when not graded in place in xform
     std::deque<JbFrame> jb;
     std::vector<JbFrame> jbPool;
     std::deque<std::pair<int64_t, int64_t>> transit;  // (time, decoded-capture)
@@ -2078,17 +2083,26 @@ struct Client::Impl {
       uv = duv;
       ys = uvs = ow;
     }
-    int64_t offset = 0;
-    const bool synced = clockSynced(offset);
-    const int64_t captureQpc =
-        synced ? usToQpc(static_cast<int64_t>(meta.capture_ts) - offset) : 0;
-    int64_t publishQpc = qpcNowRaw();
     // colour: SPS VUI first, then the decoder's output type
     uint32_t mfMatrix = 0;
     int mfFull = -1;
     ds.decoder.outputColor(mfMatrix, mfFull);
     const uint32_t colorMatrix = ds.spsMatrix ? ds.spsMatrix : mfMatrix;
     const bool fullRange = ds.spsFullRange >= 0 ? ds.spsFullRange == 1 : mfFull == 1;
+    // Colour grading: everything below (shm, onFrame, latest frame) gets the
+    // graded image. Graded in place when the transform already produced our
+    // own copy. Unknown matrix: same rule as the consumers (709 from 720 lines).
+    {
+      const uint32_t gradeMatrix =
+          colorMatrix == 1 || colorMatrix == 2 ? colorMatrix : (oh >= 720 ? 2u : 1u);
+      std::vector<uint8_t>& gbuf = y == ds.xform.data() ? ds.xform : ds.graded;
+      grader.apply(o.color, gradeMatrix, fullRange, y, ys, uv, uvs, ow, oh, gbuf);
+    }
+    int64_t offset = 0;
+    const bool synced = clockSynced(offset);
+    const int64_t captureQpc =
+        synced ? usToQpc(static_cast<int64_t>(meta.capture_ts) - offset) : 0;
+    int64_t publishQpc = qpcNowRaw();
     if (o.publish_to_shm) {
       if (!ds.shm.isOpen() && steadyMs() >= ds.shmRetryAt) tryOpenShm(ds);
       if (ds.shm.isOpen()) {
@@ -2385,6 +2399,15 @@ ClientStats Client::stats() const {
     s.jitter_buffer_frames = r.jbFrames;
     s.frames_not_presented = r.notPresented;
     s.backlog_drops = r.backlogDrops;
+  }
+  {
+    const ColorGrader::Status g = impl_->grader.status();
+    s.grade_active = g.active;
+    s.grade_ms_avg = g.applyMsAvg;
+    s.grade_bake_ms = g.bakeMs;
+    s.grade_lut_size = g.lutSize;
+    s.grade_lut_title = g.lutTitle;
+    s.grade_error = g.error;
   }
   return s;
 }

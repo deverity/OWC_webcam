@@ -108,7 +108,7 @@ struct TabDef {
   const char* key;
   const char* title;
 };
-const TabDef kTabs[] = {{"presets", "Presets"},   {"camera", "Câmera"}, {"encoder", "Encoder/Stream"},
+const TabDef kTabs[] = {{"presets", "Presets"},   {"camera", "Câmera"}, {"color", "Cor / LUT"}, {"encoder", "Encoder/Stream"},
                         {"pc", "PC"},             {"device", "Dispositivo"}, {"record", "Gravação"}, {"outputs", "Saídas"},
                         {"logs", "Logs"}};
 int g_tab = 0;
@@ -732,12 +732,13 @@ void drawRight(App& app) {
   switch (g_tab) {
     case 0: tabPresets(app); break;
     case 1: tabCamera(app); break;
-    case 2: tabEncoder(app); break;
-    case 3: tabPc(app); break;
-    case 4: tabDevice(app); break;
-    case 5: tabRecord(app); break;
-    case 6: tabOutputs(app); break;
-    case 7: tabLogs(app); break;
+    case 2: tabColor(app); break;
+    case 3: tabEncoder(app); break;
+    case 4: tabPc(app); break;
+    case 5: tabDevice(app); break;
+    case 6: tabRecord(app); break;
+    case 7: tabOutputs(app); break;
+    case 8: tabLogs(app); break;
     default: break;
   }
   ImGui::EndChild();
@@ -856,9 +857,10 @@ bool uiSelectTab(const std::string& name) {
   std::string n;
   for (char ch : name) n += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   static const struct { const char* k; int i; } alias[] = {
-      {"presets", 0}, {"preset", 0}, {"camera", 1}, {"câmera", 1}, {"encoder", 2}, {"stream", 2}, {"encoder/stream", 2},
-      {"pc", 3}, {"device", 4}, {"dispositivo", 4}, {"outputs", 6}, {"saidas", 6}, {"saídas", 6}, {"logs", 7},
-      {"record", 5}, {"gravacao", 5}, {"gravação", 5}};
+      {"presets", 0}, {"preset", 0}, {"camera", 1}, {"câmera", 1}, {"color", 2}, {"cor", 2}, {"lut", 2}, {"cor / lut", 2},
+      {"encoder", 3}, {"stream", 3}, {"encoder/stream", 3},
+      {"pc", 4}, {"device", 5}, {"dispositivo", 5}, {"outputs", 7}, {"saidas", 7}, {"saídas", 7}, {"logs", 8},
+      {"record", 6}, {"gravacao", 6}, {"gravação", 6}};
   if (n == "help") { g_openHelp = true; return true; }
   for (const auto& a : alias)
     if (n == a.k) { g_tab = a.i; return true; }

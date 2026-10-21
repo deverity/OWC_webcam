@@ -23,6 +23,7 @@ add_executable(OWC WIN32
   src/app.cpp
   src/app_record.cpp
   src/ui_record.cpp
+  src/ui_color.cpp
   src/platform.cpp
   src/settings.cpp
   src/params_meta.cpp

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 
 #include <cstdio>
 
@@ -90,6 +91,54 @@ bool writeTextFileAtomic(const std::wstring& path, const std::string& data) {
   if (!ok || put != data.size()) { DeleteFileW(tmp.c_str()); return false; }
   if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp.c_str()); return false; }
   return true;
+}
+
+static bool runFileDialog(IFileDialog* dlg, HWND owner, const wchar_t* title, const wchar_t* filterName,
+                          const wchar_t* filterSpec, std::string& out) {
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+  if (title) dlg->SetTitle(title);
+  COMDLG_FILTERSPEC fs[2] = {{filterName, filterSpec}, {L"Todos os arquivos", L"*.*"}};
+  dlg->SetFileTypes(2, fs);
+  dlg->SetFileTypeIndex(1);
+  bool ok = false;
+  if (SUCCEEDED(dlg->Show(owner))) {
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+      PWSTR p = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) {
+        out = toUtf8(p);
+        ok = true;
+        CoTaskMemFree(p);
+      }
+      item->Release();
+    }
+  }
+  return ok;
+}
+
+bool pickOpenFile(void* owner, const wchar_t* title, const wchar_t* filterName, const wchar_t* filterSpec,
+                  std::string& out) {
+  IFileOpenDialog* dlg = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+  bool ok = runFileDialog(dlg, static_cast<HWND>(owner), title, filterName, filterSpec, out);
+  dlg->Release();
+  return ok;
+}
+
+bool pickSaveFile(void* owner, const wchar_t* title, const wchar_t* filterName, const wchar_t* filterSpec,
+                  const wchar_t* defaultExt, const std::wstring& defaultName, std::string& out) {
+  IFileSaveDialog* dlg = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_OVERWRITEPROMPT);
+  if (defaultExt) dlg->SetDefaultExtension(defaultExt);
+  if (!defaultName.empty()) dlg->SetFileName(defaultName.c_str());
+  bool ok = runFileDialog(dlg, static_cast<HWND>(owner), title, filterName, filterSpec, out);
+  dlg->Release();
+  return ok;
 }
 
 static bool regKeyExists(HKEY root, const wchar_t* sub) {

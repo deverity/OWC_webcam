@@ -457,6 +457,34 @@ void testTransformAndControls() {
   FrameCopy fc;
   CHECK(c.copyLatestFrame(fc, 0) && fc.width == 480 && fc.height == 640 && fc.nv12.size() == 480 * 640 * 3 / 2);
   CHECK(!c.copyLatestFrame(fc, fc.frame_number) || fc.frame_number > 0);
+  // colour grading end to end (graded in place in the rotation buffer): the
+  // black & white look reaches the frames, then switching it off passes through
+  {
+    ClientOptions go = c.options();
+    go.color.enabled = true;
+    go.color.lut = "builtin:bw";
+    c.setOptions(go);
+    ClientStats gs;
+    for (int i = 0; i < 400; ++i) {
+      gs = c.stats();
+      if (gs.grade_active) break;
+      sleepMs(5);
+    }
+    CHECK_MSG(gs.grade_active && gs.grade_lut_size == 33 && gs.grade_error.empty(),
+              "grade active %d lut %u err '%s'", gs.grade_active, gs.grade_lut_size, gs.grade_error.c_str());
+    std::printf("  grade: apply %.2f ms, bake %.1f ms, look '%s'\n", gs.grade_ms_avg, gs.grade_bake_ms,
+                gs.grade_lut_title.c_str());
+    sleepMs(100);  // a frame or two after the table switch
+    CHECK(c.copyLatestFrame(fc, 0));
+    int worst = 0;
+    for (size_t i = static_cast<size_t>(fc.width) * fc.height; i < fc.nv12.size(); ++i)
+      worst = std::max(worst, std::abs(fc.nv12[i] - 128));
+    CHECK_MSG(worst <= 2, "graded bw frame: max |UV-128| %d", worst);
+    go.color.enabled = false;
+    c.setOptions(go);
+    for (int i = 0; i < 400 && c.stats().grade_active; ++i) sleepMs(5);
+    CHECK(!c.stats().grade_active);
+  }
   // live resolution change via SetParam (new epoch)
   t.rotation_deg = 0;
   c.setTransform(t);

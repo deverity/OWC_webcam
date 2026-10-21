@@ -140,6 +140,46 @@ struct OutputTransform {
   bool operator!=(const OutputTransform& o) const { return !(*this == o); }
 };
 
+// PC colour grading applied to the decoded NV12 after the transform and
+// before publishing, so the preview, the virtual camera and the OBS plugin
+// all get it. Recordings are NOT graded (they keep the phone's bitstream).
+// Pipeline (in RGB, of the stream's own YUV matrix/range):
+//   white balance (temperature, tint) -> exposure -> contrast -> shadows /
+//   highlights -> saturation / vibrance -> LUT (mixed by lut_strength)
+// Everything is baked into one YUV-domain table on a background thread when a
+// value changes (the previous table keeps being used meanwhile), then applied
+// per frame on the CPU (multithreaded, ~1-3 ms at 1080p). Disabled or neutral
+// with no LUT = no cost. Effect: next frame after the bake (typically < 50 ms).
+struct ColorGrade {
+  bool enabled = false;
+  // basic adjustments; all neutral at 0
+  float exposure_ev = 0;   // -3..+3 stops
+  float contrast = 0;      // -1..+1 (S-curve around mid grey)
+  float highlights = 0;    // -1..+1 (negative recovers bright areas)
+  float shadows = 0;       // -1..+1 (positive lifts dark areas)
+  float saturation = 0;    // -1..+1 (-1 = black and white)
+  float vibrance = 0;      // -1..+1 (saturation weighted to muted colours, skin-safe)
+  float temperature = 0;   // -1..+1 (positive = warmer)
+  float tint = 0;          // -1..+1 (positive = magenta, negative = green)
+  // LUT: "" = none, "builtin:<key>" (see builtinLooks() in owc/color_grade.h)
+  // or an absolute path to a .cube file (3D or 1D, Adobe/Resolve format, UTF-8).
+  // A file that fails to load is ignored (ClientStats::grade_error says why);
+  // it is reloaded when the path or the file's modification time changes.
+  std::string lut;
+  float lut_strength = 1;  // 0..1 mix between the adjusted image and the LUT output
+  // Calibration aid: the left half of the image stays original (it also
+  // reaches the virtual camera while on).
+  bool compare_split = false;
+
+  bool operator==(const ColorGrade& o) const {
+    return enabled == o.enabled && exposure_ev == o.exposure_ev && contrast == o.contrast &&
+           highlights == o.highlights && shadows == o.shadows && saturation == o.saturation &&
+           vibrance == o.vibrance && temperature == o.temperature && tint == o.tint &&
+           lut == o.lut && lut_strength == o.lut_strength && compare_split == o.compare_split;
+  }
+  bool operator!=(const ColorGrade& o) const { return !(*this == o); }
+};
+
 // PC-side tunables. Every field documents WHEN a change takes effect and its
 // LATENCY IMPACT (meant for UI tooltips). Change at runtime with setOptions().
 struct ClientOptions {
@@ -181,6 +221,9 @@ struct ClientOptions {
 
   // PC transform (rotation/mirror). Effect: next frame.
   OutputTransform transform;
+
+  // PC colour grading / LUT (see ColorGrade). Effect: after the bake.
+  ColorGrade color;
 
   // Reconnect automatically after a lost/failed connection (also re-sends
   // StartStream if the stream was running). Effect: immediate.
@@ -465,6 +508,14 @@ struct ClientStats {
   std::string shm_error;         // e.g. another OWC producer (pid N) owns the bus; retried every 2 s
   uint32_t color_matrix = 0;     // OWC_COLOR_* of the current stream (see DecodedFrame)
   bool full_range = false;
+
+  // colour grading (ClientOptions::color)
+  bool grade_active = false;     // a table is being applied to the frames
+  double grade_ms_avg = 0;       // per-frame apply time
+  double grade_bake_ms = 0;      // last table bake
+  uint32_t grade_lut_size = 0;   // loaded LUT grid size (0 = no LUT)
+  std::string grade_lut_title;   // TITLE of the .cube, or the built-in look name
+  std::string grade_error;       // e.g. "cannot open D:\x.cube" / "line 12: expected 3 numbers"
 
   // phone (Stats message, 1 Hz): fps, bitrate (measured + target_bitrate_bps),
   // dropped frames, send queue, encode/ISP latency, FEC %, battery, thermal.

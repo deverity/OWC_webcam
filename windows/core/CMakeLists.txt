@@ -3,6 +3,7 @@ add_library(owc_core STATIC
   src/adb.cpp
   src/client.cpp
   src/codec_select.cpp
+  src/color_grade.cpp
   src/decoder.cpp
   src/discovery.cpp
   src/firewall.cpp

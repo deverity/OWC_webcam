@@ -68,6 +68,18 @@ static Json optionsToJson(const owc::ClientOptions& o) {
   j.set("idle_timeout_ms", Json::number(o.idle_timeout_ms));
   j.set("patch_sps", Json::boolean(o.patch_sps));
   j.set("udp_bind_address", Json::string(o.udp_bind_address));
+  j.set("color_enabled", Json::boolean(o.color.enabled));
+  j.set("color_exposure_ev", Json::number(static_cast<double>(o.color.exposure_ev)));
+  j.set("color_contrast", Json::number(static_cast<double>(o.color.contrast)));
+  j.set("color_highlights", Json::number(static_cast<double>(o.color.highlights)));
+  j.set("color_shadows", Json::number(static_cast<double>(o.color.shadows)));
+  j.set("color_saturation", Json::number(static_cast<double>(o.color.saturation)));
+  j.set("color_vibrance", Json::number(static_cast<double>(o.color.vibrance)));
+  j.set("color_temperature", Json::number(static_cast<double>(o.color.temperature)));
+  j.set("color_tint", Json::number(static_cast<double>(o.color.tint)));
+  j.set("color_lut", Json::string(o.color.lut));
+  j.set("color_lut_strength", Json::number(static_cast<double>(o.color.lut_strength)));
+  j.set("color_compare_split", Json::boolean(o.color.compare_split));
   return j;
 }
 
@@ -96,6 +108,26 @@ static void optionsFromJson(const Json& j, owc::ClientOptions& o) {
   o.idle_timeout_ms = u32("idle_timeout_ms", o.idle_timeout_ms);
   o.patch_sps = j.flag("patch_sps", o.patch_sps);
   o.udp_bind_address = j.str("udp_bind_address", o.udp_bind_address);
+
+  // colour grade: clamp to the documented ranges (a hand-edited file must not feed garbage to the core)
+  auto cf = [&](const char* k, float def, double lo, double hi) {
+    const double v = j.num(k, static_cast<double>(def));
+    if (v != v) return def;  // NaN
+    return static_cast<float>(v < lo ? lo : (v > hi ? hi : v));
+  };
+  owc::ColorGrade& g = o.color;
+  g.enabled = j.flag("color_enabled", g.enabled);
+  g.exposure_ev = cf("color_exposure_ev", g.exposure_ev, -3.0, 3.0);
+  g.contrast = cf("color_contrast", g.contrast, -1.0, 1.0);
+  g.highlights = cf("color_highlights", g.highlights, -1.0, 1.0);
+  g.shadows = cf("color_shadows", g.shadows, -1.0, 1.0);
+  g.saturation = cf("color_saturation", g.saturation, -1.0, 1.0);
+  g.vibrance = cf("color_vibrance", g.vibrance, -1.0, 1.0);
+  g.temperature = cf("color_temperature", g.temperature, -1.0, 1.0);
+  g.tint = cf("color_tint", g.tint, -1.0, 1.0);
+  g.lut = j.str("color_lut", g.lut);
+  g.lut_strength = cf("color_lut_strength", g.lut_strength, 0.0, 1.0);
+  g.compare_split = j.flag("color_compare_split", g.compare_split);
 }
 
 bool loadSettings(AppSettings& s) {
