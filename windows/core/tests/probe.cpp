@@ -16,11 +16,13 @@
 //       F = Float, E = Enum (e.g. --set 18=E0 --set 2=1920 --set 29=F2.5).
 //       --shm publishes to the shared-memory bus (off by default so the probe
 //       never fights the OWC app for it). Exit code 0 if frames were decoded.
-//       Authentication (protocol v2): [--client-id HEX32] [--key PHONE_ID_HEX:KEY_HEX]
+//       Authentication (protocol v3): [--client-id HEX32] [--key PHONE_ID_HEX:KEY_HEX]
 //       [--pair-code NNNNNN]. Without --client-id a random id is used (a new
 //       pairing every run). When the phone shows a code, --pair-code is sent, else
 //       the code is read from stdin. The key of a new pairing is printed so it can
-//       be passed with --client-id/--key next time.
+//       be passed with --client-id/--key next time (v2 keys stay valid).
+//       Encryption: [--cipher auto|aes|chacha|off] (ClientOptions::cipher); the
+//       negotiated cipher and the per-frame decrypt cost are printed.
 #include "decoder.h"
 #include "util.h"
 
@@ -119,8 +121,8 @@ struct Events : ClientEvents {
     std::printf("[pairing] phone %s rejected our key\n", toHex(id.data(), id.size()).c_str());
   }
   void onConnected(const DeviceInfo& d) override {
-    std::printf("[connected] %s (%s) API %u codecs 0x%x session %u udp %u\n", d.device_name.c_str(),
-                d.model.c_str(), d.android_api, d.codec_mask, d.session_id, d.udp_port);
+    std::printf("[connected] %s (%s) API %u codecs 0x%x session %u udp %u cipher %s\n", d.device_name.c_str(),
+                d.model.c_str(), d.android_api, d.codec_mask, d.session_id, d.udp_port, toString(d.cipher));
   }
   void onCapabilities(const Capabilities& c) override {
     std::printf("[caps] %zu camera(s), %zu params, active %u\n", c.cameras.size(), c.params.size(),
@@ -181,6 +183,12 @@ int connectMode(int argc, char** argv) {
                                        : static_cast<uint16_t>(atoi(hp.c_str() + c + 1));
     } else if (a == "--transport") {
       cp.transport = std::string(next()) == "udp" ? VideoTransport::Udp : VideoTransport::Tcp;
+    } else if (a == "--cipher") {
+      const std::string c = next();
+      o.cipher = c == "aes"      ? CipherPreference::Aes128Gcm
+                 : c == "chacha" ? CipherPreference::ChaCha20Poly1305
+                 : c == "off"    ? CipherPreference::Off
+                                 : CipherPreference::Auto;
     } else if (a == "--seconds") {
       seconds = atoi(next());
     } else if (a == "--set") {
@@ -338,6 +346,9 @@ int connectMode(int argc, char** argv) {
           s.capture_to_arrival_ms_avg, s.capture_to_publish_ms_avg, s.capture_to_publish_ms_p95,
           s.rtt_ms, s.keyframe_requests, s.decoder_selection.empty() ? "" : " | ",
           s.decoder_selection.c_str(), s.phone.encode_fps, s.phone.send_queue, s.phone.dropped_frames);
+      std::printf("      [crypto] %s, decrypt avg %.1f us max %.1f us per frame, udp rejected %llu\n",
+                  toString(s.cipher), s.decrypt_us_avg, s.decrypt_us_max,
+                  static_cast<unsigned long long>(s.udp_auth_failures));
       if (recStarted && !recStopped) {
         const RecordStatus r = client.recordingStatus();
         std::printf("      [rec] state %d written %llu received %llu dropped %llu missing %llu capture %.1f fps media %.1f s %.1f MB %s\n",
@@ -438,7 +449,8 @@ int main(int argc, char** argv) {
   if (argc > 1) {
     std::fprintf(stderr, "usage: owc_core_probe [--discover N [--no-sweep] [--no-broadcast] [--no-announce] [--no-known]] [--connect host:port [--transport tcp|udp] "
                          "[--seconds N] [--set id=value]... [--decoder auto|hw|sw] [--shm] "
-                         "[--no-patch] [--jitter MS]]\n");
+                         "[--no-patch] [--jitter MS] [--cipher auto|aes|chacha|off] [--client-id HEX] [--key ID:KEY] "
+                         "[--pair-code N]]\n");
     return 2;
   }
   return readOnlyProbe();

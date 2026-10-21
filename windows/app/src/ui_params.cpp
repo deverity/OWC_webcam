@@ -597,6 +597,27 @@ void tabPc(App& app) {
   { bool c2 = false; sliderU32("##hatt", o.handshake_attempts, 1, 10, "%d", true, c2); commit |= c2; }
   optLabel("Timeout de inatividade", "Desconecta se o celular ficar mudo por este tempo. Efeito imediato.");
   { bool c2 = false; sliderU32("##idle", o.idle_timeout_ms, 1000, 30000, "%d ms", true, c2); commit |= c2; }
+  optLabel("Criptografia", "Cifra todo o tráfego (controle TCP e vídeo UDP) depois da autenticação, com chaves novas a cada conexão. Auto (recomendado): AES-128-GCM quando o PC e o celular têm aceleração de AES no hardware, senão ChaCha20-Poly1305. Custo medido: AES-GCM ~20 µs por quadro P (0,1-0,2 ms por keyframe); ChaCha20 ~0,1 ms por quadro P (~0,85 ms por keyframe). Decifrado na thread que já recebe os dados, sem cópia nem thread extra. Forçar uma cifra que o celular não suporta impede a conexão. Desligada: qualquer um na rede vê o vídeo e pode injetar comandos (a autenticação continua obrigatória). Vale na próxima conexão.");
+  {
+    static const char* items[] = {"Auto (recomendado)", "AES-128-GCM", "ChaCha20-Poly1305", "Desligada (inseguro)"};
+    int idx = static_cast<int>(o.cipher);
+    if (idx < 0 || idx > 3) idx = 0;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##cipher", &idx, items, 4)) { o.cipher = static_cast<owc::CipherPreference>(idx); commit = true; }
+    if (o.cipher == owc::CipherPreference::Aes128Gcm && !owc::hardwareAesAvailable())
+      ImGui::TextColored(col::warn(), "Este PC não tem AES-NI: será usado ChaCha20-Poly1305.");
+    if (o.cipher == owc::CipherPreference::Off)
+      ImGui::TextColored(col::bad(), "Sem criptografia: o vídeo e os comandos trafegam em claro.");
+    if (app.sessionUp()) {
+      ImGui::TextColored(col::dim(), "Em uso:");
+      ImGui::SameLine();
+      ImGui::TextColored(st.cipher == owc::Cipher::None ? col::bad() : col::good(), "%s", cipherText(st.cipher));
+      if (st.cipher != owc::Cipher::None) {
+        ImGui::SameLine();
+        ImGui::TextColored(col::dim(), " decifrar %.0f µs/quadro (máx. %.0f)", st.decrypt_us_avg, st.decrypt_us_max);
+      }
+    }
+  }
 
   sectionTitle("Celulares pareados");
   {
@@ -741,6 +762,17 @@ void tabDevice(App& app) {
       row("Decodificação", "%.1f ms", st.decode_ms_avg);
       row("Pedidos de keyframe", "%.0f", static_cast<double>(st.keyframe_requests));
       row("Reconexões", "%.0f", static_cast<double>(st.reconnect_count));
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(col::dim(), "Criptografia");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(st.cipher == owc::Cipher::None ? col::bad() : col::good(), "%s", cipherText(st.cipher));
+      if (st.cipher != owc::Cipher::None) {
+        row("Decifrar (média por quadro)", "%.0f µs", st.decrypt_us_avg);
+        row("Decifrar (máx. por quadro)", "%.0f µs", st.decrypt_us_max);
+        if (st.transport == owc::VideoTransport::Udp)
+          row("Datagramas rejeitados", "%.0f", static_cast<double>(st.udp_auth_failures));
+      }
       ImGui::EndTable();
     }
   }

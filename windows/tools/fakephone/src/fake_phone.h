@@ -3,14 +3,21 @@
 //   TCP control server (+ VideoFrame in Tcp mode), UDP punch/video, discovery.
 //   Synthetic NV12 pattern with the frame-counter strip (see pattern.h),
 //   encoded by the Media Foundation H.264 encoder.
-//   Protocol v2 authentication (PAIRING in owc/protocol.h), mirroring the
-//   Android phone: AuthProof check, pairing codes (fixed for tests or random +
-//   logged), wrong codes counted GLOBALLY until lockout/success (forgotten after
-//   10 min, so a new code may get fewer attempts), lockout, expiry, "cancel on
-//   the phone" (rejectPairing()), zero client_id -> Rejected, removing the
-//   connected PC (setPairedClients) -> Bye + close, preloaded pairings.
+//   Protocol v3 authentication + encryption (PAIRING in owc/protocol.h,
+//   owc/crypto.h), mirroring the Android phone: ephemeral X25519 key exchange,
+//   cipher chosen from the Hello mask (chooseCipher), AuthProof key
+//   confirmation, CPace pairing with codes (fixed for tests or random + logged;
+//   the code never travels), the phone's own confirmation in AuthResult Ok,
+//   every TCP message after Ok sealed both ways, UDP video/PunchAck sealed and
+//   only sealed punches answered. Wrong codes counted GLOBALLY until
+//   lockout/success (forgotten after 10 min, so a new code may get fewer
+//   attempts), lockout, expiry, "cancel on the phone" (rejectPairing()), zero
+//   client_id -> Rejected, removing the connected PC (setPairedClients) -> Bye +
+//   close, preloaded pairings. Test attacks: forged confirmation, tampered or
+//   plaintext TCP record, tampered/replayed UDP datagrams.
 #pragma once
 
+#include <owc/crypto.h>
 #include <owc/protocol.h>
 
 #include <cstdint>
@@ -80,6 +87,15 @@ struct FakePhoneConfig {
   uint16_t pair_code_lifetime_s = kPairCodeLifetimeS;
   uint16_t pair_lockout_s = kPairLockoutS;        // PairBegin answered Locked this long after a lock
   uint16_t auth_timeout_s = kAuthTimeoutS;        // unauthenticated connection closed after this
+
+  // ---- protocol v3 encryption
+  uint32_t cipher_mask = 0;          // ciphers this phone runs (cipherBit); 0 = localCipherMask()
+  // Test attacks (integration tests; all off by default):
+  bool forge_phone_confirm = false;      // AuthResult Ok carries a wrong confirmation (impostor/relay)
+  uint32_t tcp_tamper_after_frames = 0;  // >0: flip a ciphertext bit in the record of TCP video frame N
+  uint32_t tcp_plain_after_frames = 0;   // >0: send one PLAINTEXT Log right after TCP video frame N
+  uint32_t udp_attack_every = 0;         // >0: after every Nth video/FEC datagram also send a tampered
+                                         //     copy of it and a replay of the previous datagram
 };
 
 class FakePhone {
@@ -94,6 +110,11 @@ class FakePhone {
     uint64_t pair_begins = 0, pair_codes = 0, pair_wrong = 0, pair_ok = 0;
     uint64_t pair_locked = 0, pair_expired = 0, pair_rejected = 0;
     uint64_t unauth_msgs = 0;  // non-auth messages received before authentication (ignored)
+    // encryption
+    uint8_t last_cipher = 0;             // owc::Cipher of the last session
+    uint64_t tcp_open_failures = 0;      // PC records that failed to open / plaintext after Ok (fatal)
+    uint64_t punches_rejected = 0;       // punches that did not open with the session key (ignored)
+    uint64_t udp_tampered_sent = 0, udp_replays_sent = 0;  // udp_attack_every
     float last_rr_jitter_ms = 0, last_rr_delay_gradient_ms = 0, last_rr_decode_ms = 0;
     uint32_t last_rr_frames_lost = 0;
   };

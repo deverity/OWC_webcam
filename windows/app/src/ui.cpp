@@ -434,6 +434,11 @@ void drawHud(App& app, ImDrawList* dl, ImVec2 imgMin, ImVec2 imgMax) {
   std::snprintf(l[n++], 160, "%.2f Mbps  perdidos %llu  FEC %llu", st.rx_bitrate_bps / 1e6,
                 static_cast<unsigned long long>(st.frames_lost), static_cast<unsigned long long>(st.frames_recovered_fec));
   std::snprintf(l[n++], 160, "Decoder: %s", st.decoder_hardware ? "hardware (DXVA)" : "software (CPU)");
+  if (st.cipher == owc::Cipher::None)
+    std::snprintf(l[n++], 160, "Criptografia: DESLIGADA");
+  else
+    std::snprintf(l[n++], 160, "%s  decifrar %.0f µs (máx %.0f)", cipherText(st.cipher), st.decrypt_us_avg,
+                  st.decrypt_us_max);
   ImFont* font = ImGui::GetFont();
   const float fs = ImGui::GetFontSize() * 0.9f;
   float wmax = 0;
@@ -587,7 +592,16 @@ void drawStatusBar(App& app) {
   char b[64];
   if (!ImGui::BeginTable("##st", 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) return;
   statusCell("Estado", stateText(st.state), stateCol);
-  statusCell("Transporte", up ? (st.transport == owc::VideoTransport::Udp ? "UDP" : "TCP") : "-", txt);
+  if (up) {  // transport + session cipher (red when the session is not encrypted)
+    // short names: the status column is narrow (full name in the HUD / Dispositivo tab)
+    const char* cs = st.cipher == owc::Cipher::Aes128Gcm          ? "AES-GCM"
+                     : st.cipher == owc::Cipher::ChaCha20Poly1305 ? "ChaCha20"
+                                                                  : "sem cripto";
+    std::snprintf(b, sizeof b, "%s, %s", st.transport == owc::VideoTransport::Udp ? "UDP" : "TCP", cs);
+    statusCell("Transporte", b, st.cipher == owc::Cipher::None ? col::bad() : txt);
+  } else {
+    statusCell("Transporte", "-", txt);
+  }
   if (up && st.clock_synced) std::snprintf(b, sizeof b, "%.1f ms", st.rtt_ms); else std::snprintf(b, sizeof b, "-");
   statusCell("RTT", b, txt);
   if (up && st.clock_synced) {

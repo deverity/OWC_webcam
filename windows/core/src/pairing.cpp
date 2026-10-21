@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 
+#include <owc/crypto.h>
+
 #include <algorithm>
 
 namespace owc {
@@ -71,6 +73,13 @@ bool removePairing(std::vector<PairedPhone>& v, const PhoneId& phone_id) {
 }
 
 std::string shortHex(const Id16& id) { return toHex(id.data(), 4); }
+
+bool secureRandom(void* p, size_t n) {
+  if (BCryptGenRandom(nullptr, static_cast<PUCHAR>(p), static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+    return true;
+  secureWipe(p, n);
+  return false;
+}
 
 }  // namespace detail
 }  // namespace owc

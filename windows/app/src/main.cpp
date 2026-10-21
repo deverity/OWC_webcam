@@ -57,6 +57,7 @@ struct Args {
   std::string pair_code;          // --pair-code NNNNNN[,NNNNNN...] (self-test): typed automatically when the
                                   // phone asks for pairing, one per prompt (e.g. owc_fakephone --pair-code)
   std::wstring pair_screenshot;   // --pair-screenshot f.png (self-test): the pairing dialog, before the last code
+  int cipher = -1;                // --cipher auto|aes|chacha|off (self-test): ClientOptions::cipher for this run
 };
 
 HWND g_hwnd = nullptr;
@@ -148,6 +149,10 @@ bool parseArgs(Args& a) {
     else if (s == L"--ui-script") a.ui_script = toUtf8(next());
     else if (s == L"--pair-code") a.pair_code = toUtf8(next());
     else if (s == L"--pair-screenshot") a.pair_screenshot = next();
+    else if (s == L"--cipher") {
+      const std::wstring v = next();
+      a.cipher = v == L"auto" ? 0 : v == L"aes" ? 1 : v == L"chacha" ? 2 : v == L"off" ? 3 : -1;
+    }
     else if (s == L"--help" || s == L"-h" || s == L"/?") a.help = true;
   }
   LocalFree(argv);
@@ -683,6 +688,9 @@ void selftestTick() {
     emitf("  loss             : frames_lost=%llu fec_recovered=%llu keyframe_requests=%u\n",
           static_cast<unsigned long long>(st.frames_lost), static_cast<unsigned long long>(st.frames_recovered_fec),
           st.keyframe_requests);
+    emitf("  encryption       : %s, decrypt avg %.1f us max %.1f us per frame, udp rejected %llu\n",
+          cipherText(st.cipher), st.decrypt_us_avg, st.decrypt_us_max,
+          static_cast<unsigned long long>(st.udp_auth_failures));
     emitf("  decoder          : %s (%s)\n", st.decoder_name.c_str(), st.decoder_hardware ? "hardware" : "software");
     emitf("  decoder selection: %s\n", st.decoder_selection.empty() ? "-" : st.decoder_selection.c_str());
     emitf("  present          : tearing=%d adapter=%s\n", g_renderer.tearing() ? 1 : 0, toUtf8(g_renderer.adapterName()).c_str());
@@ -715,7 +723,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   parseArgs(g_args);
   g_logPath = g_args.logfile;
   if (g_args.help) {
-    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--size WxH] [--palette 0-4] [--color-demo] [--ui-script \"...\"] [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]\n         [--pair-code NNNNNN[,NNNNNN] [--pair-screenshot f.png]]]\n");
+    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--size WxH] [--palette 0-4] [--color-demo] [--ui-script \"...\"] [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]\n         [--pair-code NNNNNN[,NNNNNN] [--pair-screenshot f.png]] [--cipher auto|aes|chacha|off]]\n");
     return 0;
   }
 
@@ -758,6 +766,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     wh = wr.bottom - wr.top;
   }
   if (g_args.palette >= 0 && g_args.palette <= 4) app.settings.color_palette = g_args.palette;
+  if (g_args.selftest && g_args.cipher >= 0) {  // never persisted (self-test settings are not saved)
+    owc::ClientOptions o = app.client.options();
+    o.cipher = static_cast<owc::CipherPreference>(g_args.cipher);
+    app.client.setOptions(o);
+    app.settings.opts = o;
+  }
   if (g_args.color_demo && g_args.selftest) {  // never persisted (self-test settings are not saved)
     owc::ClientOptions o = app.client.options();
     owc::ColorGrade& g = o.color;

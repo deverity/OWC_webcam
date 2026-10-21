@@ -62,8 +62,18 @@ const char* reasonText(owc::DisconnectReason r) {
     case R::PairingRejected: return "pareamento recusado no celular";
     case R::NotAuthorized: return "o celular recusou a autenticação deste PC";
     case R::NotPaired: return "este PC foi removido no celular — conecte de novo para parear";
+    case R::PhoneNotAuthentic: return "o celular não provou a identidade — possível interceptação";
   }
   return "";
+}
+
+const char* cipherText(owc::Cipher c) {
+  switch (c) {
+    case owc::Cipher::Aes128Gcm: return "AES-128-GCM";
+    case owc::Cipher::ChaCha20Poly1305: return "ChaCha20-Poly1305";
+    case owc::Cipher::None: return "Desligada";
+  }
+  return "?";
 }
 
 const char* stateText(owc::ClientState s) {
@@ -375,6 +385,9 @@ void App::onStateChanged(owc::ClientState s, owc::DisconnectReason r, const std:
       pairText = "O celular " + who + " recusou a autenticação deste PC. Conecte de novo para parear.";
     else if (r == R::NotPaired)
       pairText = "Este PC foi removido no celular " + who + ". Conecte de novo para parear (o celular mostrará um código).";
+    else if (r == R::PhoneNotAuthentic)
+      pairText = "O celular " + who + " não provou a identidade: possível interceptação na rede. Conexão "
+                 "recusada (o pareamento foi mantido). Verifique a rede e conecte de novo.";
   }
   std::lock_guard<std::mutex> l(mu_);
   state_msg_ = msg;

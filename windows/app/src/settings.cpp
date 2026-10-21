@@ -189,6 +189,7 @@ static Json optionsToJson(const owc::ClientOptions& o) {
   j.set("idle_timeout_ms", Json::number(o.idle_timeout_ms));
   j.set("patch_sps", Json::boolean(o.patch_sps));
   j.set("udp_bind_address", Json::string(o.udp_bind_address));
+  j.set("cipher", Json::number(static_cast<double>(o.cipher)));
   j.set("color_enabled", Json::boolean(o.color.enabled));
   j.set("color_exposure_ev", Json::number(static_cast<double>(o.color.exposure_ev)));
   j.set("color_contrast", Json::number(static_cast<double>(o.color.contrast)));
@@ -241,6 +242,9 @@ static void optionsFromJson(const Json& j, owc::ClientOptions& o) {
   o.idle_timeout_ms = u32("idle_timeout_ms", o.idle_timeout_ms);
   o.patch_sps = j.flag("patch_sps", o.patch_sps);
   o.udp_bind_address = j.str("udp_bind_address", o.udp_bind_address);
+  // protocol v3 encryption; missing (v2 settings) = Auto
+  const int ci = static_cast<int>(j.num("cipher", static_cast<double>(o.cipher)));
+  if (ci >= 0 && ci <= 3) o.cipher = static_cast<owc::CipherPreference>(ci);
 
   // colour grade: clamp to the documented ranges (a hand-edited file must not feed garbage to the core)
   auto cf = [&](const char* k, float def, double lo, double hi) {

@@ -1,9 +1,13 @@
 // owc_core integration test: in-process FakePhone (loopback, ephemeral ports)
-// <-> owc::Client. Verifies handshake, authentication / pairing (protocol v2),
-// discovery, TCP and UDP (+loss, +FEC) streaming, decoded frame counters,
-// shared-memory output, B-frame handling, transforms, Busy / NoResponse
-// errors; prints measured latencies. Every streaming scenario authenticates
-// with a pairing preloaded on the fake phone (AuthProof path).
+// <-> owc::Client. Verifies handshake, authentication / pairing (protocol v3:
+// X25519 + CPace, mutual key confirmation), encryption of TCP and UDP (each
+// cipher, Off, attacks: forged confirmation, tampered/plaintext TCP records,
+// tampered/replayed UDP datagrams, spoofed punches), discovery, TCP and UDP
+// (+loss, +FEC) streaming, decoded frame counters, shared-memory output,
+// B-frame handling, transforms, Busy / NoResponse errors; prints measured
+// latencies (also per cipher). Every streaming scenario authenticates with a
+// pairing preloaded on the fake phone (AuthProof path) and is encrypted with
+// the default cipher unless it says otherwise.
 #include "test_util.h"
 
 #include "decoder.h"
@@ -136,7 +140,22 @@ struct ShmCheck {
   double maxPublishToRead = 0;
 };
 
+// What ClientOptions::cipher negotiates against a fake phone on this machine
+// (same CPU: the phone runs localCipherMask()).
+Cipher expectedCipher(CipherPreference p) {
+  switch (p) {
+    case CipherPreference::Off: return Cipher::None;
+    case CipherPreference::ChaCha20Poly1305: return Cipher::ChaCha20Poly1305;
+    case CipherPreference::Aes128Gcm:
+    case CipherPreference::Auto: break;
+  }
+  return hardwareAesAvailable() ? Cipher::Aes128Gcm : Cipher::ChaCha20Poly1305;
+}
+
 void printStats(const char* tag, const ClientStats& s) {
+  std::printf("  [%s] crypto %s decrypt avg %.1f us max %.1f us/frame, udp rejected %llu\n", tag,
+              toString(s.cipher), s.decrypt_us_avg, s.decrypt_us_max,
+              static_cast<unsigned long long>(s.udp_auth_failures));
   std::printf(
       "  [%s] state=%s decoder='%s' hw=%d lowlat=%d bframes=%d sps_patched=%d\n"
       "  [%s] rx %.1f fps %.0f kbps | decoded %llu (%.1f fps) published %llu | lost %llu "
@@ -177,6 +196,9 @@ struct Scenario {
   uint32_t replayFps = 30;
   int16_t rotation = 0;          // VideoFormat rotation hint (output w/h swap for 90/270)
   bool overload = false;         // stream faster than this PC can present: latency must stay bounded
+  CipherPreference cipher = CipherPreference::Auto;
+  uint32_t udpAttack = 0;        // fake phone: tampered copy + replay after every Nth datagram
+  fake::FakePhone::Counters* phoneOut = nullptr;  // phone counters at the end (optional)
 };
 
 std::string dataFile(const char* name) { return std::string(OWC_TEST_DATA_DIR) + "/" + name; }
@@ -202,6 +224,7 @@ ClientStats runScenario(const Scenario& sc) {
   pc.keyframe_interval_ms = 0;  // keyframes only at start / on request
   pc.inline_param_sets = sc.inlinePs;
   pc.rotation_deg = sc.rotation;
+  pc.udp_attack_every = sc.udpAttack;
   if (sc.replay) {
     pc.replay_file = dataFile(sc.replay);
     pc.replay_fps = sc.replayFps;
@@ -221,6 +244,7 @@ ClientStats runScenario(const Scenario& sc) {
   o.patch_sps = sc.patchSps;
   o.jitter_buffer_ms = sc.jitterMs;
   o.decoder_mode = sc.decoder;
+  o.cipher = sc.cipher;
   Client client(&rec, o);
   ConnectParams cp;
   cp.host = "127.0.0.1";
@@ -265,6 +289,17 @@ ClientStats runScenario(const Scenario& sc) {
     if (l.level >= LogLevel::Warn)
       std::printf("    log[%s]: %s\n", l.source == LogSource::Phone ? "phone" : "pc", l.text.c_str());
   auto pcnt = phone.counters();
+  if (sc.phoneOut) *sc.phoneOut = pcnt;
+  CHECK_MSG(st.cipher == expectedCipher(sc.cipher) && pcnt.last_cipher == static_cast<uint8_t>(st.cipher),
+            "cipher %s (phone %u), expected %s", toString(st.cipher), pcnt.last_cipher,
+            toString(expectedCipher(sc.cipher)));
+  CHECK_MSG(pcnt.tcp_open_failures == 0 && pcnt.punches_rejected == 0, "phone: %llu bad records, %llu bad punches",
+            static_cast<unsigned long long>(pcnt.tcp_open_failures),
+            static_cast<unsigned long long>(pcnt.punches_rejected));
+  if (st.cipher != Cipher::None && st.frames_received > 0) CHECK(st.decrypt_us_avg > 0);
+  if (st.cipher == Cipher::None) CHECK(st.decrypt_us_avg == 0 && st.udp_auth_failures == 0);
+  if (!sc.udpAttack) CHECK_MSG(st.udp_auth_failures == 0, "udp auth failures %llu",
+                               static_cast<unsigned long long>(st.udp_auth_failures));
   std::printf("  [%s] phone: encoded %llu sent %llu key %llu dgrams %llu dropped %llu fec %llu kfreq %llu rr %llu\n",
               sc.name, static_cast<unsigned long long>(pcnt.frames_encoded),
               static_cast<unsigned long long>(pcnt.frames_sent), static_cast<unsigned long long>(pcnt.keyframes),
@@ -1090,7 +1125,7 @@ void testShmBusOwnedByOther() {
   c.disconnect();
 }
 
-// ---------------------------------------------------------------- pairing (protocol v2)
+// ---------------------------------------------------------------- pairing (protocol v3)
 constexpr const char* kCode = "246810";
 
 struct PairRec : Recorder {
@@ -1543,9 +1578,10 @@ void testAutoReconnectNeverPairs() {
 }
 
 // A raw "phone" answering Hello with a fixed HelloAck, to check the client's
-// order of checks: a v1 phone (status Ok, version 1, zero nonce) must be a
-// VersionMismatch; a v2 phone answering status Ok is a protocol error (never
-// "authenticated").
+// order of checks: a v1 phone (status Ok, version 1, zero trailer) and a v2
+// phone must be a VersionMismatch; a v3 phone answering status Ok is a protocol
+// error (never "authenticated"); a cipher the PC did not offer (downgrade to
+// None) or an invalid ephemeral key is a protocol error.
 DisconnectReason helloAckOutcome(const HelloAck& reply, std::string& msg) {
   detail::winsockInit();
   SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1606,10 +1642,323 @@ void testHelloAckChecks() {
   v1busy.status = HelloStatus::Busy;
   r = helloAckOutcome(v1busy, msg);
   CHECK_MSG(r == DisconnectReason::VersionMismatch, "v1 busy phone: %s", toString(r));
-  HelloAck okV2;
-  okV2.status = HelloStatus::Ok;  // v2 must say AuthRequired
-  r = helloAckOutcome(okV2, msg);
-  CHECK_MSG(r == DisconnectReason::ProtocolError, "v2 status Ok: %s (%s)", toString(r), msg.c_str());
+  HelloAck okV3;
+  okV3.status = HelloStatus::Ok;  // v2+ must say AuthRequired
+  r = helloAckOutcome(okV3, msg);
+  CHECK_MSG(r == DisconnectReason::ProtocolError, "v3 status Ok: %s (%s)", toString(r), msg.c_str());
+  HelloAck v2;  // a v2 phone (no key exchange): update needed
+  v2.version = 2;
+  v2.status = HelloStatus::AuthRequired;
+  r = helloAckOutcome(v2, msg);
+  CHECK_MSG(r == DisconnectReason::VersionMismatch, "v2 phone: %s (%s)", toString(r), msg.c_str());
+  // Downgrade: the "phone" picks no encryption although the PC did not offer it.
+  HelloAck none;
+  none.status = HelloStatus::AuthRequired;
+  none.cipher = static_cast<uint8_t>(Cipher::None);
+  r = helloAckOutcome(none, msg);
+  CHECK_MSG(r == DisconnectReason::ProtocolError && msg.find("did not offer") != std::string::npos,
+            "downgrade to None: %s (%s)", toString(r), msg.c_str());
+  HelloAck bogus = none;
+  bogus.cipher = 9;
+  r = helloAckOutcome(bogus, msg);
+  CHECK_MSG(r == DisconnectReason::ProtocolError, "unknown cipher: %s (%s)", toString(r), msg.c_str());
+  // A valid cipher but an all-zero ephemeral key (X25519 gives an all-zero secret).
+  HelloAck zeroKey = none;
+  zeroKey.cipher = static_cast<uint8_t>(Cipher::ChaCha20Poly1305);
+  r = helloAckOutcome(zeroKey, msg);
+  CHECK_MSG(r == DisconnectReason::ProtocolError, "zero ephemeral key: %s (%s)", toString(r), msg.c_str());
+}
+
+// ---------------------------------------------------------------- encryption (protocol v3)
+// A client with the preloaded key, against a phone configured by `tweak`.
+struct CryptoRun {
+  fake::FakePhone phone;
+  PairRec rec;
+  std::unique_ptr<Client> c;
+  bool start(const std::function<void(fake::FakePhoneConfig&)>& tweak, CipherPreference cipher,
+             VideoTransport tr = VideoTransport::Tcp, bool autoReconnect = false) {
+    fake::FakePhoneConfig pc;
+    pc.bind_address = "127.0.0.1";
+    pc.control_port = pc.udp_port = pc.discovery_port = 0;
+    pc.enable_discovery = false;
+    pc.width = 640;
+    pc.height = 480;
+    pc.logger = [](const std::string& s) { std::printf("    phone: %s\n", s.c_str()); };
+    if (tweak) tweak(pc);
+    std::string err;
+    if (!phone.start(preload(pc), err)) return false;
+    ClientOptions o = pairOptions(autoReconnect);
+    o.udp_bind_address = "127.0.0.1";
+    o.cipher = cipher;
+    c.reset(new Client(&rec, o));
+    ConnectParams cp;
+    cp.port = phone.controlPort();
+    cp.transport = tr;
+    authorize(cp, phone);
+    return c->connect(cp);
+  }
+};
+
+// Every cipher (AES only with hardware AES) and Off, TCP and UDP: negotiated as
+// asked, frames decode, the phone's counters agree.
+void testCipherNegotiation() {
+  std::vector<CipherPreference> prefs = {CipherPreference::Auto, CipherPreference::ChaCha20Poly1305,
+                                         CipherPreference::Off};
+  if (hardwareAesAvailable()) prefs.push_back(CipherPreference::Aes128Gcm);
+  else std::printf("  (no AES-NI/PCLMULQDQ on this CPU: AES-128-GCM not tested)\n");
+  for (VideoTransport tr : {VideoTransport::Tcp, VideoTransport::Udp}) {
+    for (CipherPreference p : prefs) {
+      CryptoRun t;
+      CHECK(t.start(nullptr, p, tr));
+      const bool ok = waitFor([&] { return t.rec.frames.load() >= 20; }, 8000);
+      const ClientStats s = t.c->stats();
+      DeviceInfo di;
+      CHECK(t.c->deviceInfo(di));
+      std::printf("  [%s %s] -> %s, frames %d, decrypt avg %.1f max %.1f us, punched %d\n",
+                  tr == VideoTransport::Udp ? "UDP" : "TCP", toString(p), toString(s.cipher), t.rec.frames.load(),
+                  s.decrypt_us_avg, s.decrypt_us_max, s.udp_punched ? 1 : 0);
+      CHECK_MSG(ok, "%s: only %d frames", toString(p), t.rec.frames.load());
+      CHECK(s.cipher == expectedCipher(p) && di.cipher == s.cipher);
+      CHECK(t.phone.counters().last_cipher == static_cast<uint8_t>(s.cipher));
+      CHECK(s.cipher == Cipher::None ? s.decrypt_us_avg == 0 : s.decrypt_us_avg > 0);
+      CHECK(s.udp_auth_failures == 0 && t.phone.counters().punches_rejected == 0);
+      if (tr == VideoTransport::Udp) CHECK(s.udp_punched);
+      t.c->disconnect();
+    }
+  }
+  // The phone cannot run what the PC forces: VersionMismatch with a clear message, no retry.
+  {
+    CryptoRun t;
+    CHECK(t.start([](fake::FakePhoneConfig& pc) { pc.cipher_mask = cipherBit(Cipher::ChaCha20Poly1305); },
+                  CipherPreference::Off, VideoTransport::Tcp, true));
+    CHECK(waitState(*t.c, ClientState::Failed, 4000));
+    CHECK(t.c->lastDisconnectReason() == DisconnectReason::VersionMismatch);
+    std::lock_guard<std::mutex> lk(t.rec.mx);
+    CHECK_MSG(t.rec.lastMsg.find("encryption") != std::string::npos, "message '%s'", t.rec.lastMsg.c_str());
+  }
+  // A phone that only runs ChaCha serves an Auto PC with ChaCha.
+  {
+    CryptoRun t;
+    CHECK(t.start([](fake::FakePhoneConfig& pc) { pc.cipher_mask = cipherBit(Cipher::ChaCha20Poly1305); },
+                  CipherPreference::Auto));
+    CHECK(waitFor([&] { return t.rec.frames.load() >= 5; }, 6000));
+    CHECK(t.c->stats().cipher == Cipher::ChaCha20Poly1305);
+    t.c->disconnect();
+  }
+}
+
+// AuthResult Ok with a confirmation that does not match: whoever answered does
+// not hold the key. Failed/PhoneNotAuthentic, no auto-reconnect, key KEPT.
+void testPhoneNotAuthentic() {
+  {  // paired path (AuthProof)
+    CryptoRun t;
+    CHECK(t.start([](fake::FakePhoneConfig& pc) { pc.forge_phone_confirm = true; }, CipherPreference::Auto,
+                  VideoTransport::Tcp, true));
+    CHECK(waitState(*t.c, ClientState::Failed, 4000));
+    CHECK_MSG(t.c->lastDisconnectReason() == DisconnectReason::PhoneNotAuthentic, "reason %s",
+              toString(t.c->lastDisconnectReason()));
+    sleepMs(800);
+    CHECK(t.c->state() == ClientState::Failed && !t.rec.sawState(ClientState::Reconnecting));
+    CHECK(!t.rec.connected && t.rec.connects.load() == 0);
+    const ConnectParams cp = t.c->connectParams();
+    CHECK(cp.paired.size() == 1 && !cp.paired.empty() && cp.paired[0].key == kTestKey);
+    {
+      std::lock_guard<std::mutex> lk(t.rec.pmx);
+      CHECK(t.rec.rejected.empty() && !t.rec.paired);
+    }
+    {
+      std::lock_guard<std::mutex> lk(t.rec.mx);
+      std::printf("  paired path: %s\n", t.rec.lastMsg.c_str());
+    }
+    const auto pc = t.phone.counters();
+    CHECK(pc.auth_ok == 1 && pc.pings == 0 && pc.sessions == 1);
+  }
+  {  // pairing path (CPace): the right code, but a forged phone confirmation -> no key stored
+    fake::FakePhoneConfig cfg = pairPhoneConfig();
+    cfg.forge_phone_confirm = true;
+    fake::FakePhone phone;
+    std::string err;
+    CHECK(phone.start(cfg, err));
+    PairRec rec;
+    Client c(&rec, pairOptions(true));
+    CHECK(c.connect(freshParams(phone, newClientId())));
+    CHECK(waitState(c, ClientState::Pairing, 3000));
+    CHECK(c.submitPairingCode(kCode));
+    CHECK(waitState(c, ClientState::Failed, 3000));
+    CHECK(c.lastDisconnectReason() == DisconnectReason::PhoneNotAuthentic);
+    {
+      std::lock_guard<std::mutex> lk(rec.pmx);
+      CHECK(!rec.paired);
+    }
+    CHECK(c.connectParams().paired.empty() && !rec.connected);
+    sleepMs(500);
+    CHECK(phone.counters().pair_begins == 1 && c.state() == ClientState::Failed);
+  }
+}
+
+// One TCP record of the phone fails to open (bit flip) / a plaintext message
+// after authentication: ProtocolError, the session is dropped.
+void testTcpRecordAttacks() {
+  for (int plain = 0; plain < 2; ++plain) {
+    CryptoRun t;
+    CHECK(t.start([plain](fake::FakePhoneConfig& pc) {
+      if (plain) pc.tcp_plain_after_frames = 15;
+      else pc.tcp_tamper_after_frames = 15;
+    }, CipherPreference::Auto));
+    CHECK(waitState(*t.c, ClientState::Failed, 8000));
+    const DisconnectReason r = t.c->lastDisconnectReason();
+    std::string msg;
+    {
+      std::lock_guard<std::mutex> lk(t.rec.mx);
+      msg = t.rec.lastMsg;
+    }
+    std::printf("  [%s] %s: %s, frames before %d\n", plain ? "plaintext" : "tampered", toString(r), msg.c_str(),
+                t.rec.frames.load());
+    CHECK(r == DisconnectReason::ProtocolError);
+    CHECK(msg.find(plain ? "unencrypted" : "failed authentication") != std::string::npos);
+    // Tampered: frame 15 itself is bad. Plaintext: the Log follows a valid frame 15.
+    const int frames = t.rec.frames.load();
+    CHECK(frames >= 1 && frames <= (plain ? 15 : 14));
+  }
+}
+
+// UDP: tampered and replayed datagrams are dropped and counted, the stream
+// continues intact; a plaintext punch from another socket is ignored by the
+// phone (it cannot redirect the stream).
+void testUdpAttacks() {
+  Scenario sc;
+  sc.name = "UDP tampered+replayed datagrams";
+  sc.transport = VideoTransport::Udp;
+  sc.width = 640;
+  sc.height = 480;
+  sc.bitrate = 1500000;
+  sc.udpAttack = 5;
+  sc.needFrames = 90;
+  sc.checkShm = false;
+  fake::FakePhone::Counters pc;
+  sc.phoneOut = &pc;
+  const ClientStats st = runScenario(sc);
+  if (st.frames_received == 0) return;  // filtered by OWC_IT_ONLY
+  const uint64_t attacks = pc.udp_tampered_sent + pc.udp_replays_sent;
+  std::printf("  attacks sent: %llu tampered + %llu replays, rejected by the PC %llu, frames lost %llu\n",
+              static_cast<unsigned long long>(pc.udp_tampered_sent),
+              static_cast<unsigned long long>(pc.udp_replays_sent),
+              static_cast<unsigned long long>(st.udp_auth_failures),
+              static_cast<unsigned long long>(st.frames_lost));
+  CHECK(pc.udp_tampered_sent > 20 && pc.udp_replays_sent > 20);
+  // Loopback: every attack datagram arrives and must be rejected (a few may still
+  // be in flight when the stats are taken).
+  CHECK_MSG(st.udp_auth_failures + 4 >= attacks && st.udp_auth_failures <= attacks,
+            "rejected %llu of %llu", static_cast<unsigned long long>(st.udp_auth_failures),
+            static_cast<unsigned long long>(attacks));
+  CHECK_MSG(st.frames_lost <= 2, "frames lost %llu", static_cast<unsigned long long>(st.frames_lost));
+
+  // Spoofed punch: plaintext with the right session id from another socket.
+  CryptoRun t;
+  CHECK(t.start(nullptr, CipherPreference::Auto, VideoTransport::Udp));
+  CHECK(waitFor([&] { return t.rec.frames.load() >= 10; }, 6000));
+  DeviceInfo di;
+  CHECK(t.c->deviceInfo(di));
+  SOCKET spy = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in me{};
+  me.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &me.sin_addr);
+  bind(spy, reinterpret_cast<sockaddr*>(&me), sizeof(me));
+  DWORD tmo = 300;
+  setsockopt(spy, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+  UdpHeader h;
+  h.type = UdpType::Punch;
+  h.session_id = di.session_id;
+  uint8_t b[kUdpHeaderSize];
+  writeUdpHeader(h, b);
+  sockaddr_in ph = me;
+  ph.sin_port = htons(t.phone.udpPort());
+  for (int i = 0; i < 3; ++i)
+    sendto(spy, reinterpret_cast<const char*>(b), static_cast<int>(sizeof(b)), 0,
+           reinterpret_cast<const sockaddr*>(&ph), sizeof(ph));
+  char rb[2048];
+  const int got = recv(spy, rb, sizeof(rb), 0);
+  closesocket(spy);
+  CHECK_MSG(got <= 0, "the spoofed punch got %d bytes back", got);
+  CHECK(waitFor([&] { return t.phone.counters().punches_rejected >= 3; }, 2000));
+  const int f0 = t.rec.frames.load();
+  CHECK(waitFor([&] { return t.rec.frames.load() >= f0 + 10; }, 3000));  // still streaming to the PC
+  t.c->disconnect();
+}
+
+// A key created by a v2 build (same 32-byte format) authenticates in v3.
+void testV2StoredKeyStillValid() {
+  const Key32 v2Key = {0x9c, 0x02, 0x7e, 0x41, 0xd5, 0x13, 0x88, 0x6a, 0x20, 0xf7, 0x3c,
+                       0xb9, 0x64, 0x0e, 0xa1, 0x5d, 0xc2, 0x37, 0x99, 0x48, 0x0b, 0xee,
+                       0x71, 0x16, 0x83, 0xda, 0x2f, 0x54, 0xbb, 0x06, 0x6d, 0xf1};
+  fake::FakePhoneConfig cfg = pairPhoneConfig();
+  fake::FakePhoneConfig::PairedClient known;
+  known.client_id = kTestClientId;
+  known.key = v2Key;
+  known.name = "paired by a v2 build";
+  cfg.paired_clients.push_back(known);
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(cfg, err));
+  PairRec rec;
+  Client c(&rec, pairOptions(false));
+  ConnectParams cp = freshParams(phone, kTestClientId);
+  PairedPhone pp;
+  pp.phone_id = phone.phoneId();
+  pp.key = v2Key;
+  cp.paired.push_back(pp);
+  CHECK(c.connect(cp));
+  CHECK(waitSession(c, 3000));
+  CHECK(waitFor([&] { return rec.frames.load() >= 5; }, 5000));
+  const auto pc = phone.counters();
+  CHECK(pc.auth_proofs == 1 && pc.auth_ok == 1 && pc.pair_begins == 0);
+  CHECK(rec.promptCount() == 0 && !rec.paired && rec.rejected.empty());
+  CHECK(c.connectParams().paired.size() == 1 && c.connectParams().paired[0].key == v2Key);
+  c.disconnect();
+}
+
+// Capture->PC latency and decrypt cost per cipher (same stream, software
+// decoder for comparable decode times). Encryption must not regress latency
+// meaningfully: decrypt is microseconds per frame.
+void testLatencyByCipher() {
+  struct Row { const char* name; CipherPreference p; };
+  std::vector<Row> rows = {{"off", CipherPreference::Off}, {"chacha20-poly1305", CipherPreference::ChaCha20Poly1305}};
+  if (hardwareAesAvailable()) rows.push_back({"aes-128-gcm", CipherPreference::Aes128Gcm});
+  for (VideoTransport tr : {VideoTransport::Tcp, VideoTransport::Udp}) {
+    std::vector<ClientStats> res;
+    std::vector<std::string> names;
+    for (const Row& r : rows) {
+      names.push_back(std::string(tr == VideoTransport::Udp ? "LATENCY UDP" : "LATENCY TCP") +
+                      " 1080p30 8 Mbps cipher " + r.name);
+      Scenario sc;
+      sc.name = names.back().c_str();
+      sc.transport = tr;
+      sc.width = 1920;
+      sc.height = 1080;
+      sc.bitrate = 8000000;
+      sc.decoder = DecoderMode::Software;
+      sc.cipher = r.p;
+      sc.needFrames = 150;
+      sc.checkShm = false;
+      res.push_back(runScenario(sc));
+    }
+    if (res[0].frames_received == 0) continue;  // filtered by OWC_IT_ONLY
+    std::printf("SUMMARY %s latency by cipher (1080p30 8 Mbps, SW decoder):\n",
+                tr == VideoTransport::Udp ? "UDP" : "TCP");
+    for (size_t i = 0; i < rows.size(); ++i)
+      std::printf("  %-18s capture->publish avg %6.2f p95 %6.2f ms | capture->arrival %6.2f ms | decrypt avg %7.1f "
+                  "max %7.1f us/frame\n",
+                  rows[i].name, res[i].capture_to_publish_ms_avg, res[i].capture_to_publish_ms_p95,
+                  res[i].capture_to_arrival_ms_avg, res[i].decrypt_us_avg, res[i].decrypt_us_max);
+    for (size_t i = 1; i < rows.size(); ++i) {
+      if (res[i].frames_received == 0) continue;
+      CHECK_MSG(res[i].decrypt_us_avg < 1000.0, "%s: decrypt %.1f us/frame", rows[i].name, res[i].decrypt_us_avg);
+      const double off = res[0].capture_to_publish_ms_avg;
+      CHECK_MSG(res[i].capture_to_publish_ms_avg <= off + std::max(5.0, off * 0.25),
+                "%s: capture->publish %.2f ms vs %.2f ms without encryption", rows[i].name,
+                res[i].capture_to_publish_ms_avg, off);
+    }
+  }
 }
 
 // The phone counts wrong codes globally: a new code may allow fewer attempts.
@@ -1661,6 +2010,11 @@ int main() {
   RUN(testAutoReconnectNeverPairs);
   RUN(testPairingGlobalAttempts);
   RUN(testHelloAckChecks);
+  RUN(testCipherNegotiation);
+  RUN(testPhoneNotAuthentic);
+  RUN(testTcpRecordAttacks);
+  RUN(testUdpAttacks);
+  RUN(testV2StoredKeyStillValid);
   RUN(testTransformAndControls);
   RUN(testShmBusOwnedByOther);
   RUN(testCodecNegotiation);
@@ -1788,6 +2142,8 @@ int main() {
   const ClientStats e2 = runScenario(bfsw);
   CHECK(e2.frames_decoded == 0 ||
         (e2.decoder_delay_frames_avg <= 2.0 && e2.decoder_delay_frames_max <= 6));
+
+  RUN(testLatencyByCipher);
 
   Scenario jb = tcp;
   jb.name = "TCP jitter buffer 60 ms";

@@ -66,8 +66,32 @@ const char* toString(DisconnectReason r) {
     case DisconnectReason::PairingRejected: return "PairingRejected";
     case DisconnectReason::NotAuthorized: return "NotAuthorized";
     case DisconnectReason::NotPaired: return "NotPaired";
+    case DisconnectReason::PhoneNotAuthentic: return "PhoneNotAuthentic";
   }
   return "?";
+}
+
+const char* toString(CipherPreference p) {
+  switch (p) {
+    case CipherPreference::Auto: return "Auto";
+    case CipherPreference::Aes128Gcm: return "AES-128-GCM";
+    case CipherPreference::ChaCha20Poly1305: return "ChaCha20-Poly1305";
+    case CipherPreference::Off: return "Off";
+  }
+  return "?";
+}
+
+uint32_t cipherMaskFor(CipherPreference p) {
+  const uint32_t local = localCipherMask();
+  switch (p) {
+    case CipherPreference::Off: return cipherBit(Cipher::None);
+    case CipherPreference::Aes128Gcm:
+      if (local & cipherBit(Cipher::Aes128Gcm)) return cipherBit(Cipher::Aes128Gcm);
+      return cipherBit(Cipher::ChaCha20Poly1305);  // no AES-NI here: see CipherPreference
+    case CipherPreference::ChaCha20Poly1305: return cipherBit(Cipher::ChaCha20Poly1305);
+    case CipherPreference::Auto: break;
+  }
+  return local & ~cipherBit(Cipher::None);
 }
 
 const char* toString(DecoderMode m) {
@@ -251,9 +275,18 @@ struct Client::Impl {
   // ---- sockets
   std::mutex sendMx;
   SOCKET tcp = INVALID_SOCKET;
+  // Protocol v3 record layer, PC -> phone (sendMx): set right after AuthResult Ok
+  // when the cipher is not None. Sealing and sending happen under the same lock,
+  // so the implicit record counter always matches the order on the wire.
+  std::unique_ptr<TcpSealer> tcpSealer;
   std::atomic<bool> sessionUp{false};
   std::mutex udpMx;
   SOCKET udp = INVALID_SOCKET;
+  std::unique_ptr<UdpSealer> udpSealer;  // udpMx: punches (c2p_udp)
+  // p2c_udp: created before the owc-udp thread starts, used ONLY by it, destroyed
+  // after it was joined (closeUdp).
+  std::unique_ptr<UdpOpener> udpOpener;
+  std::atomic<uint64_t> udpAuthFailures{0};
   std::atomic<bool> udpStop{false};
   std::atomic<bool> punched{false};
   std::thread udpThread;
@@ -295,6 +328,8 @@ struct Client::Impl {
     JitterEstimator jitter;
     DelayTrend trend{20};
     SampleWindow arrToDec, capToPub, capToArr, decodeMs, decDelay, readbackMs;
+    SampleWindow decryptUs;            // per frame (TCP record / all datagrams of a UDP frame)
+    Cipher cipher = Cipher::None;      // session cipher
     uint32_t decDelayMax = 0;
     uint64_t frames_decoded = 0, frames_published = 0;
     bool decoderHw = false, decoderLL = false, bframes = false, spsPatched = false;
@@ -430,8 +465,8 @@ struct Client::Impl {
     return state;
   }
 
-  bool sendRaw(const std::vector<uint8_t>& buf) {
-    std::lock_guard<std::mutex> lk(sendMx);
+  // sendMx held.
+  bool sendRawLocked(const std::vector<uint8_t>& buf) {
     if (tcp == INVALID_SOCKET) return false;
     size_t off = 0;
     const int64_t deadline = steadyMs() + 2000;
@@ -455,12 +490,17 @@ struct Client::Impl {
     }
     return true;
   }
+  // Any thread. After AuthResult Ok (cipher != None) every message is sealed.
   bool sendMsg(MsgType t, const std::vector<uint8_t>& payload, bool requireSession = true) {
     if (requireSession && !sessionUp) return false;
     std::vector<uint8_t> b;
-    b.reserve(payload.size() + kTcpHeaderSize);
-    appendTcpMessage(b, t, payload);
-    return sendRaw(b);
+    b.reserve(payload.size() + kTcpHeaderSize + 2 + kAeadTagSize);
+    std::lock_guard<std::mutex> lk(sendMx);
+    if (tcpSealer)
+      tcpSealer->seal(t, payload.data(), payload.size(), b);
+    else
+      appendTcpMessage(b, t, payload);
+    return sendRawLocked(b);
   }
   bool sendCmd(CommandId id, int64_t arg = 0, float x = 0, float y = 0,
                const std::string& text = std::string()) {
@@ -696,17 +736,20 @@ struct Client::Impl {
   }
 
   // ============================================================ authentication
-  // Net thread, right after an AuthRequired HelloAck. Runs the PAIRING exchange
-  // of owc/protocol.h: AuthProof with a known key, else (or after NotPaired)
-  // ONE PairBegin, then waits for the user's code (state Pairing). With
-  // !allowPair (auto-reconnect) a missing/refused key ends in Failed/NotPaired
-  // instead: removing the PC on the phone must not pop a new code there. Returns true
-  // on AuthResult Ok (messages after it stay queued in `parser`). On false `res`
-  // is filled; the caller closes the socket. Never pings, never applies the
-  // idle timeout: the wait is bounded by kAuthTimeoutS per request and, while
-  // Pairing, by the code lifetime + kPairExpiryMarginMs.
+  // Net thread, right after an AuthRequired HelloAck and Handshake::begin().
+  // Runs the PAIRING exchange of owc/protocol.h (v3): AuthProof (key
+  // confirmation) with a known key, else (or after NotPaired) ONE PairBegin, then
+  // waits for the user's code (state Pairing) and runs CPace with the phone's
+  // share. With !allowPair (auto-reconnect) a missing/refused key ends in
+  // Failed/NotPaired instead: removing the PC on the phone must not pop a new code
+  // there. AuthResult Ok is accepted only if its confirmation equals
+  // hs.phoneConfirm() (else PhoneNotAuthentic). Returns true on a verified Ok
+  // (messages after it stay queued in `parser`, sealed unless Cipher::None). On
+  // false `res` is filled; the caller closes the socket. Never pings, never
+  // applies the idle timeout: the wait is bounded by kAuthTimeoutS per request
+  // and, while Pairing, by the code lifetime + kPairExpiryMarginMs.
   bool authenticate(SOCKET s, TcpFrameParser& parser, const HelloAck& ack, const ConnectParams& p,
-                    uint64_t myGen, bool allowPair, AuthOutcome& out, SessionResult& res) {
+                    Handshake& hs, uint64_t myGen, bool allowPair, AuthOutcome& out, SessionResult& res) {
     const std::string who = (ack.device_name.empty() ? ack.model : ack.device_name) + " [" +
                             shortHex(ack.phone_id) + "]";
     {
@@ -720,8 +763,8 @@ struct Client::Impl {
     }
     const PairedPhone* known = findPairing(p.paired, ack.phone_id);
     bool haveKey = known != nullptr;
-    const Key32 key = known ? known->key : Key32{};
     bool pairBegun = false, codeInFlight = false;
+    Key32 cpacePeer{};  // the phone's current CPace share Yb (CodeShown / WrongCode)
     const int64_t kRequestTimeoutMs = int64_t(kAuthTimeoutS) * 1000;
     int64_t deadline = steadyMs() + kRequestTimeoutMs;
 
@@ -759,9 +802,11 @@ struct Client::Impl {
     };
 
     if (haveKey && ack.paired) {
+      hs.usePairingKey(known->key);
       AuthProof proof;
-      proof.mac = authMac(key, ack.phone_id, p.client_id, ack.nonce);
+      proof.confirm = hs.pcConfirm();
       sendMsg(MsgType::AuthProof, encode(proof), false);
+      secureWipe(proof.confirm.data(), proof.confirm.size());
     } else {
       rejectKey("the phone does not know this PC");
       if (!allowPair) return unpaired();
@@ -784,9 +829,23 @@ struct Client::Impl {
           code.swap(pairCodeOut);
         }
         if (!code.empty()) {
+          // CPace: own share from the typed code + fresh randomness, then the
+          // shared secret with the phone's share. An invalid share (finish
+          // false) is still answered with a PairCode: the phone decides (it
+          // counts it as a wrong code).
+          Key32 rnd{};
+          if (!secureRandom(rnd.data(), rnd.size())) {
+            secureWipe(&code[0], code.size());
+            sendMsg(MsgType::Bye, {}, false);
+            return fail(DisconnectReason::NotAuthorized, "system random generator failed");
+          }
           PairCode pc;
-          pc.code = code;
+          pc.cpace_pub = hs.cpaceStart(code, rnd);
+          secureWipe(rnd.data(), rnd.size());
+          secureWipe(&code[0], code.size());
+          if (hs.cpaceFinish(cpacePeer)) pc.confirm = hs.pcConfirm();
           sendMsg(MsgType::PairCode, encode(pc), false);
+          secureWipe(pc.confirm.data(), pc.confirm.size());
           codeInFlight = true;
           deadline = std::max(deadline, now + kRequestTimeoutMs);  // a late code still gets its verdict
         }
@@ -836,24 +895,42 @@ struct Client::Impl {
         }
         noteAuthStatus(ar.status, ar.status == AuthStatus::Locked ? ar.seconds : 0);
         switch (ar.status) {
-          case AuthStatus::Ok:
+          case AuthStatus::Ok: {
+            // Mutual key confirmation: the phone must prove it derived the same
+            // keys (it holds the pairing key / knew the code, and saw exactly
+            // our Hello and its HelloAck). Without a proof of ours in flight an
+            // Ok is bogus too. Never forget the key here: the real phone has it.
+            const bool proofSent = pairBegun ? codeInFlight : haveKey;
+            bool authentic = false;
+            if (proofSent && hs.ready()) {
+              const Key32 want = hs.phoneConfirm();
+              authentic = constantTimeEqual(want.data(), ar.confirm.data(), want.size());
+            }
+            if (!authentic) {
+              logf(LogLevel::Error, "%s answered Ok without a valid confirmation: possible interception, "
+                   "connection dropped (the pairing key is kept)", who.c_str());
+              res.reason = DisconnectReason::PhoneNotAuthentic;
+              res.message = "the phone did not prove its identity (wrong key confirmation): possible "
+                            "interception on the network";
+              res.noReconnect = true;
+              return false;
+            }
             if (pairBegun) {
-              if (isZero(ar.key)) {
-                logf(LogLevel::Warn, "%s accepted the pairing but sent no key: the next connection will "
-                     "need a new pairing", who.c_str());
-              } else {
-                out.newKey = true;
-                out.key = ar.key;
+              out.newKey = true;
+              out.key = hs.newPairingKey();
+              {
                 std::lock_guard<std::mutex> lk(ctlMx);
-                if (gen == myGen) upsertPairing(params.paired, ack.phone_id, ar.key);
+                if (gen == myGen) upsertPairing(params.paired, ack.phone_id, out.key);
               }
               logf(LogLevel::Info, "paired with %s", who.c_str());
             } else {
               logf(LogLevel::Info, "authenticated by %s", who.c_str());
             }
             return true;
+          }
           case AuthStatus::CodeShown: {
             if (!pairBegun) break;  // not asked for: ignore
+            cpacePeer = ar.cpace_pub;
             const uint16_t life = ar.seconds ? ar.seconds : kPairCodeLifetimeS;
             PairingInfo snap;
             {
@@ -878,6 +955,7 @@ struct Client::Impl {
           case AuthStatus::WrongCode: {
             if (!codeInFlight) break;
             codeInFlight = false;
+            cpacePeer = ar.cpace_pub;  // the phone restarted CPace with a fresh share
             PairingInfo snap;
             {
               std::lock_guard<std::mutex> lk(stMx);
@@ -964,6 +1042,14 @@ struct Client::Impl {
     TcpFrameParser parser;
     HelloAck ack;
     bool gotAck = false;
+    // v3: one Handshake (fresh ephemeral X25519 secret) per attempt; th covers the
+    // exact Hello payload sent and HelloAck payload received.
+    std::unique_ptr<Handshake> hs;
+    std::vector<uint8_t> helloBytes, ackBytes;
+    const uint32_t cipherMask = cipherMaskFor(o.cipher);
+    if (o.cipher == CipherPreference::Aes128Gcm && !(cipherMask & cipherBit(Cipher::Aes128Gcm)))
+      logf(LogLevel::Warn, "AES-128-GCM requested but this CPU has no AES-NI/PCLMULQDQ: offering "
+           "ChaCha20-Poly1305 instead");
     const uint32_t attempts = std::max<uint32_t>(1, o.handshake_attempts);
     std::string lastErr;
     bool everConnected = false;
@@ -980,15 +1066,29 @@ struct Client::Impl {
       everConnected = true;
       setState(ClientState::Handshaking);
       parser = TcpFrameParser();
+      {
+        Key32 eph{};
+        if (!secureRandom(eph.data(), eph.size())) {
+          closeSocket(s);
+          res.reason = DisconnectReason::SocketError;
+          res.message = "system random generator (BCryptGenRandom) failed";
+          return res;
+        }
+        hs.reset(new Handshake(Handshake::Role::Pc, eph));
+        secureWipe(eph.data(), eph.size());
+      }
       Hello h;
       h.transport = p.transport;
       h.client_name = p.client_name;
       h.client_id = p.client_id;
+      h.eph_pub = hs->ephPublic();
+      h.cipher_mask = cipherMask;
+      helloBytes = encode(h);
       {
         std::lock_guard<std::mutex> lk(sendMx);
         tcp = s;
       }
-      if (!sendMsg(MsgType::Hello, encode(h), false)) lastErr = "send Hello failed";
+      if (!sendMsg(MsgType::Hello, helloBytes, false)) lastErr = "send Hello failed";
       const int64_t deadline = steadyMs() + o.handshake_timeout_ms;
       bool closed = false;
       while (!gotAck && !closed && steadyMs() < deadline) {
@@ -1006,6 +1106,7 @@ struct Client::Impl {
         if (parser.next(m)) {
           if (m.type == MsgType::HelloAck && decode(m.payload.data(), m.payload.size(), ack)) {
             gotAck = true;
+            ackBytes.swap(m.payload);
           } else {
             closed = true;
             lastErr = "unexpected first message";
@@ -1043,14 +1144,19 @@ struct Client::Impl {
       res.message = "peer is not an OWC phone";
       return res;
     }
-    // Version first: a v1 phone's HelloAck decodes as status Ok with a zero nonce
-    // and must never reach the status handling below.
+    // Version first: an older phone's HelloAck decodes with a zero trailer (v1:
+    // status Ok) and must never reach the status handling below.
     if (ack.status == HelloStatus::VersionMismatch || ack.version != kProtocolVersion) {
       closeTcp();
       res.reason = DisconnectReason::VersionMismatch;
-      res.message = "protocol version mismatch (phone v" + std::to_string(ack.version) +
-                    ", PC v" + std::to_string(kProtocolVersion) + ") - update OWC on " +
-                    (ack.version < kProtocolVersion ? "the phone" : "this PC");
+      if (ack.version == kProtocolVersion && o.cipher != CipherPreference::Auto)
+        // Same version: the phone found no common cipher (owc/protocol.h HelloAck).
+        res.message = std::string("the phone does not support the encryption chosen on this PC (") +
+                      toString(o.cipher) + "): choose Auto";
+      else
+        res.message = "protocol version mismatch (phone v" + std::to_string(ack.version) +
+                      ", PC v" + std::to_string(kProtocolVersion) + ") - update OWC on " +
+                      (ack.version < kProtocolVersion ? "the phone" : "this PC");
       return res;
     }
     if (ack.status == HelloStatus::Busy) {
@@ -1060,12 +1166,28 @@ struct Client::Impl {
       return res;
     }
     if (ack.status != HelloStatus::AuthRequired) {
-      // A v2 phone always requires authentication: status Ok is a protocol
+      // A v2+ phone always requires authentication: status Ok is a protocol
       // error, never "authenticated".
       closeTcp();
       res.reason = DisconnectReason::ProtocolError;
       res.message = "phone did not request authentication (HelloAck status " +
                     std::to_string(static_cast<int>(ack.status)) + ")";
+      return res;
+    }
+    // ---- key exchange. The phone must pick one of the ciphers we offered (a
+    // downgrade to None we did not offer is refused here; tampering with the
+    // offer itself breaks the key confirmation, th covers both payloads).
+    const Cipher cipher = static_cast<Cipher>(ack.cipher);
+    if (ack.cipher > static_cast<uint8_t>(Cipher::ChaCha20Poly1305) || !(cipherMask & cipherBit(cipher))) {
+      closeTcp();
+      res.reason = DisconnectReason::ProtocolError;
+      res.message = "the phone chose cipher " + std::to_string(ack.cipher) + ", which this PC did not offer";
+      return res;
+    }
+    if (!hs->begin(helloBytes.data(), helloBytes.size(), ackBytes.data(), ackBytes.size(), ack.eph_pub, cipher)) {
+      closeTcp();
+      res.reason = DisconnectReason::ProtocolError;
+      res.message = "invalid ephemeral key from the phone";
       return res;
     }
 
@@ -1075,7 +1197,7 @@ struct Client::Impl {
     const bool allowPair = mayPair;
     mayPair = false;
     AuthOutcome auth;
-    if (!authenticate(s, parser, ack, p, myGen, allowPair, auth, res)) {
+    if (!authenticate(s, parser, ack, p, *hs, myGen, allowPair, auth, res)) {
       {
         std::lock_guard<std::mutex> lk(stMx);
         pairing.active = false;
@@ -1084,6 +1206,42 @@ struct Client::Impl {
       }
       closeTcp();
       return res;
+    }
+
+    // ---- record layer (v3): from here on every TCP message both ways (and
+    // every UDP datagram) is sealed, unless the cipher is None.
+    std::unique_ptr<TcpOpener> opener;  // p2c_tcp, net thread only
+    {
+      SessionKeys keys = hs->keys();
+      bool ok = true;
+      if (cipher != Cipher::None) {
+        opener.reset(new TcpOpener);
+        std::unique_ptr<TcpSealer> sealer(new TcpSealer);
+        ok = opener->init(keys.p2c_tcp) && sealer->init(keys.c2p_tcp);
+        if (ok && p.transport == VideoTransport::Udp) {
+          std::unique_ptr<UdpSealer> us(new UdpSealer);
+          std::unique_ptr<UdpOpener> uo(new UdpOpener);
+          ok = us->init(keys.c2p_udp) && uo->init(keys.p2c_udp);
+          if (ok) {
+            udpOpener = std::move(uo);  // owc-udp is not running yet
+            std::lock_guard<std::mutex> lk(udpMx);
+            udpSealer = std::move(us);
+          }
+        }
+        if (ok) {
+          std::lock_guard<std::mutex> lk(sendMx);
+          tcpSealer = std::move(sealer);
+        }
+      }
+      secureWipe(&keys, sizeof(keys));
+      hs.reset();  // wipes the ephemeral secret, prk and confirmations
+      if (!ok) {
+        dropRecordLayer();
+        closeTcp();
+        res.reason = DisconnectReason::ProtocolError;
+        res.message = std::string("cannot initialise ") + toString(cipher);
+        return res;
+      }
     }
 
     // ---- session up
@@ -1096,6 +1254,7 @@ struct Client::Impl {
     di.codec_mask = ack.codec_mask;
     di.udp_port = ack.udp_port;
     di.phone_id = ack.phone_id;
+    di.cipher = cipher;
     {
       std::lock_guard<std::mutex> lk(stMx);
       dev = di;
@@ -1114,7 +1273,10 @@ struct Client::Impl {
       rx.haveTcpSeq = false;
       rx.jitter.reset();
       rx.trend.reset();
+      rx.decryptUs.reset();
+      rx.cipher = cipher;
     }
+    udpAuthFailures = 0;
     punched = false;
     capsSeen = negotiatePending = false;
     codecFailure = -1;
@@ -1124,10 +1286,13 @@ struct Client::Impl {
     start.udp.session_id = ack.session_id;
     pushWork(std::move(start));
     sessionUp = true;
-    logf(LogLevel::Info, "connected to %s (%s, Android API %u) via %s", di.device_name.c_str(),
-         di.model.c_str(), di.android_api, p.transport == VideoTransport::Udp ? "UDP" : "TCP");
+    logf(cipher == Cipher::None ? LogLevel::Warn : LogLevel::Info,
+         "connected to %s (%s, Android API %u) via %s, %s", di.device_name.c_str(), di.model.c_str(),
+         di.android_api, p.transport == VideoTransport::Udp ? "UDP" : "TCP",
+         cipher == Cipher::None ? "NOT ENCRYPTED (cipher Off)" : toString(cipher));
     setState(ClientState::Connected);
     if (auth.newKey && ev) ev->onPaired(ack.phone_id, auth.key, di);
+    secureWipe(auth.key.data(), auth.key.size());
     if (ev) ev->onConnected(di);
 
     // ---- UDP
@@ -1137,6 +1302,7 @@ struct Client::Impl {
       std::string err;
       if (!openUdp(o, ack.session_id, err)) {
         sessionUp = false;
+        dropRecordLayer();
         closeTcp();
         res.reason = DisconnectReason::SocketError;
         res.message = "UDP socket: " + err;
@@ -1144,6 +1310,34 @@ struct Client::Impl {
       }
     }
     if (o.auto_start_stream) wantStreaming = true;
+
+    // Pops the next whole message; with a cipher it must be a Sealed record that
+    // opens with p2c_tcp (anything else is fatal: res filled, stop = true).
+    TcpFrameParser::Message sealedMsg;
+    auto nextMsg = [&](TcpFrameParser::Message& out, bool& stop) -> bool {
+      if (!opener) return parser.next(out);
+      if (!parser.next(sealedMsg)) return false;
+      if (sealedMsg.type != MsgType::Sealed) {
+        res.reason = DisconnectReason::ProtocolError;
+        res.message = std::string("unencrypted message (") + owc::toString(sealedMsg.type) +
+                      ") after authentication";
+        stop = true;
+        return false;
+      }
+      const int64_t q0 = qpcNowRaw();
+      if (!opener->open(sealedMsg, out)) {
+        res.reason = DisconnectReason::ProtocolError;
+        res.message = "a TCP record failed authentication (tampered, replayed or reordered)";
+        stop = true;
+        return false;
+      }
+      if (out.type == MsgType::VideoFrame) {
+        const double us = static_cast<double>(qpcNowRaw() - q0) * 1e6 / static_cast<double>(qpcFreq());
+        std::lock_guard<std::mutex> lk(statMx);
+        rx.decryptUs.add(us);
+      }
+      return true;
+    };
 
     // ---- main loop
     const int64_t t0 = steadyMs();
@@ -1223,7 +1417,7 @@ struct Client::Impl {
       bool stop = false;
       TcpFrameParser::Message m;
       int64_t trecv = pcNowUs();
-      while (!stop && parser.next(m)) stop = !handleMsg(m, trecv, res);
+      while (!stop && nextMsg(m, stop)) stop = !handleMsg(m, trecv, res);
       if (stop) break;
 
       fd_set r;
@@ -1249,13 +1443,14 @@ struct Client::Impl {
         res.reason = DisconnectReason::ProtocolError;
         res.message = "bad TCP framing";
       }
-      while (!stop && parser.next(m)) stop = !handleMsg(m, trecv, res);
+      while (!stop && nextMsg(m, stop)) stop = !handleMsg(m, trecv, res);
       if (stop || got < 0) break;
     }
     // ---- teardown
     sessionUp = false;
     closeTcp();
     closeUdp();
+    dropRecordLayer();
     WorkItem end;
     end.kind = WorkItem::StreamEnd;
     pushWork(std::move(end));
@@ -1530,6 +1725,20 @@ struct Client::Impl {
     closeSocket(udp);
   }
 
+  // Session end: destroys the sealers/openers (their key schedules are wiped).
+  // owc-udp must not be running (closeUdp() first, or it was never started).
+  void dropRecordLayer() {
+    {
+      std::lock_guard<std::mutex> lk(sendMx);
+      tcpSealer.reset();
+    }
+    {
+      std::lock_guard<std::mutex> lk(udpMx);
+      udpSealer.reset();
+    }
+    if (!udpThread.joinable()) udpOpener.reset();
+  }
+
   void sendPunch(const sockaddr_in& to, uint32_t sid) {
     UdpHeader h;
     h.type = UdpType::Punch;
@@ -1541,18 +1750,30 @@ struct Client::Impl {
     h.capture_ts_us = 0;
     h.epoch = 0;
     h.flags = 0;
-    uint8_t b[kUdpHeaderSize];
+    uint8_t b[kUdpHeaderSize + kUdpSealOverhead];
     writeUdpHeader(h, b);
     std::lock_guard<std::mutex> lk(udpMx);
-    if (udp != INVALID_SOCKET)
-      sendto(udp, reinterpret_cast<const char*>(b), static_cast<int>(kUdpHeaderSize), 0,
+    // v3: the punch is sealed (empty plaintext); the phone only answers / sends
+    // video to a punch that opens with the session key.
+    const size_t len = udpSealer ? udpSealer->seal(b, kUdpHeaderSize, sizeof(b)) : kUdpHeaderSize;
+    if (udp != INVALID_SOCKET && len)
+      sendto(udp, reinterpret_cast<const char*>(b), static_cast<int>(len), 0,
              reinterpret_cast<const sockaddr*>(&to), sizeof(to));
   }
 
-  // "owc-udp": only drains the socket into the decode queue (research sec. 3.2).
+  // "owc-udp": drains the socket into the decode queue (research sec. 3.2).
+  // v3: each datagram is opened IN PLACE in the receive buffer (still hot in
+  // L1, no extra copy) before the one copy into the work item; the decode
+  // thread only ever sees plaintext. Failures (tampered, replayed, foreign,
+  // plaintext) are dropped and counted. Decrypt cost is summed per frame_seq.
   void udpMain(SOCKET u, uint32_t sid) {
     setThreadName(L"owc-udp");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    UdpOpener* const opener = udpOpener.get();  // owned by this thread until closeUdp()
+    const double usPerTick = 1e6 / static_cast<double>(qpcFreq());
+    bool haveSeq = false;
+    uint32_t curSeq = 0;
+    int64_t seqTicks = 0;
     uint8_t buf[2048];
     while (!udpStop) {
       sockaddr_in from{};
@@ -1561,9 +1782,31 @@ struct Client::Impl {
                        reinterpret_cast<sockaddr*>(&from), &fl);
       if (n <= 0) continue;  // timeout / transient error
       const int64_t arrival = pcNowUs();
+      size_t len = static_cast<size_t>(n);
+      int64_t ticks = 0;
+      if (opener) {
+        const int64_t q0 = qpcNowRaw();
+        if (!opener->open(buf, len, len)) {
+          ++udpAuthFailures;
+          continue;
+        }
+        ticks = qpcNowRaw() - q0;
+      }
       UdpHeader h;
-      if (!readUdpHeader(buf, static_cast<size_t>(n), h)) continue;
+      if (!readUdpHeader(buf, len, h)) continue;
       if (h.session_id != sid) continue;
+      if (opener && (h.type == UdpType::Video || h.type == UdpType::Fec)) {
+        if (haveSeq && h.frame_seq != curSeq) {  // previous frame done: one sample
+          std::lock_guard<std::mutex> lk(statMx);
+          rx.decryptUs.add(static_cast<double>(seqTicks) * usPerTick);
+          seqTicks = 0;
+        }
+        if (!haveSeq || h.frame_seq != curSeq) {
+          curSeq = h.frame_seq;
+          haveSeq = true;
+        }
+        seqTicks += ticks;
+      }
       if (h.type == UdpType::PunchAck) {
         if (!punched.exchange(true)) logf(LogLevel::Info, "UDP path established");
         continue;
@@ -1572,7 +1815,7 @@ struct Client::Impl {
       WorkItem w;
       w.kind = WorkItem::Datagram;
       w.udp = h;
-      w.data.assign(buf + kUdpHeaderSize, buf + n);
+      w.data.assign(buf + kUdpHeaderSize, buf + len);
       w.arrival_us = arrival;
       pushWork(std::move(w));
     }
@@ -2695,6 +2938,7 @@ ClientStats Client::stats() const {
   }
   s.keyframe_requests = impl_->kfRequests;
   s.udp_punched = impl_->punched;
+  s.udp_auth_failures = impl_->udpAuthFailures;
   {
     std::lock_guard<std::mutex> lk(impl_->statMx);
     auto& r = impl_->rx;
@@ -2740,6 +2984,9 @@ ClientStats Client::stats() const {
     s.jitter_buffer_frames = r.jbFrames;
     s.frames_not_presented = r.notPresented;
     s.backlog_drops = r.backlogDrops;
+    s.cipher = r.cipher;
+    s.decrypt_us_avg = r.decryptUs.avg();
+    s.decrypt_us_max = r.decryptUs.max();
   }
   {
     const ColorGrader::Status g = impl_->grader.status();

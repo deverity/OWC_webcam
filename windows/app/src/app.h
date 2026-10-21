@@ -283,5 +283,7 @@ class App : public owc::ClientEvents {
 
 const char* reasonText(owc::DisconnectReason r);
 const char* stateText(owc::ClientState s);
+// Cipher name for the UI (pt-BR; None = "Desligada").
+const char* cipherText(owc::Cipher c);
 
 }  // namespace owcapp

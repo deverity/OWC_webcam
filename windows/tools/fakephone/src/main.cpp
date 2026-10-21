@@ -4,8 +4,11 @@
 //                 [--bitrate 4000000] [--bframes 0] [--profile 0] [--gop-ms 2000]
 //                 [--loss 0] [--fec 0] [--name FakePhone] [--no-discovery] [--verbose]
 //                 [--pair-code 123456] [--pairings-file F] [--paired CLIENT_HEX:KEY_HEX] ...
-// Protocol v2: every client must authenticate. A new PC gets a pairing code,
-// printed on the console (like the phone's notification); type it in OWC.exe.
+//                 [--ciphers aes,chacha,none] [--forge-confirm] [--udp-attack N]
+// Protocol v3: every client must authenticate (CPace pairing / key
+// confirmation) and, unless both sides agree on "none", all traffic after it is
+// encrypted. A new PC gets a pairing code, printed on the console (like the
+// phone's notification); type it in OWC.exe.
 // Runs until Ctrl+C / Enter.
 #include "fake_phone.h"
 
@@ -44,7 +47,7 @@ void usage() {
       "  --replay-fps N     replay frame rate (default 30)\n"
       "  --rotation DEG     VideoFormat rotation hint\n"
       "  --strip-ps         send IDRs without inline SPS/PPS (csd only)\n"
-      "  pairing (protocol v2; every client must authenticate):\n"
+      "  pairing (protocol v3; every client must authenticate, the code never travels):\n"
       "  --pair-code NNNNNN fixed pairing code (default: random, printed when a PC pairs)\n"
       "  --pairings-file F  keep pairings across runs in this file\n"
       "  --paired C:K       preload a pairing: client_id hex (32) : key hex (64)\n"
@@ -52,6 +55,10 @@ void usage() {
       "  --pair-attempts N  wrong codes before Locked (default 3)\n"
       "  --pair-lifetime S  code lifetime in seconds (default 120)\n"
       "  --pair-lockout S   lockout after Locked (default 30)\n"
+      "  encryption (protocol v3):\n"
+      "  --ciphers LIST     ciphers this phone runs: aes,chacha,none (default: all this CPU can run)\n"
+      "  --forge-confirm    TEST: answer AuthResult Ok with a wrong confirmation (impostor)\n"
+      "  --udp-attack N     TEST: after every Nth datagram send a tampered copy + a replay\n"
       "  --verbose\n");
 }
 }  // namespace
@@ -112,6 +119,21 @@ int main(int argc, char** argv) {
       pc.name = "preloaded";
       cfg.paired_clients.push_back(pc);
     }
+    else if (a == "--ciphers") {
+      const std::string v = next("--ciphers");
+      cfg.cipher_mask = 0;
+      if (v.find("aes") != std::string::npos) cfg.cipher_mask |= owc::cipherBit(owc::Cipher::Aes128Gcm);
+      if (v.find("chacha") != std::string::npos) cfg.cipher_mask |= owc::cipherBit(owc::Cipher::ChaCha20Poly1305);
+      if (v.find("none") != std::string::npos) cfg.cipher_mask |= owc::cipherBit(owc::Cipher::None);
+      if (!cfg.cipher_mask) {
+        fprintf(stderr, "--ciphers: expected a list of aes, chacha, none\n");
+        return 2;
+      }
+      if ((cfg.cipher_mask & owc::cipherBit(owc::Cipher::Aes128Gcm)) && !owc::hardwareAesAvailable())
+        fprintf(stderr, "warning: --ciphers aes but this CPU has no AES-NI/PCLMULQDQ\n");
+    }
+    else if (a == "--forge-confirm") cfg.forge_phone_confirm = true;
+    else if (a == "--udp-attack") cfg.udp_attack_every = u32("--udp-attack");
     else if (a == "--verbose") cfg.verbose = true;
     else if (a == "--help" || a == "-h") { usage(); return 0; }
     else { fprintf(stderr, "unknown argument %s\n", a.c_str()); usage(); return 2; }
@@ -129,6 +151,10 @@ int main(int argc, char** argv) {
     const owc::Id16 id = phone.phoneId();
     printf("phone_id %s, %zu paired PC(s), pairing code: %s\n", owc::toHex(id.data(), id.size()).c_str(),
            phone.pairedClients().size(), cfg.pair_code.empty() ? "random (printed on PairBegin)" : cfg.pair_code.c_str());
+    const uint32_t mask = cfg.cipher_mask ? cfg.cipher_mask : owc::localCipherMask();
+    printf("ciphers:%s%s%s (hardware AES %s)\n", (mask & owc::cipherBit(owc::Cipher::Aes128Gcm)) ? " aes" : "",
+           (mask & owc::cipherBit(owc::Cipher::ChaCha20Poly1305)) ? " chacha" : "",
+           (mask & owc::cipherBit(owc::Cipher::None)) ? " none" : "", owc::hardwareAesAvailable() ? "yes" : "no");
   }
   printf("Ctrl+C to quit\n");
   fflush(stdout);

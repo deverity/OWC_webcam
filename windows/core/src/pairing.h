@@ -30,5 +30,9 @@ bool removePairing(std::vector<PairedPhone>& v, const PhoneId& phone_id);
 // Short, human-readable id for logs: first 8 hex chars.
 std::string shortHex(const Id16& id);
 
+// n bytes from the system CSPRNG (BCryptGenRandom). false if CNG failed (the
+// buffer is then wiped: never use it as a secret).
+bool secureRandom(void* p, size_t n);
+
 }  // namespace detail
 }  // namespace owc

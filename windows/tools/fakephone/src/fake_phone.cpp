@@ -5,6 +5,7 @@
 #include <mswsock.h>
 #include <windows.h>
 
+#include <owc/crypto.h>
 #include <owc/protocol.h>
 
 #include "h264_encoder.h"
@@ -127,12 +128,19 @@ struct FakePhone::Impl {
   // session
   std::mutex sendMx;
   SOCKET client = INVALID_SOCKET;
+  std::unique_ptr<TcpSealer> tcpSealer;    // sendMx: p2c_tcp, set right after AuthResult Ok
   std::atomic<bool> sessionActive{false};
   std::atomic<uint32_t> sessionId{0};
   std::atomic<int> transport{0};
   std::mutex udpMx;
   bool haveUdpPeer = false;
   sockaddr_in udpPeer{};
+  std::unique_ptr<UdpOpener> udpOpener;    // udpMx: c2p_udp (punches)
+  std::mutex udpSendMx;                    // UDP sealing + sendto (stream thread / PunchAck)
+  std::unique_ptr<UdpSealer> udpSealer;    // udpSendMx: p2c_udp
+  std::atomic<uint32_t> tcpVideoFrames{0}; // per session (tcp_*_after_frames)
+  uint32_t udpAttackCount = 0;             // udpSendMx
+  std::vector<uint8_t> lastDatagram;       // udpSendMx: for replays
 
   // stream params (pmx)
   mutable std::mutex pmx;
@@ -208,11 +216,13 @@ struct FakePhone::Impl {
     }
     return true;
   }
+  // Sealed (p2c_tcp) from the first message after AuthResult Ok, like the phone.
   bool sendMsg(MsgType t, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> b;
-    appendTcpMessage(b, t, payload);
     std::lock_guard<std::mutex> lk(sendMx);
     if (client == INVALID_SOCKET) return false;
+    if (tcpSealer) tcpSealer->seal(t, payload.data(), payload.size(), b);
+    else appendTcpMessage(b, t, payload);
     return sendBytes(client, b.data(), b.size());
   }
 
@@ -374,12 +384,16 @@ struct FakePhone::Impl {
     }
   }
 
-  bool readHello(SOCKET s, TcpFrameParser& parser, Hello& h) {
+  // `raw` (optional) receives the exact Hello payload (handshake transcript).
+  bool readHello(SOCKET s, TcpFrameParser& parser, Hello& h, std::vector<uint8_t>* raw = nullptr) {
     const int64_t deadline = pcUs() + 3000000;
     uint8_t buf[4096];
     while (pcUs() < deadline && !stopFlag) {
       TcpFrameParser::Message m;
-      if (parser.next(m)) return m.type == MsgType::Hello && decode(m.payload.data(), m.payload.size(), h);
+      if (parser.next(m)) {
+        if (raw) *raw = m.payload;
+        return m.type == MsgType::Hello && decode(m.payload.data(), m.payload.size(), h);
+      }
       if (!readable(s, 50)) continue;
       int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
       if (n <= 0) return false;
@@ -406,21 +420,37 @@ struct FakePhone::Impl {
   void sessionMain(SOCKET s) {
     TcpFrameParser parser;
     Hello h;
-    if (!readHello(s, parser, h)) {
+    std::vector<uint8_t> helloBytes;
+    if (!readHello(s, parser, h, &helloBytes)) {
       closesocket(s);
       sessionActive = false;
       return;
     }
+    // v3 key exchange: fresh ephemeral key per connection, cipher from the PC's offer.
+    std::unique_ptr<Handshake> hs;
+    {
+      Key32 eph{};
+      randomBytes(eph.data(), eph.size());
+      hs.reset(new Handshake(Handshake::Role::Phone, eph));
+      secureWipe(eph.data(), eph.size());
+    }
+    const uint32_t phoneMask = cfg.cipher_mask ? cfg.cipher_mask : localCipherMask();
+    Cipher cipher = Cipher::None;
     HelloAck ack;
     ack.status = HelloStatus::AuthRequired;
     if (h.magic != kMagic) ack.status = HelloStatus::BadMagic;
     else if (h.version != kProtocolVersion) ack.status = HelloStatus::VersionMismatch;
+    else if (!chooseCipher(h.cipher_mask, phoneMask, cipher)) {
+      log("no common cipher (PC offers 0x%x, phone runs 0x%x): VersionMismatch", h.cipher_mask, phoneMask);
+      ack.status = HelloStatus::VersionMismatch;
+    }
     {
       std::lock_guard<std::mutex> lk(amx);
       ack.phone_id = phoneId;
       ack.paired = findPairing(h.client_id) != nullptr;
     }
-    randomBytes(ack.nonce.data(), ack.nonce.size());
+    ack.eph_pub = hs->ephPublic();
+    ack.cipher = static_cast<uint8_t>(cipher);
     std::uniform_int_distribution<uint32_t> d(1, 0xFFFFFFFEu);
     ack.session_id = d(rng);
     ack.udp_port = uport;
@@ -435,11 +465,45 @@ struct FakePhone::Impl {
       std::lock_guard<std::mutex> lk(sendMx);
       client = s;
     }
-    sendMsg(MsgType::HelloAck, encode(ack));
+    const std::vector<uint8_t> ackBytes = encode(ack);
+    sendMsg(MsgType::HelloAck, ackBytes);
     kick = false;
     rejectReq = false;
     unpairKick = false;
-    if (ack.status != HelloStatus::AuthRequired || !authenticate(s, parser, h, ack)) {
+    bool authed = ack.status == HelloStatus::AuthRequired &&
+                  hs->begin(helloBytes.data(), helloBytes.size(), ackBytes.data(), ackBytes.size(), h.eph_pub,
+                            cipher) &&
+                  authenticate(s, parser, h, *hs);
+    // Record layer: everything after the (plain) AuthResult Ok is sealed.
+    std::unique_ptr<TcpOpener> opener;  // c2p_tcp, this thread
+    if (authed && cipher != Cipher::None) {
+      SessionKeys keys = hs->keys();
+      opener.reset(new TcpOpener);
+      std::unique_ptr<TcpSealer> sealer(new TcpSealer);
+      std::unique_ptr<UdpSealer> us(new UdpSealer);
+      std::unique_ptr<UdpOpener> uo(new UdpOpener);
+      authed = opener->init(keys.c2p_tcp) && sealer->init(keys.p2c_tcp) && us->init(keys.p2c_udp) &&
+               uo->init(keys.c2p_udp);
+      secureWipe(&keys, sizeof(keys));
+      if (authed) {
+        {
+          std::lock_guard<std::mutex> lk(sendMx);
+          tcpSealer = std::move(sealer);
+        }
+        {
+          std::lock_guard<std::mutex> lk(udpSendMx);
+          udpSealer = std::move(us);
+          udpAttackCount = 0;
+          lastDatagram.clear();
+        }
+        std::lock_guard<std::mutex> lk(udpMx);
+        udpOpener = std::move(uo);
+      } else {
+        log("cannot initialise %s", toString(cipher));
+      }
+    }
+    hs.reset();  // wipes the handshake secrets
+    if (!authed) {
       Sleep(50);
       {
         std::lock_guard<std::mutex> lk(sendMx);
@@ -449,6 +513,7 @@ struct FakePhone::Impl {
       sessionActive = false;
       return;
     }
+    tcpVideoFrames = 0;
     sessionId = ack.session_id;
     transport = static_cast<int>(h.transport);
     {
@@ -458,8 +523,10 @@ struct FakePhone::Impl {
     {
       std::lock_guard<std::mutex> lk(cmx);
       ++c.sessions;
+      c.last_cipher = static_cast<uint8_t>(cipher);
     }
-    log("client '%s' connected (%s)", h.client_name.c_str(), h.transport == VideoTransport::Udp ? "UDP" : "TCP");
+    log("client '%s' connected (%s, %s)", h.client_name.c_str(), h.transport == VideoTransport::Udp ? "UDP" : "TCP",
+        toString(cipher));
     resetParams();
     sendMsg(MsgType::Capabilities, encode(caps()));
     LogMsg lm;
@@ -508,8 +575,20 @@ struct FakePhone::Impl {
         st.thermal_status = 0;
         sendMsg(MsgType::Stats, encode(st));
       }
-      TcpFrameParser::Message m;
-      while (run && parser.next(m)) run = handle(m);
+      TcpFrameParser::Message raw, m;
+      while (run && parser.next(raw)) {
+        if (opener) {  // like the phone: plaintext or a record that does not open is fatal
+          if (raw.type != MsgType::Sealed || !opener->open(raw, m)) {
+            log("PC record %s: closing", raw.type != MsgType::Sealed ? "not sealed" : "failed to open");
+            count(&Counters::tcp_open_failures);
+            run = false;
+            break;
+          }
+        } else {
+          m = std::move(raw);
+        }
+        run = handle(m);
+      }
       if (!run) break;
       if (!readable(s, 20)) continue;
       int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
@@ -518,9 +597,19 @@ struct FakePhone::Impl {
     }
     sessionAuthed = false;
     stopStream();
+    sessionId = 0;
     {
       std::lock_guard<std::mutex> lk(sendMx);
       client = INVALID_SOCKET;
+      tcpSealer.reset();
+    }
+    {
+      std::lock_guard<std::mutex> lk(udpSendMx);
+      udpSealer.reset();
+    }
+    {
+      std::lock_guard<std::mutex> lk(udpMx);
+      udpOpener.reset();
     }
     closesocket(s);
     log("client disconnected");
@@ -564,21 +653,42 @@ struct FakePhone::Impl {
       if (!findPairing(pc.client_id)) pairings.push_back(pc);
     }
   }
-  void authResult(AuthStatus st, uint8_t attempts, uint16_t seconds, const Key32& key = Key32{}) {
+  void authResult(AuthStatus st, uint8_t attempts, uint16_t seconds, const Key32& cpacePub = Key32{},
+                  const Key32& confirm = Key32{}) {
     AuthResult r;
     r.status = st;
     r.attempts_left = attempts;
     r.seconds = seconds;
-    r.key = key;
+    r.cpace_pub = cpacePub;
+    r.confirm = confirm;
     sendMsg(MsgType::AuthResult, encode(r));
+  }
+  // AuthResult Ok with the phone's key confirmation (or a forged one: test attack).
+  void authOk(const Handshake& hs) {
+    Key32 confirm = hs.phoneConfirm();
+    if (cfg.forge_phone_confirm) {
+      confirm[0] ^= 0x01;
+      log("TEST ATTACK: AuthResult Ok with a forged confirmation");
+    }
+    authResult(AuthStatus::Ok, 0, 0, Key32{}, confirm);
+    secureWipe(confirm.data(), confirm.size());
+  }
+  // A fresh CPace share Yb for `code` (PairBegin and after every wrong code).
+  Key32 cpaceShare(Handshake& hs, const std::string& code) {
+    Key32 rnd{};
+    randomBytes(rnd.data(), rnd.size());
+    const Key32 yb = hs.cpaceStart(code, rnd);
+    secureWipe(rnd.data(), rnd.size());
+    return yb;
   }
   void count(uint64_t Counters::*field) {
     std::lock_guard<std::mutex> lk(cmx);
     ++(c.*field);
   }
 
-  // Protocol v2 PAIRING, phone side. true = authenticated (the session may start).
-  bool authenticate(SOCKET s, TcpFrameParser& parser, const Hello& h, const HelloAck& ack) {
+  // Protocol v3 PAIRING, phone side (hs.begin() done). true = authenticated and
+  // AuthResult Ok sent (the session may start; the caller installs the sealers).
+  bool authenticate(SOCKET s, TcpFrameParser& parser, const Hello& h, Handshake& hs) {
     int64_t deadline = pcUs() + int64_t(cfg.auth_timeout_s) * 1000000;
     bool codeActive = false;
     std::string code;
@@ -623,16 +733,23 @@ struct FakePhone::Impl {
           count(&Counters::auth_proofs);
           AuthProof ap;
           if (codeActive || !decode(p, n, ap)) break;  // a pairing is pending: only PairCode counts
-          bool ok = false;
+          bool ok = false, known = false;
+          Key32 key{};
           {
             std::lock_guard<std::mutex> lk(amx);
             if (const auto* pc = findPairing(h.client_id)) {
-              const Key32 want = authMac(pc->key, phoneId, h.client_id, ack.nonce);
-              ok = constantTimeEqual(want.data(), ap.mac.data(), want.size());
+              key = pc->key;
+              known = true;
             }
           }
+          if (known) {
+            hs.usePairingKey(key);
+            secureWipe(key.data(), key.size());
+            const Key32 want = hs.pcConfirm();
+            ok = constantTimeEqual(want.data(), ap.confirm.data(), want.size());
+          }
           if (ok) {
-            authResult(AuthStatus::Ok, 0, 0);
+            authOk(hs);
             count(&Counters::auth_ok);
             vlog("client '%s' authenticated (AuthProof)", h.client_name.c_str());
             return true;
@@ -678,7 +795,8 @@ struct FakePhone::Impl {
           codeActive = true;
           log("PAIRING CODE for '%s': %s (valid %u s)", h.client_name.c_str(), code.c_str(),
               static_cast<unsigned>(cfg.pair_code_lifetime_s));
-          authResult(AuthStatus::CodeShown, static_cast<uint8_t>(attempts), cfg.pair_code_lifetime_s);
+          authResult(AuthStatus::CodeShown, static_cast<uint8_t>(attempts), cfg.pair_code_lifetime_s,
+                     cpaceShare(hs, code));
           break;
         }
         case MsgType::PairCode: {
@@ -686,12 +804,17 @@ struct FakePhone::Impl {
           count(&Counters::pair_codes);
           PairCode pcm;
           if (!decode(p, n, pcm)) break;
-          if (pcm.code.size() == code.size() &&
-              constantTimeEqual(reinterpret_cast<const uint8_t*>(pcm.code.data()),
-                                reinterpret_cast<const uint8_t*>(code.data()), code.size())) {
+          // CPace: the code is never on the wire; a matching code gives both sides
+          // the same K, which the PC proves with pcConfirm.
+          bool match = hs.cpaceFinish(pcm.cpace_pub);
+          if (match) {
+            const Key32 want = hs.pcConfirm();
+            match = constantTimeEqual(want.data(), pcm.confirm.data(), want.size());
+          }
+          if (match) {
             FakePhoneConfig::PairedClient pc;
             pc.client_id = h.client_id;
-            randomBytes(pc.key.data(), pc.key.size());
+            pc.key = hs.newPairingKey();
             pc.name = h.client_name;
             {
               std::lock_guard<std::mutex> lk(amx);
@@ -704,7 +827,8 @@ struct FakePhone::Impl {
               savePairings();
               wrongCodes = 0;
             }
-            authResult(AuthStatus::Ok, 0, 0, pc.key);
+            secureWipe(pc.key.data(), pc.key.size());
+            authOk(hs);
             count(&Counters::pair_ok);
             log("paired with '%s'", h.client_name.c_str());
             return true;
@@ -726,7 +850,7 @@ struct FakePhone::Impl {
             log("wrong pairing code: locked for %u s", static_cast<unsigned>(cfg.pair_lockout_s));
             return false;
           }
-          authResult(AuthStatus::WrongCode, static_cast<uint8_t>(attempts), 0);
+          authResult(AuthStatus::WrongCode, static_cast<uint8_t>(attempts), 0, cpaceShare(hs, code));
           log("wrong pairing code (%d attempts left)", attempts);
           break;
         }
@@ -830,9 +954,19 @@ struct FakePhone::Impl {
       int n = recvfrom(usock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                        reinterpret_cast<sockaddr*>(&from), &fl);
       if (n <= 0) continue;
+      size_t len = static_cast<size_t>(n);
+      {
+        // Encrypted session: only a punch sealed with the session key counts
+        // (nobody else can redirect the stream to another address).
+        std::lock_guard<std::mutex> lk(udpMx);
+        if (udpOpener && !udpOpener->open(buf, len, len)) {
+          count(&Counters::punches_rejected);
+          continue;
+        }
+      }
       UdpHeader h;
-      if (!readUdpHeader(buf, static_cast<size_t>(n), h) || h.type != UdpType::Punch) continue;
-      if (!sessionActive || h.session_id != sessionId) continue;
+      if (!readUdpHeader(buf, len, h) || h.type != UdpType::Punch) continue;
+      if (!sessionActive || sessionId == 0 || h.session_id != sessionId) continue;
       {
         std::lock_guard<std::mutex> lk(udpMx);
         if (!haveUdpPeer) vlog("UDP punch from port %u", ntohs(from.sin_port));
@@ -842,9 +976,11 @@ struct FakePhone::Impl {
       UdpHeader a;
       a.type = UdpType::PunchAck;
       a.session_id = h.session_id;
-      uint8_t out[kUdpHeaderSize];
+      uint8_t out[kUdpHeaderSize + kUdpSealOverhead];
       writeUdpHeader(a, out);
-      sendto(usock, reinterpret_cast<const char*>(out), static_cast<int>(kUdpHeaderSize), 0,
+      std::lock_guard<std::mutex> lk(udpSendMx);
+      const size_t outLen = udpSealer ? udpSealer->seal(out, kUdpHeaderSize, sizeof(out)) : kUdpHeaderSize;
+      sendto(usock, reinterpret_cast<const char*>(out), static_cast<int>(outLen), 0,
              reinterpret_cast<sockaddr*>(&from), sizeof(from));
     }
   }
@@ -918,9 +1054,32 @@ struct FakePhone::Impl {
       vh.frame_seq = seq;
       vh.capture_ts_us = ts;
       vh.flags = flags;
-      std::vector<uint8_t> payload;
-      encodeVideoFrame(vh, au, n, payload);
-      sendMsg(MsgType::VideoFrame, payload);
+      const uint32_t nth = ++tcpVideoFrames;
+      std::lock_guard<std::mutex> lk(sendMx);
+      if (client == INVALID_SOCKET) return;
+      std::vector<uint8_t> b;
+      if (tcpSealer) {
+        // Like the phone's Sender: header + AU sealed in one pass, no payload copy.
+        std::vector<uint8_t> hdr;
+        encodeVideoFrame(vh, nullptr, 0, hdr);
+        b.reserve(kTcpHeaderSize + 2 + hdr.size() + n + kAeadTagSize);
+        tcpSealer->seal2(MsgType::VideoFrame, hdr.data(), hdr.size(), au, n, b);
+        if (cfg.tcp_tamper_after_frames && nth == cfg.tcp_tamper_after_frames) {
+          b[kTcpHeaderSize + 4] ^= 0x01;  // one ciphertext bit (inner header/payload)
+          log("TEST ATTACK: tampered TCP record (video frame %u)", nth);
+        }
+      } else {
+        std::vector<uint8_t> payload;
+        encodeVideoFrame(vh, au, n, payload);
+        appendTcpMessage(b, MsgType::VideoFrame, payload);
+      }
+      if (cfg.tcp_plain_after_frames && nth == cfg.tcp_plain_after_frames) {
+        LogMsg lm;
+        lm.text = "plaintext injected after authentication";
+        appendTcpMessage(b, MsgType::Log, encode(lm));
+        log("TEST ATTACK: plaintext Log after video frame %u", nth);
+      }
+      sendBytes(client, b.data(), b.size());
       return;
     }
     sockaddr_in to{};
@@ -937,26 +1096,54 @@ struct FakePhone::Impl {
     base.epoch = static_cast<uint16_t>(ep & 0xFFFF);
     base.flags = flags;
     std::uniform_real_distribution<double> u(0.0, 100.0);
-    uint64_t sent = 0, dropped = 0, fecN = 0;
+    uint64_t sent = 0, dropped = 0, fecN = 0, tampered = 0, replays = 0;
+    std::lock_guard<std::mutex> ul(udpSendMx);
+    const bool sealed = udpSealer != nullptr;
+    // A sealed sender fragments so that header + payload + counter + tag still fit.
+    const size_t maxPayload = sealed ? kUdpMaxPayloadSealed : kUdpMaxPayload;
+    uint8_t sb[kUdpMaxDatagram + 64];
+    auto send = [&](const uint8_t* d, size_t len) {
+      sendto(usock, reinterpret_cast<const char*>(d), static_cast<int>(len), 0,
+             reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    };
     auto sink = [&](const uint8_t* d, size_t len) {
       if (cfg.loss_percent > 0 && u(lossRng) < cfg.loss_percent) {
         ++dropped;
         return;
       }
-      sendto(usock, reinterpret_cast<const char*>(d), static_cast<int>(len), 0,
-             reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+      if (sealed) {  // in place in a scratch datagram, like the phone's sender
+        std::memcpy(sb, d, len);
+        len = udpSealer->seal(sb, len, sizeof(sb));
+        if (!len) return;
+        d = sb;
+      }
+      send(d, len);
       ++sent;
+      if (cfg.udp_attack_every && ++udpAttackCount % cfg.udp_attack_every == 0) {
+        uint8_t t[kUdpMaxDatagram + 64];
+        std::memcpy(t, d, len);
+        t[len - 1] ^= 0x80;  // tag (sealed) / payload (plain) bit
+        send(t, len);
+        ++tampered;
+        if (!lastDatagram.empty()) {
+          send(lastDatagram.data(), lastDatagram.size());  // replay of an already delivered datagram
+          ++replays;
+        }
+      }
+      if (cfg.udp_attack_every) lastDatagram.assign(d, d + len);
     };
-    const size_t frags = packetize(base, au, n, sink);
+    const size_t frags = packetize(base, au, n, sink, maxPayload);
     if (fecPct != 0 && frags > 0) {
       const int pct = fecPct < 0 ? 20 : fecPct;
       const uint8_t m = fecParityCount(static_cast<uint16_t>(frags), pct);
-      if (m) fecN = packetizeFec(base, au, n, m, sink);
+      if (m) fecN = packetizeFec(base, au, n, m, sink, maxPayload);
     }
     std::lock_guard<std::mutex> lk(cmx);
     c.datagrams_sent += sent;
     c.datagrams_dropped += dropped;
     c.fec_datagrams += fecN;
+    c.udp_tampered_sent += tampered;
+    c.udp_replays_sent += replays;
   }
 
   // ---------------------------------------------------------------- replay

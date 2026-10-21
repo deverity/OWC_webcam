@@ -1,9 +1,11 @@
 // owc_core — PC side of the OWC phone-webcam link.
 //
 // One owc::Client = one session with one phone:
-//   connect -> Hello/HelloAck -> authentication (AuthProof, or pairing with a
-//   6-digit code shown on the phone, see PAIRING below) -> Capabilities/
-//   ParamState cache -> StartStream
+//   connect -> Hello/HelloAck (ephemeral X25519 key exchange + cipher choice)
+//   -> authentication (key confirmation with a stored pairing key, or CPace
+//   pairing with a 6-digit code shown on the phone, see PAIRING below)
+//   -> every later TCP message and UDP datagram AEAD-encrypted (ENCRYPTION)
+//   -> Capabilities/ParamState cache -> StartStream
 //   -> receive H.264/HEVC over TCP (VideoFrame) or UDP (fragments)
 //   -> Media Foundation decoder (D3D11/DXVA hardware, software fallback)
 //   -> optional rotate/mirror on NV12 -> owc::ShmWriter (virtual cam / OBS)
@@ -24,9 +26,32 @@
 //                Invokes every ClientEvents callback EXCEPT onFrame.
 //   "owc-decode" Media Foundation decoder, transform, shm publish, jitter
 //                buffer pacing. Invokes ClientEvents::onFrame.
-//   "owc-udp"    (UDP sessions only, high priority) only drains the UDP socket
-//                into the decode queue; FrameAssembler/FEC run on owc-decode.
-//                Never invokes callbacks.
+//   "owc-udp"    (UDP sessions only, high priority) drains the UDP socket,
+//                opens (decrypts + authenticates + replay-checks) each datagram
+//                in place in its receive buffer and queues the plaintext for
+//                owc-decode; FrameAssembler/FEC run on owc-decode. Never invokes
+//                callbacks.
+// ============================================================== ENCRYPTION
+// Protocol v3 (owc/crypto.h). Per connection attempt: a fresh X25519 secret
+// (BCryptGenRandom), Hello offers cipherMaskFor(ClientOptions::cipher), the
+// phone picks one in HelloAck; owc::Handshake derives everything from the exact
+// Hello/HelloAck bytes. After the verified AuthResult Ok, with a cipher other
+// than None:
+//   TCP PC->phone   TcpSealer, under the send lock of whatever thread sends
+//                   (owc-net, or the caller of setParam()/sendCommand()...):
+//                   seal and send are one critical section, so the implicit
+//                   record counter always matches the wire order.
+//   TCP phone->PC   TcpOpener on owc-net, right where the parser yields each
+//                   record (records already buffered with the AuthResult are
+//                   opened the same way). Plaintext or a record that does not
+//                   open -> ProtocolError (session dropped).
+//   UDP PC->phone   UdpSealer on owc-net (punches, under the UDP socket lock).
+//   UDP phone->PC   UdpOpener on owc-udp, in place in the receive buffer before
+//                   the one copy into the decode queue: no extra thread, copy or
+//                   queue hop on the video path. Failures are dropped and
+//                   counted (ClientStats::udp_auth_failures).
+// Session secrets (handshake, key schedules) are wiped when the session ends.
+//
 // Callbacks must return quickly (they stall the thread they run on — a slow
 // onFrame directly adds latency; a slow net callback delays ping replies and
 // UDP draining). Do not block on UI-thread work inside a callback; copy and
@@ -50,6 +75,7 @@
 #include <string>
 #include <vector>
 
+#include <owc/crypto.h>
 #include <owc/protocol.h>
 
 namespace owc {
@@ -96,6 +122,10 @@ enum class DisconnectReason : uint8_t {
   NotPaired,         // auto-reconnect found that the phone no longer accepts this PC (it was
                      // removed on the phone; onKeyRejected fired). Auto-reconnects never start a
                      // pairing: call connect() again to pair.
+  PhoneNotAuthentic, // protocol v3: whatever answered accepted our proof/code but could not prove
+                     // it holds the same key (AuthResult Ok with a wrong confirmation): possible
+                     // interception (impostor / relay). Failed, never auto-reconnected; the stored
+                     // key is KEPT (the real phone still has it).
 };
 
 enum class DecoderMode : uint8_t {
@@ -108,6 +138,21 @@ enum class DecoderMode : uint8_t {
 };
 
 enum class LogSource : uint8_t { Client = 0, Phone = 1 };
+
+// Session encryption offered in Hello (ClientOptions::cipher). The phone picks
+// from what is offered; authentication is mandatory with every choice.
+//   Auto: every AEAD this PC runs (AES-128-GCM when the CPU has AES-NI +
+//         PCLMULQDQ, else ChaCha20-Poly1305); the phone prefers AES-128-GCM if
+//         both sides have hardware AES.
+//   Aes128Gcm / ChaCha20Poly1305: only that cipher (AES without hardware support
+//         on this PC falls back to ChaCha20-Poly1305 with a warning). A phone that
+//         cannot run it answers VersionMismatch ("cipher not supported").
+//   Off: no encryption (v2-like plaintext after authentication). INSECURE: anyone
+//         on the network can watch the video and inject commands/frames.
+enum class CipherPreference : uint8_t { Auto = 0, Aes128Gcm = 1, ChaCha20Poly1305 = 2, Off = 3 };
+
+// The Hello::cipher_mask a preference offers on this PC.
+uint32_t cipherMaskFor(CipherPreference p);
 
 // Which codec the client asks the phone for (ClientOptions::codec_preference).
 //   Auto: first of AV1 > HEVC that the phone advertises (HelloAck codec_mask)
@@ -139,6 +184,7 @@ struct DecoderCapabilities {
 const char* toString(ClientState);
 const char* toString(DisconnectReason);
 const char* toString(DecoderMode);
+const char* toString(CipherPreference);
 
 // ------------------------------------------------------------------ options
 // User transform applied on the PC to decoded NV12 before publishing.
@@ -341,20 +387,36 @@ struct ClientOptions {
   // Local address the UDP video socket binds to ("0.0.0.0" = all interfaces).
   // Effect: next connect.
   std::string udp_bind_address = "0.0.0.0";
+
+  // Session encryption (see CipherPreference / ENCRYPTION). Effect: next
+  // connect. Latency: decryption runs where the bytes are already touched
+  // (owc-net for TCP records, owc-udp for datagrams, in place, no extra copy or
+  // thread). Measured (owc_crypto_bench, x86-64 laptop): AES-128-GCM with
+  // AES-NI ~1-2 GB/s = ~20 us per 25 KB P-frame, ~0.1-0.2 ms per 200 KB
+  // keyframe; ChaCha20-Poly1305 (portable) ~240 MB/s = ~0.1 ms per P-frame,
+  // ~0.85 ms per keyframe (see ClientStats::decrypt_us_avg). Off saves only
+  // that and exposes the stream: keep Auto (picks AES-GCM when both CPUs have it).
+  CipherPreference cipher = CipherPreference::Auto;
 };
 
 // ------------------------------------------------------------------ pairing
-// Protocol v2 (PAIRING in owc/protocol.h): the phone accepts nothing before
+// Protocol v3 (PAIRING in owc/protocol.h): the phone accepts nothing before
 // the connection is authenticated. This PC is identified by
 // ConnectParams::client_id; a phone by HelloAck::phone_id. Pairing gives the PC
 // a 32-byte key for that phone. owc::Client never stores anything on disk: the
 // application persists client_id and the keys (protect the keys at rest).
-//   have a key for phone_id AND HelloAck::paired -> AuthProof, no user interaction
+//   have a key for phone_id AND HelloAck::paired -> AuthProof (key confirmation
+//        bound to this connection's ephemeral keys), no user interaction; the
+//        phone's AuthResult Ok carries its own confirmation, verified here
+//        (mismatch -> Failed/PhoneNotAuthentic, key kept)
 //   phone refuses it (AuthResult NotPaired) or does not know this PC
 //        -> ClientEvents::onKeyRejected (forget the key), then pairing:
 //   no key -> PairBegin: the phone shows a 6-digit code, state Pairing,
 //        ClientEvents::onPairing; the user types it -> submitPairingCode()
-//        -> AuthResult Ok + key -> ClientEvents::onPaired (persist it) -> Connected
+//        -> CPace PAKE (the code never travels; an eavesdropper learns nothing,
+//        an active attacker gets one guess per attempt) -> AuthResult Ok, the
+//        phone's confirmation verified -> both derive the same new key
+//        -> ClientEvents::onPaired (persist it) -> Connected
 //        WrongCode -> onPairing (wrong_code, attempts_left), still Pairing
 //        Locked / Expired / Rejected -> Failed (PairingLocked/Expired/Rejected)
 // Only a connect() may start a pairing (PairBegin), at most once, in its first
@@ -368,7 +430,8 @@ struct ClientOptions {
 using PhoneId = Id16;   // HelloAck::phone_id: random, persisted per phone install
 using ClientId = Id16;  // Hello::client_id: random, persisted per PC install
 
-// One pairing held by this PC.
+// One pairing held by this PC. Keys stored by v2 builds stay valid in v3 (same
+// 32-byte key; only the proof built from it changed).
 struct PairedPhone {
   PhoneId phone_id{};
   Key32 key{};           // secret: keep it protected at rest (e.g. DPAPI)
@@ -419,6 +482,7 @@ struct DeviceInfo {
   uint32_t codec_mask = 0;          // codecBit(Codec::H264) | codecBit(Codec::Hevc)
   uint16_t udp_port = 0;
   PhoneId phone_id{};               // stable per phone install: key of the pairing
+  Cipher cipher = Cipher::None;     // negotiated session cipher (HelloAck::cipher)
 };
 
 // ------------------------------------------------------------------ frames
@@ -594,7 +658,17 @@ struct ClientStats {
   double delay_gradient_ms = 0;  // least-squares slope of one-way delay over the last 20
                                  // frames, as ms of delay change across that span (>0 = queueing)
   uint32_t keyframe_requests = 0;
-  bool udp_punched = false;      // PunchAck received
+  bool udp_punched = false;      // PunchAck received (sealed: it proved the session key)
+
+  // encryption (ClientOptions::cipher; session values, reset per session)
+  Cipher cipher = Cipher::None;  // negotiated cipher of the current/last session
+  // Video decryption cost per frame (TCP: one VideoFrame record; UDP: all
+  // datagrams of the frame, FEC included), on the thread that received it, over
+  // the last ~120 frames. 0 with Cipher::None.
+  double decrypt_us_avg = 0, decrypt_us_max = 0;
+  // UDP datagrams dropped because they did not open with the session key:
+  // tampered, replayed / too old, foreign or plaintext. The stream continues.
+  uint64_t udp_auth_failures = 0;
 
   // video
   bool has_format = false;
