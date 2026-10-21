@@ -115,6 +115,7 @@ Copy-Required (Join-Path $repo 'README.md') $stage 'README.md'
 # ---- THIRD_PARTY_NOTICES.txt -----------------------------------------------
 $imguiLic = Join-Path $repo 'windows\third_party\imgui\LICENSE.txt'
 $obsLic = Join-Path $repo 'windows\third_party\obs\LICENSE'
+$monoLic = Join-Path $repo 'protocol\third_party\monocypher\LICENCE.md'
 $notice = New-Object System.Text.StringBuilder
 [void]$notice.AppendLine('OWC - third-party notices')
 [void]$notice.AppendLine('=========================')
@@ -130,8 +131,15 @@ $notice = New-Object System.Text.StringBuilder
 [void]$notice.AppendLine('3. scrcpy, Moonlight and Sunshine - studied as REFERENCES ONLY. No code from these')
 [void]$notice.AppendLine('   projects is included in this package.')
 [void]$notice.AppendLine('')
+[void]$notice.AppendLine('4. Monocypher 4.0.3 (protocol/third_party/monocypher) - used by OWC.exe and OWC.apk')
+[void]$notice.AppendLine('   (X25519, Elligator 2, ChaCha20-Poly1305). License: BSD-2-Clause or CC0-1.0 (dual).')
+[void]$notice.AppendLine('   Copyright (c) 2017-2023 Loup Vaillant, Michael Savage, Fabio Scotoni. Full text reproduced below.')
+[void]$notice.AppendLine('')
 [void]$notice.AppendLine('--- Dear ImGui LICENSE.txt ---')
 if (Test-Path $imguiLic) { [void]$notice.AppendLine((Get-Content -Raw $imguiLic)) } else { [void]$notice.AppendLine('(file missing)') }
+[void]$notice.AppendLine('')
+[void]$notice.AppendLine('--- Monocypher LICENCE.md ---')
+if (Test-Path $monoLic) { [void]$notice.AppendLine((Get-Content -Raw $monoLic)) } else { [void]$notice.AppendLine('(file missing)') }
 [void]$notice.AppendLine('')
 [void]$notice.AppendLine('--- libobs LICENSE (GPL-2.0) ---')
 if (Test-Path $obsLic) { [void]$notice.AppendLine((Get-Content -Raw $obsLic)) } else { [void]$notice.AppendLine('(file missing)') }
