@@ -8,7 +8,7 @@
     vcam\x64\owc_virtualcam.dll   virtual camera, 64-bit
     vcam\x86\owc_virtualcam.dll   virtual camera, 32-bit (if built)
     obs-plugin\                   OBS source plugin tree (bin\64bit, data)
-    OWC.apk                       Android debug APK (if built)
+    OWC.apk                       Android APK (release if built, else debug)
     install-virtualcam.ps1, uninstall-virtualcam.ps1, install-obs-plugin.ps1
     README.md, THIRD_PARTY_NOTICES.txt
 
@@ -97,7 +97,9 @@ if (-not (Test-Path (Join-Path $obsSrc 'bin\64bit\owc-obs-source.dll'))) {
 Copy-Item $obsSrc (Join-Path $stage 'obs-plugin') -Recurse -Force
 
 # ---- Android APK -----------------------------------------------------------
-$apk = Join-Path $repo 'android\app\build\outputs\apk\debug\app-debug.apk'
+# Prefer the release APK (not debuggable; signed with the debug key), else debug.
+$apk = Join-Path $repo 'android\app\build\outputs\apk\release\app-release.apk'
+if (-not (Test-Path $apk)) { $apk = Join-Path $repo 'android\app\build\outputs\apk\debug\app-debug.apk' }
 if (Test-Path $apk) {
   Copy-Item $apk (Join-Path $stage 'OWC.apk') -Force
 } else {
