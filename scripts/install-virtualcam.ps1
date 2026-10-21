@@ -50,17 +50,22 @@ if (-not $PerUser -and -not (Test-Admin)) {
   exit $p.ExitCode
 }
 
+# Candidates: package layout next to this script (dist\OWC\vcam\<arch>), then repo build trees.
 function Find-Dll([string]$given, [string[]]$candidates) {
   if ($given) { return (Resolve-Path $given).Path }
   foreach ($c in $candidates) {
-    $p = Join-Path $repo $c
-    if (Test-Path $p) { return (Resolve-Path $p).Path }
+    foreach ($base in @($PSScriptRoot, $repo)) {
+      $p = Join-Path $base $c
+      if (Test-Path $p) { return (Resolve-Path $p).Path }
+    }
   }
   return $null
 }
 
-$src64 = Find-Dll $Dll64 @('build\virtualcam\out\Release\owc_virtualcam.dll', 'build\win\out\Release\owc_virtualcam.dll')
-$src32 = if ($Dll32) { Find-Dll $Dll32 @() } else { $null }
+$src64 = Find-Dll $Dll64 @('vcam\x64\owc_virtualcam.dll', 'build\release\out\Release\owc_virtualcam.dll',
+                           'build\virtualcam\out\Release\owc_virtualcam.dll', 'build\win\out\Release\owc_virtualcam.dll')
+$src32 = Find-Dll $Dll32 @('vcam\x86\owc_virtualcam.dll', 'build\release-x86\out\Release\owc_virtualcam.dll',
+                           'build\virtualcam-x86\out\Release\owc_virtualcam.dll')
 if (-not $src64 -and -not $src32) { throw 'owc_virtualcam.dll not found; build it or pass -Dll64/-Dll32.' }
 
 if (-not $InstallDir) {

@@ -19,3 +19,4 @@ android/captures/
 *.log
 .DS_Store
 android/.kotlin/
+/dist/

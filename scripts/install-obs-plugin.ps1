@@ -16,7 +16,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $BuildDir) { $BuildDir = Join-Path $root '..\build\obs\out\obs-plugins\owc-obs-source' }
+if (-not $BuildDir) {
+  # Package layout (dist\OWC\obs-plugin) first, then repo build trees.
+  $BuildDir = @('obs-plugin', '..\build\release\out\obs-plugins\owc-obs-source',
+                '..\build\obs\out\obs-plugins\owc-obs-source') |
+    ForEach-Object { Join-Path $root $_ } |
+    Where-Object { Test-Path (Join-Path $_ 'bin\64bit\owc-obs-source.dll') } |
+    Select-Object -First 1
+  if (-not $BuildDir) { $BuildDir = Join-Path $root 'obs-plugin' }
+}
 if (-not $Destination) { $Destination = Join-Path $env:ProgramData 'obs-studio\plugins\owc-obs-source' }
 
 if ($Uninstall) {
