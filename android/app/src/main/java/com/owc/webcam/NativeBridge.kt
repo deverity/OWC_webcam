@@ -66,6 +66,10 @@ object NativeBridge {
     @JvmStatic
     external fun nativeSetDeviceName(name: String)
 
+    /** O usuário saiu da tela preta no celular: sincroniza o ParamStore/PC. */
+    @JvmStatic
+    external fun nativeScreenModeChanged(mode: Int)
+
     /** Chamado pelo código nativo, em qualquer thread. */
     @JvmStatic
     fun onNativeEvent(type: Int, intArg: Int, strArg: String?) {
@@ -106,5 +110,10 @@ object NativeBridge {
     fun safeSetName(name: String) {
         if (!available) return
         try { nativeSetDeviceName(name) } catch (t: Throwable) { Log.e(TAG, "nativeSetDeviceName", t) }
+    }
+
+    fun safeScreenModeChanged(mode: Int) {
+        if (!available) return
+        try { nativeScreenModeChanged(mode) } catch (t: Throwable) { Log.e(TAG, "nativeScreenModeChanged", t) }
     }
 }

@@ -76,6 +76,13 @@ void Worker::setPreview(ANativeWindow* w) {
     LOGW_LOCAL("setPreviewSurface: worker busy for > 2 s");
 }
 
+void Worker::screenModeChanged(int mode) {
+  Event e;
+  e.kind = Event::Kind::ScreenMode;
+  e.gen = static_cast<uint64_t>(mode);  // reused as payload; no connection involved
+  q_.push(std::move(e));
+}
+
 // ------------------------------------------------------------------ callbacks
 void Worker::onClientConnected(std::shared_ptr<net::ClientConn> c) {
   Event e;
@@ -257,6 +264,14 @@ void Worker::handle(Event& ev) {
       if (ev.done) ev.done->set_value();
       break;
     }
+    case Event::Kind::ScreenMode: {
+      // The phone user left black mode locally: keep the store (and the PC UI) in sync.
+      // No emit(): Kotlin already acted on it.
+      params_.screenMode = static_cast<int>(ev.gen);
+      if (conn_ && helloDone_ && !closing_ && params_.ready())
+        sendParamState(ParamId::ScreenMode, ParamStatus::Ok, params_.current(ParamId::ScreenMode));
+      break;
+    }
     case Event::Kind::Shutdown:
       break;
   }
@@ -308,6 +323,7 @@ void Worker::tick() {
 
 // ------------------------------------------------------------------ session
 void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
+  byeReceived_ = false;
   if (conn_) {  // cannot happen (net thread allows one client) but be safe
     c->sock->shutdownBoth();
     return;
@@ -336,7 +352,9 @@ void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
 
 void Worker::onDisconnected() {
   log::setPcSink(nullptr);
+  sessionTeardown_ = true;  // kEvStreamingStopped arg 1 = stop caused by the session ending
   stopStream(true);
+  sessionTeardown_ = false;
   wantStream_ = false;
   restartAtMs_ = 0;
   reconfigAtMs_ = 0;
@@ -347,7 +365,9 @@ void Worker::onDisconnected() {
   conn_.reset();
   helloDone_ = false;
   closing_ = false;
-  emit(kEvClientDisconnected, 0, "");
+  // arg: 1 = PC said Bye (explicit), 0 = connection lost/timeout (PC will auto-reconnect)
+  emit(kEvClientDisconnected, byeReceived_ ? 1 : 0, "");
+  byeReceived_ = false;
   updateStatus();
 }
 
@@ -387,7 +407,10 @@ void Worker::onMessage(MsgType type, const std::vector<uint8_t>& payload) {
     case MsgType::SetParam: onSetParam(payload); break;
     case MsgType::Command: onCommand(payload); break;
     case MsgType::ReceiverReport: onReceiverReport(payload); break;
-    case MsgType::Bye: closeClient("Bye from client"); break;
+    case MsgType::Bye:
+      byeReceived_ = true;
+      closeClient("Bye from client");
+      break;
     case MsgType::Hello: LOGW_LOCAL("duplicate Hello ignored"); break;
     default: LOGD("ignoring message %s", toString(type)); break;
   }
@@ -686,7 +709,7 @@ void Worker::stopStream(bool notify) {
   // seeing "streaming" until the stream is really stopped or given up.
   if (notify && appStreaming_) {
     appStreaming_ = false;
-    emit(kEvStreamingStopped, 0, "");
+    emit(kEvStreamingStopped, sessionTeardown_ ? 1 : 0, "");
   }
   updateStatus();
 }

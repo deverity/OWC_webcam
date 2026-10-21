@@ -24,7 +24,7 @@
 namespace owc {
 
 struct Event {
-  enum class Kind { Connected, Message, Disconnected, Punch, CameraLost, EncoderError, Preview, Shutdown };
+  enum class Kind { Connected, Message, Disconnected, Punch, CameraLost, EncoderError, Preview, ScreenMode, Shutdown };
   Kind kind = Kind::Shutdown;
   uint64_t gen = 0;
   std::shared_ptr<net::ClientConn> conn;
@@ -44,6 +44,8 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   bool start(std::string& err);  // binds sockets, starts threads
   void stop();                   // joins everything
   void setPreview(ANativeWindow* w);
+  // Phone side left black-screen mode (any thread): resets the param and tells the PC.
+  void screenModeChanged(int mode);
 
   // NetServer::Callbacks (net thread)
   void onClientConnected(std::shared_ptr<net::ClientConn> c) override;
@@ -118,6 +120,8 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   std::shared_ptr<net::ClientConn> conn_;
   bool helloDone_ = false;
   bool closing_ = false;
+  bool sessionTeardown_ = false;  // inside onDisconnected(): stop is not a PC decision
+  bool byeReceived_ = false;  // PC sent Bye: the disconnect event is "graceful", not "lost"
   int64_t helloDeadlineMs_ = 0, closeDeadlineMs_ = 0, punchDeadlineMs_ = 0;
   VideoTransport requested_ = VideoTransport::Tcp;
   bool wantStream_ = false;

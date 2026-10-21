@@ -14,7 +14,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.provider.Settings
-import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -48,6 +48,18 @@ class WebcamService : Service() {
         @Volatile
         var running: Boolean = false
             private set
+
+        @Volatile
+        private var instance: WebcamService? = null
+
+        /**
+         * Pedido de saída da tela preta vindo do lado do celular (BlackScreenActivity).
+         * Passa pelo mesmo caminho único do overlay; sem serviço vivo é no-op.
+         */
+        fun requestExitBlack() {
+            val s = instance ?: return
+            s.main.post { s.exitBlackScreen(syncNative = true) }
+        }
 
         fun start(ctx: Context) {
             val i = Intent(ctx, WebcamService::class.java).setAction(ACTION_START)
@@ -90,6 +102,7 @@ class WebcamService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createChannels()
     }
 
@@ -156,6 +169,8 @@ class WebcamService : Service() {
 
     override fun onDestroy() {
         running = false
+        instance = null
+        unregisterScreenOff()
         main.removeCallbacksAndMessages(null)
         NativeBridge.eventListener = null
         if (batteryReceiverRegistered) {
@@ -268,7 +283,8 @@ class WebcamService : Service() {
     private fun handleEvent(type: Int, arg: Int, str: String?) {
         when (type) {
             NativeBridge.EVT_SCREEN_MODE -> {
-                if (arg == 1) openBlackScreen() else closeBlackScreen()
+                // Modo 0 veio do próprio PC: ele já sabe, não precisa sincronizar de volta.
+                if (arg == 1) openBlackScreen() else exitBlackScreen(syncNative = false)
             }
             NativeBridge.EVT_DEVICE_NAME -> {
                 val n = str?.trim().orEmpty()
@@ -279,8 +295,15 @@ class WebcamService : Service() {
                 updateNotification(getString(R.string.notif_error, str ?: "?"))
             }
             else -> {
-                if (type == NativeBridge.EVT_CLIENT_DISCONNECTED || type == NativeBridge.EVT_STREAMING_STOPPED) {
-                    // o tela preta nao deve ficar presa sem PC
+                // Tela preta nao fica presa quando o PC encerra de proposito:
+                //  - Bye (arg=1): desconexao explicita;
+                //  - STREAMING_STOPPED com arg=0: PC parou a transmissao com a sessao de pe
+                //    (arg=1 e o stop interno de uma sessao que caiu: perda, nao sai).
+                // Conexao PERDIDA (arg=0, sem Bye): mantem preta; o PC reconecta sozinho
+                // e o usuario sai com qualquer toque/tecla.
+                if ((type == NativeBridge.EVT_CLIENT_DISCONNECTED && arg == 1) ||
+                    (type == NativeBridge.EVT_STREAMING_STOPPED && arg == 0)) {
+                    exitBlackScreen(syncNative = true)
                 }
                 updateNotification(buildStatusText())
             }
@@ -292,32 +315,55 @@ class WebcamService : Service() {
 
     private var overlay: View? = null
 
+    /**
+     * View do overlay. Cobertura de saida (todas via [exitBlackScreen] com sync nativo):
+     *  - toque: ACTION_DOWN em dispatchTouchEvent;
+     *  - teclas (Back, volume, camera...): dispatchKeyEvent, possivel porque a janela e focavel;
+     *  - Home/Recents/barra de notificacoes: Home nao chega como tecla; o que funciona e a janela
+     *    focavel perder o foco (onWindowFocusChanged(false)), so valido depois de ter ganho foco.
+     */
+    private inner class BlackOverlayView(ctx: Context) : View(ctx) {
+        private var hadFocus = false
+
+        override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) exitBlackScreen(syncNative = true)
+            return true
+        }
+
+        override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+            if (event.action == KeyEvent.ACTION_DOWN) exitBlackScreen(syncNative = true)
+            return true
+        }
+
+        override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+            super.onWindowFocusChanged(hasWindowFocus)
+            if (hasWindowFocus) hadFocus = true
+            else if (hadFocus) exitBlackScreen(syncNative = true)
+        }
+    }
+
     private fun showOverlay(): Boolean {
         if (overlay != null) return true
         if (!Settings.canDrawOverlays(this)) return false
         return try {
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val v = View(this)
+            val v = BlackOverlayView(this)
             v.setBackgroundColor(Color.BLACK)
+            v.isFocusable = true
+            v.isFocusableInTouchMode = true
             @Suppress("DEPRECATION")
             v.systemUiVisibility = (View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
-            val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-                override fun onDown(e: MotionEvent): Boolean = true
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    hideOverlay()
-                    return true
-                }
-            })
-            v.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
+            // Sem FLAG_NOT_FOCUSABLE para receber teclas e foco; ALT_FOCUSABLE_IM evita
+            // que a janela mexa no teclado (IME).
             val lp = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                         WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM or
                         WindowManager.LayoutParams.FLAG_FULLSCREEN,
                 PixelFormat.OPAQUE
             )
@@ -327,6 +373,7 @@ class WebcamService : Service() {
             }
             wm.addView(v, lp)
             overlay = v
+            v.requestFocus()
             true
         } catch (t: Throwable) {
             Log.w(TAG, "overlay falhou", t)
@@ -340,8 +387,41 @@ class WebcamService : Service() {
         try { (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v) } catch (_: Throwable) {}
     }
 
+    // Receiver ativo so enquanto a tela preta estiver ligada.
+    //  - ACTION_SCREEN_OFF: aparelho bloqueado/apagado (botao power) -> sai, para que ao
+    //    desbloquear a tela esteja normal (cobre overlay e activity).
+    //  - ACTION_CLOSE_SYSTEM_DIALOGS (so API < 31; depois e ignorado para apps): Home/Recents.
+    //    Na pratica o onWindowFocusChanged do overlay ja cobre.
+    private val blackReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            exitBlackScreen(syncNative = true)
+        }
+    }
+    private var blackReceiverRegistered = false
+
+    private fun registerScreenOff() {
+        if (blackReceiverRegistered) return
+        val f = IntentFilter(Intent.ACTION_SCREEN_OFF)
+        if (Build.VERSION.SDK_INT < 31) f.addAction(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(blackReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(blackReceiver, f)
+            }
+            blackReceiverRegistered = true
+        } catch (t: Throwable) { Log.w(TAG, "receiver tela preta", t) }
+    }
+
+    private fun unregisterScreenOff() {
+        if (!blackReceiverRegistered) return
+        blackReceiverRegistered = false
+        try { unregisterReceiver(blackReceiver) } catch (_: Throwable) {}
+    }
+
     private fun openBlackScreen() {
         lastBlackRequested = true
+        registerScreenOff()
         if (showOverlay()) return
         // Tentativa direta (funciona se o app estiver visível/permitido)
         try { startActivity(blackIntent()) } catch (t: Throwable) { Log.w(TAG, "startActivity tela preta: $t") }
@@ -360,11 +440,19 @@ class WebcamService : Service() {
         } catch (t: Throwable) { Log.w(TAG, "full-screen notif", t) }
     }
 
-    private fun closeBlackScreen() {
+    /**
+     * Unico ponto de saida da tela preta (overlay + activity + notificacao + receiver).
+     * Idempotente. syncNative=true quando a saida nao foi pedida pelo PC: avisa o nucleo
+     * para zerar ScreenMode e atualizar a UI do PC.
+     */
+    private fun exitBlackScreen(syncNative: Boolean) {
+        val wasActive = lastBlackRequested || overlay != null
         lastBlackRequested = false
+        unregisterScreenOff()
         hideOverlay()
         sendBroadcast(Intent(ACTION_CLOSE_BLACK).setPackage(packageName))
         getSystemService(NotificationManager::class.java).cancel(NOTIF_SCREEN_ID)
+        if (wasActive && syncNative && nativeStarted) NativeBridge.safeScreenModeChanged(0)
     }
 
     // ----------------------------------------------------------- notificação

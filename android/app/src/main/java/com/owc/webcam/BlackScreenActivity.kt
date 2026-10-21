@@ -8,7 +8,7 @@ import android.content.IntentFilter
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
-import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
@@ -17,8 +17,10 @@ import android.view.WindowManager
 
 /**
  * Tela totalmente preta com brilho mínimo: em OLED equivale a "desligada" enquanto a
- * câmera continua transmitindo. Toque duplo sai; fecha também ao receber o broadcast
- * do serviço (modo de tela normal).
+ * câmera continua transmitindo. Qualquer toque ou tecla (Back, volume...) sai; Home/Recents
+ * (onStop) e tela apagada/bloqueada (ACTION_SCREEN_OFF) também. Fecha ainda ao receber o
+ * broadcast do serviço (modo de tela normal). Toda saída iniciada aqui avisa o serviço
+ * (requestExitBlack) para sincronizar o ParamStore/PC.
  */
 class BlackScreenActivity : Activity() {
 
@@ -27,8 +29,20 @@ class BlackScreenActivity : Activity() {
             finish()
         }
     }
+    // Segurança: se o serviço não estiver vivo para tratar ACTION_SCREEN_OFF, a activity
+    // própria não pode ficar sobre a tela de bloqueio com brilho mínimo.
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            exitBlack()
+        }
+    }
     private var receiverRegistered = false
-    private lateinit var detector: GestureDetector
+    private var screenOffRegistered = false
+
+    private fun exitBlack() {
+        WebcamService.requestExitBlack()
+        if (!isFinishing) finish()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,15 +65,6 @@ class BlackScreenActivity : Activity() {
         v.setBackgroundColor(Color.BLACK)
         setContentView(v)
 
-        detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onDown(e: MotionEvent): Boolean = true
-            override fun onDoubleTap(e: MotionEvent): Boolean {
-                finish()
-                return true
-            }
-        })
-        v.setOnTouchListener { _, ev -> detector.onTouchEvent(ev) }
-
         val f = IntentFilter(WebcamService.ACTION_CLOSE_BLACK)
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(closeReceiver, f, Context.RECEIVER_NOT_EXPORTED)
@@ -67,6 +72,32 @@ class BlackScreenActivity : Activity() {
             registerReceiver(closeReceiver, f)
         }
         receiverRegistered = true
+        registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        screenOffRegistered = true
+    }
+
+    // Qualquer toque (ACTION_DOWN basta).
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) exitBlack()
+        return true
+    }
+
+    // Qualquer tecla (Back, volume, camera...). Home nunca chega aqui: ver onStop.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) exitBlack()
+        return true
+    }
+
+    // Back por gesto (API 33+ sem key event) cai aqui.
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        exitBlack()
+    }
+
+    // Home / Recents / outro app / tela apagada: a activity deixa de ser visível.
+    override fun onStop() {
+        super.onStop()
+        if (!isFinishing) exitBlack()
     }
 
     private fun setBrightness() {
@@ -109,6 +140,10 @@ class BlackScreenActivity : Activity() {
         if (receiverRegistered) {
             try { unregisterReceiver(closeReceiver) } catch (_: Throwable) {}
             receiverRegistered = false
+        }
+        if (screenOffRegistered) {
+            try { unregisterReceiver(screenOffReceiver) } catch (_: Throwable) {}
+            screenOffRegistered = false
         }
         super.onDestroy()
     }

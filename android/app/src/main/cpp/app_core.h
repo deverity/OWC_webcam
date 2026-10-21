@@ -38,10 +38,10 @@ namespace owc {
 // Events delivered to the app (ARCHITECTURE.md "Contrato JNI").
 enum AppEvent : int {
   kEvClientConnected = 1,
-  kEvClientDisconnected = 2,
+  kEvClientDisconnected = 2,  // arg: 1 = graceful (Bye), 0 = lost
   kEvScreenMode = 3,
   kEvStreamingStarted = 4,
-  kEvStreamingStopped = 5,
+  kEvStreamingStopped = 5,  // arg: 1 = emitted because the session ended
   kEvError = 6,
   kEvDeviceName = 7,  // str = new name set by the PC (the app persists it)
 };
@@ -105,6 +105,7 @@ class AppCore {
   std::string statusJson();
   void updateDeviceStatus(int batteryPct, float tempC, bool charging, int thermal);
   void setDeviceName(const std::string& name);
+  void screenModeChanged(int mode);  // posts to the worker thread
 
  private:
   std::mutex lifeMu_;  // serializes start/stop/setPreviewSurface

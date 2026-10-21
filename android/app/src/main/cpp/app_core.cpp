@@ -97,4 +97,9 @@ void AppCore::setDeviceName(const std::string& name) {
   info_->deviceName = name;
 }
 
+void AppCore::screenModeChanged(int mode) {
+  std::lock_guard<std::mutex> lk(lifeMu_);
+  if (worker_) worker_->screenModeChanged(mode);
+}
+
 }  // namespace owc

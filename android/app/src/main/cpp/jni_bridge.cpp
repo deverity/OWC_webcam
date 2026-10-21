@@ -2,7 +2,7 @@
 //   class com.owc.webcam.NativeBridge (Kotlin object, @JvmStatic) — static natives:
 //     nativeStart(String,String,int,int,int,int)Z, nativeStop()V,
 //     nativeSetPreviewSurface(Surface)V, nativeGetStatus()String,
-//     nativeUpdateDeviceStatus(int,float,boolean,int)V, nativeSetDeviceName(String)V
+//     nativeUpdateDeviceStatus(int,float,boolean,int)V, nativeSetDeviceName(String)V, nativeScreenModeChanged(int)V
 //   callback: static onNativeEvent(int,int,String)V, invoked from a dedicated
 //   native thread ("owc-jni-ev", attached once) so no camera/encoder/network
 //   thread ever runs Java code or waits for it.
@@ -570,4 +570,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_owc_webcam_NativeBridge_nativeSetDevi
                                                                                        jclass,
                                                                                        jstring name) {
   core().setDeviceName(toStd(env, name));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_owc_webcam_NativeBridge_nativeScreenModeChanged(JNIEnv*, jclass,
+                                                                                           jint mode) {
+  core().screenModeChanged(mode);
 }
