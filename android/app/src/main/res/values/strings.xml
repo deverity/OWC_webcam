@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OWC Webcam</string>
+    <string name="status_title">STATUS</string>
+    <string name="lbl_state">Estado</string>
+    <string name="lbl_peer">PC conectado</string>
+    <string name="lbl_transport">Transporte</string>
+    <string name="lbl_video">Vídeo</string>
+    <string name="lbl_bitrate">Bitrate</string>
+    <string name="lbl_latency">Latência de codificação</string>
+    <string name="lbl_dropped">Quadros descartados</string>
+    <string name="state_stopped">Serviço parado</string>
+    <string name="state_idle">Inativo</string>
+    <string name="state_listening">Aguardando conexão</string>
+    <string name="state_connected">Conectado</string>
+    <string name="state_streaming">Transmitindo</string>
+    <string name="native_missing">Biblioteca nativa ausente</string>
+    <string name="native_missing_detail">Biblioteca nativa ausente (%1$s)</string>
+    <string name="network_title">REDE</string>
+    <string name="no_network">Nenhum endereço IPv4 encontrado</string>
+    <string name="ports_fmt">Portas: controle TCP %1$d, vídeo UDP %2$d, descoberta UDP %3$d</string>
+    <string name="device_name">Nome do dispositivo</string>
+    <string name="device_title">DISPOSITIVO</string>
+    <string name="options_title">OPÇÕES</string>
+    <string name="apply">Aplicar</string>
+    <string name="start_service">Iniciar serviço</string>
+    <string name="stop_service">Parar serviço</string>
+    <string name="black_screen">Tela preta</string>
+    <string name="preview_local">Pré-visualização local</string>
+    <string name="keep_screen_on">Manter tela ligada</string>
+    <string name="battery_opt">Isentar de otimização de bateria</string>
+    <string name="battery_opt_done">Já isento de otimização de bateria</string>
+    <string name="battery_hint">Para transmitir com a tela desligada, desative a otimização de bateria. Em celulares Samsung, adicione o app em Configurações > Bateria > Limites de uso em segundo plano > Apps que nunca dormem.</string>
+    <string name="perm_denied">Permissão de câmera negada</string>
+    <string name="notif_channel">Transmissão da webcam</string>
+    <string name="notif_channel_screen">Modo tela preta</string>
+    <string name="notif_title">OWC Webcam</string>
+    <string name="notif_stop">Parar</string>
+    <string name="notif_starting">Iniciando…</string>
+    <string name="notif_waiting">Aguardando conexão</string>
+    <string name="notif_black">Toque para abrir a tela preta</string>
+    <string name="notif_error">Erro: %1$s</string>
+    <string name="start_failed">Falha ao iniciar o núcleo nativo</string>
+    <string name="overlay_perm">Permitir sobreposição (tela preta remota)</string>
+    <string name="net_hint">Conecte via USB ou na mesma rede Wi-Fi do PC</string>
+    <string name="net_mobile">(dados móveis — não use)</string>
+</resources>
