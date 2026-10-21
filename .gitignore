@@ -1,0 +1,20 @@
+# build outputs
+/build/
+/windows/build/
+*.user
+.vs/
+.vscode/
+# android
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/captures/
+*.apk
+*.aab
+*.iml
+.idea/
+# misc
+*.log
+.DS_Store
