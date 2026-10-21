@@ -18,3 +18,4 @@ android/captures/
 # misc
 *.log
 .DS_Store
+android/.kotlin/
