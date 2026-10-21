@@ -33,6 +33,7 @@ struct CameraDesc {
   int64_t expMin = 0, expMax = 0;
   int32_t maxRegionsAe = 0, maxRegionsAf = 0;
   bool manualSensor = false;
+  bool logicalMulti = false;  // LOGICAL_MULTI_CAMERA (fuses several physical sensors)
   uint8_t timestampSource = 0;  // ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE_*
   // Upper bound of the AE target fps ranges (normal capture sessions cannot exceed it).
   int maxAeFps = 30, minAeFps = 1;

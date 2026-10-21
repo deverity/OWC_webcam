@@ -254,8 +254,10 @@ CameraDesc describe(const char* id, const ACameraMetadata* m) {
     d.maxRegionsAe = r3[0];
     d.maxRegionsAf = r3[2];
   }
-  for (uint8_t cap : u8List(m, ACAMERA_REQUEST_AVAILABLE_CAPABILITIES))
+  for (uint8_t cap : u8List(m, ACAMERA_REQUEST_AVAILABLE_CAPABILITIES)) {
     if (cap == ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) d.manualSensor = true;
+    if (cap == ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) d.logicalMulti = true;
+  }
   getU8(m, ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE, d.timestampSource);
   return d;
 }
@@ -270,15 +272,39 @@ std::vector<CameraDesc> enumerateCameras(ACameraManager* mgr, bool verbose) {
     LOGE("ACameraManager_getCameraIdList failed: %d", st);
     return out;
   }
-  for (int i = 0; i < ids->numCameras; ++i) {
-    const char* id = ids->cameraIds[i];
+  // Vendors (Qualcomm aux-camera allowlist on Motorola, among others) trim the
+  // list for third-party packages while the hidden ids may still be reachable,
+  // so numeric ids missing from the list are probed as well. (Samsung's extra
+  // sensors, e.g. the Note 9 telephoto "20", are refused inside the app's own
+  // process by both the NDK and the Java framework: not reachable this way.)
+  std::vector<std::string> all;
+  for (int i = 0; i < ids->numCameras; ++i) all.emplace_back(ids->cameraIds[i]);
+  ACameraManager_deleteCameraIdList(ids);
+  const size_t listed = all.size();
+  for (int n = 0; n < 16; ++n) {
+    std::string id = std::to_string(n);
+    if (std::find(all.begin(), all.end(), id) == all.end()) all.push_back(id);
+  }
+  for (size_t i = 0; i < all.size(); ++i) {
+    const char* id = all[i].c_str();
+    const bool probed = i >= listed;
     ACameraMetadata* m = nullptr;
     if (ACameraManager_getCameraCharacteristics(mgr, id, &m) != ACAMERA_OK || !m) {
-      LOGW("camera %s: no characteristics", id);
+      if (!probed) LOGW("camera %s: no characteristics", id);
       continue;
     }
     CameraDesc d = describe(id, m);
     ACameraMetadata_free(m);
+    if (probed) {
+      // A hidden logical camera expects vendor setup from the OEM app (moto g32:
+      // opening it kills the camera provider); its physical sensors are probed
+      // individually anyway.
+      if (d.logicalMulti) {
+        if (verbose) LOGI("camera %s: hidden logical multi-camera; skipped", id);
+        continue;
+      }
+      if (verbose) LOGI("camera %s: not listed by the system, reachable by id", id);
+    }
     if (d.info.sizes.empty()) {
       LOGW("camera %s: no PRIVATE output sizes; skipped", id);
       continue;
@@ -291,7 +317,6 @@ std::vector<CameraDesc> enumerateCameras(ACameraManager* mgr, bool verbose) {
          d.manualSensor, d.afModes.size());
     out.push_back(std::move(d));
   }
-  ACameraManager_deleteCameraIdList(ids);
   return out;
 }
 
