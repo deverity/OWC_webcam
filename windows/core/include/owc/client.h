@@ -140,16 +140,37 @@ struct OutputTransform {
   bool operator!=(const OutputTransform& o) const { return !(*this == o); }
 };
 
+// Colour-wheel value (DaVinci Resolve style primaries). r/g/b = colour push
+// of the wheel's puck, y = the master ring under the wheel. All neutral at 0.
+// The UI converts the puck position (unit disk) to r/g/b deltas that sum to 0
+// (owc::wheelToRgb in owc/color_grade.h), so the puck never changes brightness.
+struct ColorWheel {
+  float r = 0, g = 0, b = 0;  // -1..+1 each (sum 0 from the puck)
+  float y = 0;                // master, -1..+1
+  bool isNeutral() const { return r == 0 && g == 0 && b == 0 && y == 0; }
+  bool operator==(const ColorWheel& o) const { return r == o.r && g == o.g && b == o.b && y == o.y; }
+  bool operator!=(const ColorWheel& o) const { return !(*this == o); }
+};
+
+// A curve control point, both coordinates 0..1.
+struct CurvePoint {
+  float x = 0, y = 0;
+  bool operator==(const CurvePoint& o) const { return x == o.x && y == o.y; }
+};
+
 // PC colour grading applied to the decoded NV12 after the transform and
 // before publishing, so the preview, the virtual camera and the OBS plugin
 // all get it. Recordings are NOT graded (they keep the phone's bitstream).
 // Pipeline (in RGB, of the stream's own YUV matrix/range):
-//   white balance (temperature, tint) -> exposure -> contrast -> shadows /
-//   highlights -> saturation / vibrance -> LUT (mixed by lut_strength)
+//   white balance (temperature, tint) -> exposure -> offset -> lift / gamma /
+//   gain -> contrast (around pivot) -> shadows / highlights -> custom curves
+//   (Y, then R/G/B) -> hue vs hue -> hue vs sat -> luma vs sat ->
+//   saturation / vibrance -> LUT (mixed by lut_strength)
 // Everything is baked into one YUV-domain table on a background thread when a
 // value changes (the previous table keeps being used meanwhile), then applied
 // per frame on the CPU (multithreaded, ~1-3 ms at 1080p). Disabled or neutral
 // with no LUT = no cost. Effect: next frame after the bake (typically < 50 ms).
+// Adding wheels/curves does not change the per-frame cost.
 struct ColorGrade {
   bool enabled = false;
   // basic adjustments; all neutral at 0
@@ -161,6 +182,30 @@ struct ColorGrade {
   float vibrance = 0;      // -1..+1 (saturation weighted to muted colours, skin-safe)
   float temperature = 0;   // -1..+1 (positive = warmer)
   float tint = 0;          // -1..+1 (positive = magenta, negative = green)
+  float pivot = 0.435f;    // 0.1..0.9, contrast pivot (Resolve's default 0.435)
+
+  // Primaries, Resolve semantics (per channel c, with m = master):
+  //   offset: x += 0.25 * (m + c)                      (moves everything)
+  //   lift:   x += 0.25 * (m + c) * (1 - x)            (blacks, white fixed)
+  //   gain:   x *= 2^(m + c)                           (whites, black fixed)
+  //   gamma:  x  = x^(2^-(m + c))                      (mids, black+white fixed)
+  ColorWheel lift, gamma, gain, offset;
+
+  // Custom curves, Resolve style: sorted by x, both ends usually present,
+  // at most 16 points; empty = identity. Smooth monotone cubic (Fritsch-
+  // Carlson) through the points, clamped to 0..1. curve_y acts on all three
+  // channels (master), then curve_r/g/b per channel.
+  std::vector<CurvePoint> curve_y, curve_r, curve_g, curve_b;
+  // Hue curves: x = hue 0..1 (0 = red, periodic: wraps around), y = 0.5 is
+  // neutral; empty = identity. Periodic smooth cubic through the points.
+  //   hue_vs_hue: hue shift (y-0.5) turns, i.e. -0.5..+0.5
+  //   hue_vs_sat: saturation gain 2^(4*(y-0.5)) (0 = grey at y=0, 4x at y=1;
+  //               below y = 0.5 minus 0.25*(1-2y)^2 so y = 0 is exactly grey)
+  // luma_vs_sat: x = luma 0..1 (not periodic), y as hue_vs_sat.
+  // Both hue curves key on the incoming hue; they act on the BT.709 Cb/Cr
+  // vector at constant luma and fade out on near-grey pixels.
+  std::vector<CurvePoint> hue_vs_hue, hue_vs_sat, luma_vs_sat;
+
   // LUT: "" = none, "builtin:<key>" (see builtinLooks() in owc/color_grade.h)
   // or an absolute path to a .cube file (3D or 1D, Adobe/Resolve format, UTF-8).
   // A file that fails to load is ignored (ClientStats::grade_error says why);
@@ -175,7 +220,11 @@ struct ColorGrade {
     return enabled == o.enabled && exposure_ev == o.exposure_ev && contrast == o.contrast &&
            highlights == o.highlights && shadows == o.shadows && saturation == o.saturation &&
            vibrance == o.vibrance && temperature == o.temperature && tint == o.tint &&
-           lut == o.lut && lut_strength == o.lut_strength && compare_split == o.compare_split;
+           pivot == o.pivot && lift == o.lift && gamma == o.gamma && gain == o.gain &&
+           offset == o.offset && curve_y == o.curve_y && curve_r == o.curve_r &&
+           curve_g == o.curve_g && curve_b == o.curve_b && hue_vs_hue == o.hue_vs_hue &&
+           hue_vs_sat == o.hue_vs_sat && luma_vs_sat == o.luma_vs_sat && lut == o.lut &&
+           lut_strength == o.lut_strength && compare_split == o.compare_split;
   }
   bool operator!=(const ColorGrade& o) const { return !(*this == o); }
 };

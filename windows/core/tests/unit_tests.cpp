@@ -18,6 +18,7 @@
 #include <owc/discovery.h>
 #include <owc/firewall.h>
 #include <owc/presets.h>
+#include <owc/scopes.h>
 
 #include <algorithm>
 #include <chrono>
@@ -1202,6 +1203,856 @@ void testGradeBenchmark() {
               std::thread::hardware_concurrency());
 }
 
+
+// ------------------------------------------------------------------ wheels / curves / scopes
+float runOne(const GradePipeline& p, float r, float g, float b, int k) {
+  float c[3] = {r, g, b};
+  p.run(c);
+  return c[k];
+}
+
+float degOf(float x, float y) {
+  float a = std::atan2(y, x) * 180.0f / 3.14159265f;
+  return a < 0 ? a + 360 : a;
+}
+
+void testWheels() {
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<float> d(-1, 1);
+  float worstRt = 0, worstSum = 0, worstMag = 0;
+  for (int i = 0; i < 2000; ++i) {
+    float px = d(rng), py = d(rng);
+    if (px * px + py * py > 1) continue;
+    float r, g, b, qx, qy;
+    wheelToRgb(px, py, r, g, b);
+    rgbToWheel(r, g, b, qx, qy);
+    worstRt = std::max(worstRt, std::max(std::fabs(qx - px), std::fabs(qy - py)));
+    worstSum = std::max(worstSum, std::fabs(r + g + b));
+    const float mx = std::max(std::fabs(r), std::max(std::fabs(g), std::fabs(b)));
+    worstMag = std::max(worstMag, std::fabs(mx - std::sqrt(px * px + py * py)));
+  }
+  CHECK_MSG(worstRt < 1e-5f && worstSum < 1e-5f && worstMag < 1e-5f, "rt %g sum %g mag %g", worstRt,
+            worstSum, worstMag);
+  // hue placement = BT.709 vectorscope directions (R upper left ~103, G ~230, B ~355)
+  float px, py;
+  rgbToWheel(1, -0.5f, -0.5f, px, py);
+  CHECK_MSG(std::fabs(degOf(px, py) - 102.9f) < 0.5f && std::fabs(std::hypot(px, py) - 1) < 1e-5f,
+            "red at %g deg", degOf(px, py));
+  rgbToWheel(-0.5f, 1, -0.5f, px, py);
+  CHECK_MSG(std::fabs(degOf(px, py) - 229.7f) < 0.5f, "green at %g deg", degOf(px, py));
+  rgbToWheel(-0.5f, -0.5f, 1, px, py);
+  CHECK_MSG(std::fabs(degOf(px, py) - 354.8f) < 0.5f, "blue at %g deg", degOf(px, py));
+  for (const VectorTarget& t : vectorscopeTargets(2)) {
+    const float tx = t.x100 - 0.5f, ty = 0.5f - t.y100;  // image y down -> up
+    const float k = 1.0f / std::hypot(tx, ty);
+    float r, g, b;
+    wheelToRgb(tx * k, ty * k, r, g, b);
+    rgbToWheel(r, g, b, px, py);
+    CHECK_MSG(std::fabs(degOf(px, py) - degOf(tx, ty)) < 0.01f, "%s", t.label);
+    if (std::string(t.label) == "R") CHECK(r > 0 && g < 0 && b < 0 && std::fabs(r - 1) < 1e-5f);
+    if (std::string(t.label) == "Yl") CHECK(b < 0 && std::fabs(b + 1) < 1e-5f);
+  }
+  // non-zero-sum input is projected (grey removed); zero stays zero
+  float ax, ay, bx, by;
+  rgbToWheel(1.5f, 0, 0, ax, ay);
+  rgbToWheel(1, -0.5f, -0.5f, bx, by);
+  CHECK(std::fabs(ax - bx) < 1e-6f && std::fabs(ay - by) < 1e-6f);
+  rgbToWheel(0.3f, 0.3f, 0.3f, ax, ay);
+  float r0, g0, b0;
+  wheelToRgb(0, 0, r0, g0, b0);
+  CHECK(ax == 0 && ay == 0 && r0 == 0 && g0 == 0 && b0 == 0);
+}
+
+void testCurveEval() {
+  // identity: empty, ends only, any points on the diagonal
+  const std::vector<CurvePoint> diag = {{0, 0}, {0.3f, 0.3f}, {1, 1}};
+  bool exact = true;
+  for (int i = 0; i <= 100; ++i) {
+    const float x = i / 100.0f;
+    exact = exact && evalCurve({}, x) == x && evalCurve({{0, 0}, {1, 1}}, x) == x && evalCurve(diag, x) == x;
+  }
+  CHECK(exact);
+  CHECK(evalCurve({}, -0.5f) == 0 && evalCurve({}, 2) == 1);
+  // monotone data -> monotone curve through the points, inside 0..1
+  const std::vector<CurvePoint> s = {{0, 0}, {0.3f, 0.6f}, {0.5f, 0.62f}, {0.8f, 0.9f}, {1, 1}};
+  float prev = -1;
+  bool mono = true, inRange = true;
+  for (int i = 0; i <= 2000; ++i) {
+    const float y = evalCurve(s, i / 2000.0f);
+    mono = mono && y >= prev;
+    inRange = inRange && y >= 0 && y <= 1;
+    prev = y;
+  }
+  CHECK(mono && inRange);
+  for (const CurvePoint& p : s) CHECK_MSG(std::fabs(evalCurve(s, p.x) - p.y) < 1e-6f, "at %g", p.x);
+  // no overshoot on non-monotone data: stays within the points' range
+  const std::vector<CurvePoint> bump = {{0, 0.2f}, {0.5f, 1}, {1, 0.2f}};
+  float mn = 2, mx = -1;
+  for (int i = 0; i <= 1000; ++i) {
+    const float y = evalCurve(bump, i / 1000.0f);
+    mn = std::min(mn, y);
+    mx = std::max(mx, y);
+  }
+  CHECK_MSG(mn >= 0.2f - 1e-6f && mx <= 1, "range %g..%g", mn, mx);
+  // the per-thread "last curve" cache follows the points
+  const float s4 = evalCurve(s, 0.4f), b4 = evalCurve(bump, 0.4f);
+  CHECK(s4 != b4 && evalCurve(s, 0.4f) == s4 && evalCurve(bump, 0.4f) == b4);
+  std::vector<CurvePoint> edit = s;
+  edit[1].y = 0.3f;
+  CHECK(evalCurve(edit, 0.3f) == 0.3f && std::fabs(evalCurve(s, 0.3f) - 0.6f) < 1e-6f);
+  // y outside 0..1 is clamped
+  CHECK(evalCurve({{0, -1}, {0.5f, 2}, {1, 1}}, 0.5f) == 1 && evalCurve({{0, -1}, {1, 1}}, 0) == 0);
+  // unsorted input + duplicate x (merged into their mean) == sorted input
+  const std::vector<CurvePoint> uns = {{1, 1}, {0.5f, 0.7f}, {0, 0}, {0.5f, 0.5f}, {0.25f, 0.3f}};
+  const std::vector<CurvePoint> srt = {{0, 0}, {0.25f, 0.3f}, {0.5f, 0.6f}, {1, 1}};
+  float worst = 0;
+  for (int i = 0; i <= 100; ++i) worst = std::max(worst, std::fabs(evalCurve(uns, i / 100.0f) - evalCurve(srt, i / 100.0f)));
+  CHECK_MSG(worst < 1e-6f, "unsorted vs sorted %g", worst);
+  // a single point bends the identity through it (implicit (0,0) and (1,1))
+  const std::vector<CurvePoint> one = {{0.5f, 0.7f}};
+  CHECK(evalCurve(one, 0) == 0 && evalCurve(one, 1) == 1 && std::fabs(evalCurve(one, 0.5f) - 0.7f) < 1e-6f);
+  CHECK(evalCurve(one, 0.25f) > 0.25f && evalCurve(one, 0.75f) > 0.75f);
+  // hue curve: periodic, continuous (value and slope) across 1 -> 0
+  const std::vector<CurvePoint> hue = {{0.2f, 0.8f}, {0.6f, 0.3f}, {0.9f, 0.55f}};
+  const float e = 1e-4f;
+  CHECK(std::fabs(evalHueCurve(hue, 0) - evalHueCurve(hue, 1)) < 1e-6f);
+  CHECK(std::fabs(evalHueCurve(hue, e) - evalHueCurve(hue, 1 - e)) < 1e-3f);
+  const float slopeL = (evalHueCurve(hue, 1) - evalHueCurve(hue, 1 - e)) / e;
+  const float slopeR = (evalHueCurve(hue, e) - evalHueCurve(hue, 0)) / e;
+  CHECK_MSG(std::fabs(slopeL - slopeR) < 0.02f, "slopes %g %g", slopeL, slopeR);
+  CHECK(std::fabs(evalHueCurve(hue, 1.2f) - evalHueCurve(hue, 0.2f)) < 1e-6f &&
+        std::fabs(evalHueCurve(hue, -0.4f) - 0.3f) < 1e-5f);
+  for (const CurvePoint& p : hue) CHECK(std::fabs(evalHueCurve(hue, p.x) - p.y) < 1e-6f);
+  CHECK(evalHueCurve({}, 0.3f) == 0.5f && evalHueCurve({{0.4f, 0.7f}}, 0.9f) == 0.7f);
+  // a point at x = 1 is the point at x = 0
+  CHECK(std::fabs(evalHueCurve({{1, 0.9f}, {0.5f, 0.5f}}, 0) - 0.9f) < 1e-6f);
+  // luma vs sat: flat ends, 0.5 when empty
+  const std::vector<CurvePoint> ls = {{0.2f, 0.3f}, {0.8f, 0.6f}};
+  CHECK(evalLumaSatCurve({}, 0.1f) == 0.5f && evalLumaSatCurve(ls, 0) == 0.3f && evalLumaSatCurve(ls, 1) == 0.6f);
+  CHECK(evalLumaSatCurve(ls, 0.5f) > 0.3f && evalLumaSatCurve(ls, 0.5f) < 0.6f);
+  // saturation gain of a curve y
+  CHECK(satGainOfCurveY(0) == 0 && satGainOfCurveY(0.5f) == 1 && std::fabs(satGainOfCurveY(1) - 4) < 1e-5f);
+  CHECK(std::fabs(satGainOfCurveY(0.75f) - 2) < 1e-5f);
+}
+
+void testGradeWheels() {
+  ColorGrade n;  // every wheel present but neutral, pivot moved (contrast 0)
+  n.pivot = 0.3f;
+  GradePipeline p;
+  p.prepare(n, nullptr);
+  CHECK(p.noop());
+  auto pipe = [](const ColorGrade& g) {
+    GradePipeline q;
+    q.prepare(g, nullptr);
+    return q;
+  };
+  const float tol = 2e-4f;
+  // offset: x += 0.25 (m + c)
+  ColorGrade g;
+  g.offset.y = 0.2f;
+  g.offset.r = 0.4f;
+  g.offset.g = -0.2f;
+  g.offset.b = -0.2f;
+  p = pipe(g);
+  CHECK(std::fabs(runOne(p, 0.3f, 0.3f, 0.3f, 0) - (0.3f + 0.25f * 0.6f)) < tol);
+  CHECK(std::fabs(runOne(p, 0.3f, 0.3f, 0.3f, 1) - 0.3f) < tol);
+  CHECK(std::fabs(runOne(p, 0.6f, 0.2f, 0.4f, 2) - 0.4f) < tol);
+  // lift: x += 0.25 (m + c)(1 - x): black moves, white fixed
+  g = ColorGrade();
+  g.lift.y = 0.4f;
+  p = pipe(g);
+  for (float x : {0.0f, 0.25f, 0.5f, 1.0f})
+    CHECK_MSG(std::fabs(runOne(p, x, x, x, 1) - (x + 0.1f * (1 - x))) < tol, "lift at %g", x);
+  g.lift.y = 0;
+  g.lift.b = 0.8f;
+  g.lift.r = g.lift.g = -0.4f;
+  p = pipe(g);
+  CHECK(std::fabs(runOne(p, 0, 0, 0, 2) - 0.2f) < tol && runOne(p, 0, 0, 0, 0) == 0);  // red clamps at 0
+  CHECK(std::fabs(runOne(p, 1, 1, 1, 0) - 1) < tol && std::fabs(runOne(p, 1, 1, 1, 2) - 1) < tol);
+  // gamma: x^(2^-(m + c)): black and white fixed
+  g = ColorGrade();
+  g.gamma.y = 0.5f;
+  p = pipe(g);
+  for (float x : {0.0f, 0.25f, 0.5f, 1.0f})
+    CHECK_MSG(std::fabs(runOne(p, x, x, x, 0) - std::pow(x, std::exp2(-0.5f))) < tol, "gamma at %g", x);
+  g.gamma.y = 0;
+  g.gamma.g = -1;
+  g.gamma.r = g.gamma.b = 0.5f;
+  p = pipe(g);
+  CHECK(std::fabs(runOne(p, 0.5f, 0.5f, 0.5f, 1) - 0.25f) < tol &&
+        std::fabs(runOne(p, 0.5f, 0.5f, 0.5f, 0) - std::pow(0.5f, std::exp2(-0.5f))) < tol);
+  // gain: x * 2^(m + c): black fixed
+  g = ColorGrade();
+  g.gain.y = -0.5f;
+  p = pipe(g);
+  for (float x : {0.0f, 0.4f, 0.8f, 1.0f})
+    CHECK_MSG(std::fabs(runOne(p, x, x, x, 2) - x * std::exp2(-0.5f)) < tol, "gain at %g", x);
+  g.gain.y = 0.5f;  // white goes over 1: clamped at the end
+  p = pipe(g);
+  CHECK(runOne(p, 1, 1, 1, 0) == 1 && std::fabs(runOne(p, 0.5f, 0.5f, 0.5f, 0) - 0.7071f) < tol);
+  // contrast pivots around `pivot` (black, white and the pivot stay put)
+  for (float pv : {0.3f, 0.435f, 0.5f, 0.7f}) {
+    g = ColorGrade();
+    g.contrast = 0.6f;
+    g.pivot = pv;
+    p = pipe(g);
+    CHECK_MSG(std::fabs(runOne(p, pv, pv, pv, 1) - pv) < tol, "pivot %g", pv);
+    CHECK(runOne(p, 0, 0, 0, 1) == 0 && std::fabs(runOne(p, 1, 1, 1, 1) - 1) < tol);
+    CHECK(runOne(p, pv + 0.1f, pv + 0.1f, pv + 0.1f, 1) > pv + 0.1f &&
+          runOne(p, pv - 0.1f, pv - 0.1f, pv - 0.1f, 1) < pv - 0.1f);
+  }
+  // all four wheels + contrast keep a grey ramp monotonic
+  g = ColorGrade();
+  g.offset.y = -0.1f;
+  g.lift.y = 0.3f;
+  g.gamma.y = -0.4f;
+  g.gain.y = 0.3f;
+  g.contrast = 0.5f;
+  p = pipe(g);
+  float prev = -1;
+  bool mono = true;
+  for (int i = 0; i <= 1000; ++i) {
+    const float v = runOne(p, i / 1000.0f, i / 1000.0f, i / 1000.0f, 1);
+    mono = mono && v >= prev - 1e-6f;
+    prev = v;
+  }
+  CHECK(mono);
+}
+
+void testGradeCurvesStage() {
+  // Y curve acts on all channels, then the channel curve
+  ColorGrade g;
+  g.curve_y = {{0, 0}, {0.5f, 0.6f}, {1, 1}};
+  g.curve_b = {{0, 0.1f}, {1, 1}};
+  GradePipeline p;
+  p.prepare(g, nullptr);
+  const float y5 = evalCurve(g.curve_y, 0.5f);
+  CHECK(std::fabs(runOne(p, 0.5f, 0.5f, 0.5f, 0) - y5) < 1e-4f);
+  CHECK(std::fabs(runOne(p, 0.5f, 0.5f, 0.5f, 2) - evalCurve(g.curve_b, y5)) < 1e-4f);
+  // hue vs sat: y = 0 on red only -> red goes grey (luma kept), others untouched
+  g = ColorGrade();
+  g.hue_vs_sat = {{0, 0}, {1 / 6.0f, 0.5f}, {2 / 6.0f, 0.5f}, {3 / 6.0f, 0.5f}, {4 / 6.0f, 0.5f}, {5 / 6.0f, 0.5f}};
+  p.prepare(g, nullptr);
+  float c[3] = {1, 0, 0};
+  p.run(c);
+  CHECK_MSG(std::fabs(c[0] - 0.2126f) < 2e-3f && std::fabs(c[1] - 0.2126f) < 2e-3f && std::fabs(c[2] - 0.2126f) < 2e-3f,
+            "red -> %g %g %g", c[0], c[1], c[2]);
+  const float others[][3] = {{0, 1, 0}, {0, 0, 1}, {0, 1, 1}, {1, 1, 0}, {1, 0, 1}, {0.2f, 0.6f, 0.3f}};
+  for (const auto& o : others) {
+    float v[3] = {o[0], o[1], o[2]};
+    p.run(v);
+    CHECK_MSG(std::fabs(v[0] - o[0]) < 2e-3f && std::fabs(v[1] - o[1]) < 2e-3f && std::fabs(v[2] - o[2]) < 2e-3f,
+              "(%g %g %g) -> (%g %g %g)", o[0], o[1], o[2], v[0], v[1], v[2]);
+  }
+  // hue vs hue: a constant +1/6 turn takes a muted red to the yellow hue at the same luma
+  g = ColorGrade();
+  g.hue_vs_hue = {{0.3f, 0.5f + 1 / 6.0f}};
+  p.prepare(g, nullptr);
+  float in[3] = {0.6f, 0.4f, 0.4f}, out[3] = {0.6f, 0.4f, 0.4f};
+  p.run(out);
+  auto hueOf = [](const float* v) {
+    const float L = 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2];
+    return hueFromChromaAngle(std::atan2((v[0] - L) / 1.5748f, (v[2] - L) / 1.8556f));
+  };
+  auto lumaOf = [](const float* v) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
+  float dh = hueOf(out) - hueOf(in);
+  dh -= std::floor(dh + 0.5f);
+  CHECK_MSG(std::fabs(dh - 1 / 6.0f) < 2e-3f, "hue shift %g", dh);
+  CHECK(std::fabs(lumaOf(out) - lumaOf(in)) < 1e-4f);
+  // near grey the hue curves fade out: grey stays grey, tiny chroma barely moves
+  float grey[3] = {0.4f, 0.4f, 0.4f};
+  p.run(grey);
+  CHECK(std::fabs(grey[0] - 0.4f) < 1e-5f && std::fabs(grey[2] - 0.4f) < 1e-5f);
+  // luma vs sat at y = 0 everywhere: all grey
+  g = ColorGrade();
+  g.luma_vs_sat = {{0.5f, 0}};
+  p.prepare(g, nullptr);
+  float v[3] = {0.9f, 0.3f, 0.1f};
+  p.run(v);
+  CHECK(std::fabs(v[0] - v[1]) < 1e-5f && std::fabs(v[1] - v[2]) < 1e-5f);
+  // luma vs sat keyed on luma: dark colours desaturated, bright ones kept
+  g.luma_vs_sat = {{0, 0}, {0.3f, 0.5f}, {1, 0.5f}};
+  p.prepare(g, nullptr);
+  float dark[3] = {0.05f, 0.0f, 0.0f}, bright[3] = {1, 0.8f, 0.7f};
+  p.run(dark);
+  p.run(bright);
+  CHECK(std::fabs(dark[0] - dark[1]) < 4e-3f && std::fabs(bright[0] - 1) < 1e-3f && std::fabs(bright[2] - 0.7f) < 1e-3f);
+}
+
+ColorGrade neutralButPresent() {
+  ColorGrade g;
+  g.enabled = true;
+  g.pivot = 0.25f;
+  g.lift = ColorWheel();
+  g.curve_y = {{0, 0}, {1, 1}};
+  g.curve_r = {{0.5f, 0.5f}};
+  g.curve_g = {{0, 0}, {0.25f, 0.25f}, {1, 1}};
+  g.curve_b = {};
+  g.hue_vs_hue = {{0, 0.5f}, {0.5f, 0.5f}};
+  g.hue_vs_sat = {{0.3f, 0.5f}};
+  g.luma_vs_sat = {{0, 0.5f}, {1, 0.5f}};
+  return g;
+}
+
+void testGradeNeutralNewFields() {
+  const ColorGrade n = neutralButPresent();
+  CHECK(isIdentity(n));
+  GradePipeline p;
+  p.prepare(n, nullptr);
+  CHECK(p.noop());
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<float> d(-1, 2);
+  bool exact = true;
+  for (int i = 0; i < 1000; ++i) {
+    float c[3] = {d(rng), d(rng), d(rng)};
+    const float o[3] = {c[0], c[1], c[2]};
+    p.run(c);
+    exact = exact && c[0] == o[0] && c[1] == o[1] && c[2] == o[2];
+  }
+  CHECK(exact);
+  // with an identity LUT the table path stays exact (as in testGradeIdentity)
+  const std::string path = tempPath("owc_test_identity_new.cube");
+  CHECK(writeText(path, kIdentityCube2));
+  ColorGrade gl = n;
+  gl.lut = path;
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  const Img in = gradientNv12(512, 512);
+  Img out(in.w, in.h);
+  CHECK(gradeFrame(gr, gl, 2, false, in, out, buf));
+  int dy, duv;
+  maxDiff(in, out, dy, duv);
+  CHECK_MSG(dy <= 1 && duv <= 2, "max |dY| %d |dUV| %d", dy, duv);
+  // every single new control, when moved, makes the grade non-identity
+  std::vector<ColorGrade> moved(12, n);
+  moved[0].lift.r = 0.1f;
+  moved[1].gamma.y = 0.1f;
+  moved[2].gain.b = -0.1f;
+  moved[3].offset.g = 0.1f;
+  moved[4].curve_y = {{0.5f, 0.6f}};
+  moved[5].curve_r = {{0, 0.1f}, {1, 1}};
+  moved[6].curve_g = {{0.5f, 0.4f}};
+  moved[7].curve_b = {{1, 0.9f}};
+  moved[8].hue_vs_hue = {{0.2f, 0.6f}};
+  moved[9].hue_vs_sat = {{0.2f, 0.4f}};
+  moved[10].luma_vs_sat = {{0.2f, 0.4f}, {1, 0.5f}};
+  moved[11].contrast = 0.1f;
+  for (size_t i = 0; i < moved.size(); ++i) {
+    CHECK_MSG(!isIdentity(moved[i]), "case %zu", i);
+    p.prepare(moved[i], nullptr);
+    CHECK_MSG(!p.noop(), "case %zu", i);
+  }
+}
+
+void testExportCubeWheels() {
+  const std::string path = tempPath("owc_test_export_wheels.cube");
+  std::string err;
+  ColorGrade g;
+  g.gain.y = 0.5f;
+  CHECK(exportCube(g, path, 17, err));
+  CubeLut c;
+  CHECK(loadCubeFile(path, c, err) && c.size == 17);
+  // node (8, 8, 8) = grey 0.5 -> 0.5 * 2^0.5
+  const size_t i = (static_cast<size_t>(8) * 17 * 17 + 8 * 17 + 8) * 3;
+  CHECK_MSG(std::fabs(c.rgb[i] - 0.70711f) < 1e-4f && std::fabs(c.rgb[i + 2] - 0.70711f) < 1e-4f, "%g", c.rgb[i]);
+  // everything at once round-trips to the live pipeline
+  ColorGrade a;
+  a.lift = {0.1f, -0.05f, -0.05f, 0.05f};
+  a.gamma = {-0.1f, 0.05f, 0.05f, 0.1f};
+  a.gain = {0.05f, 0, -0.05f, -0.1f};
+  a.offset = {0, 0.02f, -0.02f, 0};
+  a.contrast = 0.3f;
+  a.pivot = 0.4f;
+  a.curve_y = {{0, 0}, {0.4f, 0.45f}, {1, 1}};
+  a.curve_r = {{0, 0}, {0.5f, 0.55f}, {1, 1}};
+  a.hue_vs_hue = {{0.0f, 0.55f}, {0.5f, 0.45f}};
+  a.hue_vs_sat = {{0.3f, 0.7f}, {0.7f, 0.4f}};
+  a.luma_vs_sat = {{0, 0.3f}, {0.5f, 0.5f}};
+  a.lut = "builtin:teal_orange";
+  a.lut_strength = 0.5f;
+  CHECK(exportCube(a, path, 9, err));
+  CHECK(loadCubeFile(path, c, err) && c.size == 9);
+  GradePipeline p;
+  p.prepare(a, builtinLookLut("teal_orange"));
+  float worst = 0;
+  for (int b = 0, k = 0; b < 9; ++b)
+    for (int gg = 0; gg < 9; ++gg)
+      for (int r = 0; r < 9; ++r, k += 3) {
+        float e[3] = {r / 8.0f, gg / 8.0f, b / 8.0f};
+        p.run(e);
+        for (int j = 0; j < 3; ++j) worst = std::max(worst, std::fabs(c.rgb[k + j] - std::min(1.0f, std::max(0.0f, e[j]))));
+      }
+  CHECK_MSG(worst < 1e-5f, "graded worst %g", worst);
+}
+
+// Full-range RGB of an NV12 pixel (block chroma), as renderGradedRgba converts.
+void nv12PixelRgb(const Img& im, uint32_t x, uint32_t r, uint32_t matrix, bool full, float* c) {
+  const float kr = matrix == 1 ? 0.299f : 0.2126f, kb = matrix == 1 ? 0.114f : 0.0722f;
+  const float yn = (im.Y(x, r) - (full ? 0.0f : 16.0f)) / (full ? 255.0f : 219.0f);
+  const uint8_t* uv = &im.uv[(r / 2) * im.w + (x & ~1u)];
+  const float cb = (uv[0] - 128.0f) / (full ? 255.0f : 224.0f), cr = (uv[1] - 128.0f) / (full ? 255.0f : 224.0f);
+  c[0] = yn + 2 * (1 - kr) * cr;
+  c[2] = yn + 2 * (1 - kb) * cb;
+  c[1] = (yn - kr * c[0] - kb * c[2]) / (1 - kr - kb);
+}
+
+void testRenderGradedRgba() {
+  // downscale: constant stays constant, 2x2 boxes average exactly
+  Img flat(64, 32);
+  std::fill(flat.y.begin(), flat.y.end(), static_cast<uint8_t>(77));
+  std::fill(flat.uv.begin(), flat.uv.end(), static_cast<uint8_t>(140));
+  std::vector<uint8_t> small;
+  downscaleNV12(flat.y.data(), flat.w, flat.uv.data(), flat.w, flat.w, flat.h, 16, 8, small);
+  CHECK(small.size() == 16 * 8 * 3 / 2 && std::all_of(small.begin(), small.begin() + 128, [](uint8_t v) { return v == 77; }) &&
+        std::all_of(small.begin() + 128, small.end(), [](uint8_t v) { return v == 140; }));
+  Img q(4, 4);
+  for (int i = 0; i < 16; ++i) q.y[i] = static_cast<uint8_t>(i * 10);
+  downscaleNV12(q.y.data(), 4, q.uv.data(), 4, 4, 4, 2, 2, small);
+  CHECK(small.size() == 6 && small[0] == 25 && small[1] == 45 && small[2] == 105 && small[3] == 125);
+  downscaleNV12(q.y.data(), 4, q.uv.data(), 4, 4, 4, 3, 3, small);  // odd -> even (2x2)
+  CHECK(small.size() == 6);
+
+  // matches the table path (in-gamut image, moderate grade)
+  const Img in = rgbBlocksNv12(320, 180, 2, false, 31);
+  ColorGrade g;
+  g.enabled = true;
+  g.contrast = 0.3f;
+  g.lift = {0.05f, -0.025f, -0.025f, 0.05f};
+  g.gain = {0, 0, 0, 0.1f};
+  g.curve_y = {{0, 0}, {0.5f, 0.55f}, {1, 1}};
+  g.hue_vs_sat = {{0, 0.65f}, {0.5f, 0.45f}};
+  g.saturation = 0.1f;
+  g.lut = "builtin:teal_orange";
+  g.lut_strength = 0.6f;
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  Img out(in.w, in.h);
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  std::vector<uint8_t> rgba;
+  std::string err;
+  CHECK(renderGradedRgba(g, nullptr, 0, 0, 2, false, rgba, &err) == false && !err.empty());
+  std::vector<uint8_t> packed(in.y);
+  packed.insert(packed.end(), in.uv.begin(), in.uv.end());
+  CHECK(renderGradedRgba(g, packed.data(), in.w, in.h, 2, false, rgba, &err) && err.empty());
+  CHECK(rgba.size() == static_cast<size_t>(in.w) * in.h * 4);
+  int worst = 0, over4 = 0;
+  double sum = 0;
+  bool opaque = true;
+  for (uint32_t r = 0; r < in.h; ++r)
+    for (uint32_t x = 0; x < in.w; ++x) {
+      float c[3];
+      nv12PixelRgb(out, x, r, 2, false, c);
+      const uint8_t* p = &rgba[(static_cast<size_t>(r) * in.w + x) * 4];
+      for (int k = 0; k < 3; ++k) {
+        const int ref = static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, c[k])) * 255));
+        worst = std::max(worst, std::abs(ref - p[k]));
+        sum += std::abs(ref - p[k]);
+        over4 += std::abs(ref - p[k]) > 4;
+      }
+      opaque = opaque && p[3] == 255;
+    }
+  const double mean = sum / (in.w * in.h * 3.0);
+  const double pctOver4 = 100.0 * over4 / (in.w * in.h * 3.0);
+  std::printf("  thumbnail vs table path: max %d, mean %.2f codes, %.2f%% > 4 codes\n", worst, mean, pctOver4);
+  // The table interpolates chroma bilinearly on an 8-code grid: saturated
+  // colours pushed against the gamut edge differ by a few codes (worst ~11).
+  CHECK_MSG(worst <= 16 && mean < 1.0 && pctOver4 < 1.0, "max %d mean %.2f >4: %.2f%%", worst, mean, pctOver4);
+  CHECK(opaque);
+  // enabled / compare_split are ignored
+  ColorGrade off = g;
+  off.enabled = false;
+  off.compare_split = true;
+  std::vector<uint8_t> rgba2;
+  CHECK(renderGradedRgba(off, packed.data(), in.w, in.h, 2, false, rgba2) && rgba2 == rgba);
+
+  // .cube through the cache: concurrent renders agree; a missing file reports
+  const std::string path = tempPath("owc_test_thumb.cube");
+  ColorGrade look;
+  look.contrast = 0.4f;
+  look.temperature = 0.5f;
+  CHECK(exportCube(look, path, 17, err));
+  ColorGrade fileGrade;
+  fileGrade.lut = path;
+  std::vector<std::vector<uint8_t>> res(4);
+  std::vector<int> oks(4, 0);
+  std::vector<std::thread> th;
+  for (int i = 0; i < 4; ++i)
+    th.emplace_back([&, i] { oks[i] = renderGradedRgba(fileGrade, packed.data(), in.w, in.h, 2, false, res[i]); });
+  for (auto& t : th) t.join();
+  CHECK(oks[0] && oks[1] && oks[2] && oks[3] && res[0] == res[1] && res[0] == res[2] && res[0] == res[3]);
+  CHECK(res[0] != rgba);
+  // the cached LUT-less base follows the grade
+  std::vector<uint8_t> again;
+  CHECK(renderGradedRgba(g, packed.data(), in.w, in.h, 2, false, again) && again == rgba);
+  ColorGrade missing = g;
+  missing.lut = tempPath("owc_missing_thumb_42.cube");
+  CHECK(!renderGradedRgba(missing, packed.data(), in.w, in.h, 2, false, rgba2, &err) && !err.empty());
+  ColorGrade noLut = g;
+  noLut.lut.clear();
+  std::vector<uint8_t> rgba3;
+  CHECK(renderGradedRgba(noLut, packed.data(), in.w, in.h, 2, false, rgba3) && rgba3 == rgba2);
+}
+
+// Alpha of pixel (x, y) of an RGBA image of width w.
+inline uint8_t alphaAt(const std::vector<uint8_t>& img, uint32_t w, uint32_t x, uint32_t y) {
+  return img[(static_cast<size_t>(y) * w + x) * 4 + 3];
+}
+
+void testScopes() {
+  ScopeOptions o;  // 512x256, vector 256, step 2
+  ScopeImages s;
+  // black frame (limited range): waveform energy on the bottom row only
+  Img black(320, 180);
+  std::fill(black.y.begin(), black.y.end(), static_cast<uint8_t>(16));
+  std::fill(black.uv.begin(), black.uv.end(), static_cast<uint8_t>(128));
+  computeScopes(black.y.data(), black.w, black.uv.data(), black.w, black.w, black.h, o, s);
+  CHECK(s.w == 512 && s.h == 256 && s.vs == 256 && s.waveform.size() == 512 * 256 * 4 &&
+        s.vectorscope.size() == 256 * 256 * 4);
+  // (code 16 is the centre of the black row: box resampling lets at most
+  // the row above catch the sliver of the code's interval beyond the edge)
+  bool onlyBottom = true;
+  int bottomLit = 0;
+  for (uint32_t y = 0; y < s.h; ++y)
+    for (uint32_t x = 0; x < s.w; ++x) {
+      const uint8_t a = alphaAt(s.waveform, s.w, x, y);
+      if (y == s.h - 1) bottomLit += a > 0;
+      else onlyBottom = onlyBottom && (a == 0 || y == s.h - 2);
+    }
+  CHECK_MSG(onlyBottom && bottomLit > 500, "bottom lit %d", bottomLit);
+  // vectorscope: only the centre
+  bool centreOnly = true;
+  for (uint32_t y = 0; y < s.vs; ++y)
+    for (uint32_t x = 0; x < s.vs; ++x)
+      if (alphaAt(s.vectorscope, s.vs, x, y))
+        centreOnly = centreOnly && std::abs(static_cast<int>(x) - 128) <= 1 && std::abs(static_cast<int>(y) - 128) <= 1;
+  CHECK(centreOnly);
+
+  // pure red, full range BT.709: parade R at the top, G and B at the bottom
+  Img red(320, 180);
+  std::fill(red.y.begin(), red.y.end(), static_cast<uint8_t>(54));
+  for (size_t i = 0; i < red.uv.size(); i += 2) {
+    red.uv[i] = 99;
+    red.uv[i + 1] = 255;
+  }
+  ScopeOptions of = o;
+  of.full_range = true;
+  of.matrix = 2;
+  computeScopes(red.y.data(), red.w, red.uv.data(), red.w, red.w, red.h, of, s);
+  const uint32_t P = s.w / 3;
+  int minRow[3] = {9999, 9999, 9999}, maxRow[3] = {-1, -1, -1};
+  for (uint32_t y = 0; y < s.h; ++y)
+    for (uint32_t x = 0; x < 3 * P; ++x)
+      if (alphaAt(s.parade, s.w, x, y)) {
+        const uint32_t k = x / P;
+        minRow[k] = std::min(minRow[k], static_cast<int>(y));
+        maxRow[k] = std::max(maxRow[k], static_cast<int>(y));
+      }
+  CHECK_MSG(maxRow[0] >= 0 && maxRow[0] <= 2, "R rows %d..%d", minRow[0], maxRow[0]);
+  CHECK_MSG(minRow[1] >= static_cast<int>(s.h) - 3 && minRow[2] >= static_cast<int>(s.h) - 3, "G from %d, B from %d",
+            minRow[1], minRow[2]);
+  // red's parade traces are reddish
+  const uint8_t* rp = &s.parade[(static_cast<size_t>(maxRow[0]) * s.w + P / 2) * 4];
+  CHECK(rp[3] > 0 && rp[0] >= rp[1] && rp[0] >= rp[2]);
+
+  // 75% colour bars (limited 709): vectorscope energy at the 75% targets only
+  const float bars[6][3] = {{0.75f, 0.75f, 0}, {0, 0.75f, 0.75f}, {0, 0.75f, 0}, {0.75f, 0, 0.75f}, {0.75f, 0, 0}, {0, 0, 0.75f}};
+  Img cb(384, 64);
+  for (uint32_t x = 0; x < cb.w; ++x) {
+    const float* c = bars[x * 6 / cb.w];
+    const float Y = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+    const float u = (c[2] - Y) / 1.8556f, v = (c[0] - Y) / 1.5748f;
+    for (uint32_t r = 0; r < cb.h; ++r) cb.y[r * cb.w + x] = static_cast<uint8_t>(std::lround(16 + 219 * Y));
+    for (uint32_t r = 0; r < cb.h / 2; ++r) {
+      cb.uv[r * cb.w + (x & ~1u)] = static_cast<uint8_t>(std::lround(128 + 224 * u));
+      cb.uv[r * cb.w + (x & ~1u) + 1] = static_cast<uint8_t>(std::lround(128 + 224 * v));
+    }
+  }
+  ScopeOptions ob = o;
+  ob.matrix = 2;
+  computeScopes(cb.y.data(), cb.w, cb.uv.data(), cb.w, cb.w, cb.h, ob, s);
+  const std::vector<VectorTarget> tg = vectorscopeTargets(2);
+  CHECK(tg.size() == 6);
+  std::vector<int> hits(tg.size(), 0);
+  bool allNear = true;
+  for (uint32_t y = 0; y < s.vs; ++y)
+    for (uint32_t x = 0; x < s.vs; ++x) {
+      if (!alphaAt(s.vectorscope, s.vs, x, y)) continue;
+      bool isNear = false;
+      for (size_t k = 0; k < tg.size(); ++k) {
+        const float dx = (x + 0.5f) - tg[k].x75 * s.vs, dy = (y + 0.5f) - tg[k].y75 * s.vs;
+        if (dx * dx + dy * dy <= 3.0f * 3.0f) {
+          isNear = true;
+          ++hits[k];
+        }
+      }
+      allNear = allNear && isNear;
+    }
+  CHECK(allNear);
+  for (size_t k = 0; k < tg.size(); ++k) CHECK_MSG(hits[k] > 0, "no energy at %s", tg[k].label);
+  // the 100% targets are 4/3 of the 75% ones from the centre, the skin line in the R..Yl sector
+  CHECK(std::fabs((tg[0].x100 - 0.5f) * 0.75f - (tg[0].x75 - 0.5f)) < 1e-6f);
+  const float skin = vectorscopeSkinLineAngle() * 180 / 3.14159265f;
+  CHECK(skin > 115 && skin < 130);
+
+  // histogram: two equal halves (full-range grey 64 / 192) -> two equal bars
+  Img two(256, 128);
+  for (uint32_t r = 0; r < two.h; ++r)
+    for (uint32_t x = 0; x < two.w; ++x) two.y[r * two.w + x] = x < two.w / 2 ? 64 : 192;
+  std::fill(two.uv.begin(), two.uv.end(), static_cast<uint8_t>(128));
+  computeScopes(two.y.data(), two.w, two.uv.data(), two.w, two.w, two.h, of, s);
+  std::vector<int> colLit(s.w, 0);
+  for (uint32_t y = 0; y < s.h; ++y)
+    for (uint32_t x = 0; x < s.w; ++x) colLit[x] += alphaAt(s.histogram, s.w, x, y) > 0;
+  const uint32_t c64 = 64 * s.w / 256, c192 = 192 * s.w / 256;
+  CHECK_MSG(colLit[c64] == static_cast<int>(s.h) && colLit[c192] == static_cast<int>(s.h), "bars %d %d", colLit[c64],
+            colLit[c192]);
+  bool elsewhereEmpty = true;
+  for (uint32_t x = 0; x < s.w; ++x)
+    if (x + 1 < c64 || (x > c64 + 2 && x + 1 < c192) || x > c192 + 2) elsewhereEmpty = elsewhereEmpty && colLit[x] == 0;
+  CHECK(elsewhereEmpty);
+  // the bar is grey (R+G+B additive) under the white luma outline at its edge
+  const uint8_t* hp = &s.histogram[(static_cast<size_t>(s.h / 2) * s.w + c64 + 1) * 4];
+  CHECK(hp[3] > 0 && std::abs(hp[0] - hp[1]) < 40 && std::abs(hp[1] - hp[2]) < 40);
+  // transparent background
+  CHECK(s.histogram[3] == 0 && s.waveform[3] == 0);
+
+  // (a) luma gradient across the code range, tall waveform: no empty rows
+  {
+    Img gr(1024, 64);
+    std::fill(gr.uv.begin(), gr.uv.end(), static_cast<uint8_t>(128));
+    for (int pass = 0; pass < 4; ++pass) {
+      const bool full = pass & 1, wide = pass & 2;  // wide: 0..255 codes in limited range too
+      const int lo = full || wide ? 0 : 16, hi = full || wide ? 255 : 235;
+      for (uint32_t r = 0; r < gr.h; ++r)
+        for (uint32_t x = 0; x < gr.w; ++x)
+          gr.y[r * gr.w + x] = static_cast<uint8_t>(lo + (hi - lo) * x / (gr.w - 1));
+      for (uint32_t H : {128u, 256u, 512u, 700u}) {
+        ScopeOptions og;
+        og.width = 512;
+        og.height = H;
+        og.step = 1;
+        og.full_range = full;
+        computeScopes(gr.y.data(), gr.w, gr.uv.data(), gr.w, gr.w, gr.h, og, s);
+        // value range of the gradient -> rows
+        const double vlo = full ? lo / 255.0 : std::max(0.0, (lo - 16) / 219.0);
+        const double vhi = full ? hi / 255.0 : std::min(1.0, (hi - 16) / 219.0);
+        const int rTop = static_cast<int>(std::ceil((H - 1) * (1 - vhi))), rBot = static_cast<int>((H - 1) * (1 - vlo));
+        int empty = 0;
+        for (int y = rTop; y <= rBot; ++y) {
+          bool any = false;
+          for (uint32_t x = 0; x < s.w && !any; ++x) any = alphaAt(s.waveform, s.w, x, static_cast<uint32_t>(y)) > 0;
+          empty += !any;
+        }
+        CHECK_MSG(empty == 0, "waveform gradient pass %d H=%u: %d empty rows in %d..%d", pass, H, empty, rTop, rBot);
+        // and every column of the gradient is lit
+        int darkCols = 0;
+        for (uint32_t x = 0; x < s.w; ++x) {
+          bool any = false;
+          for (uint32_t y = 0; y < s.h && !any; ++y) any = alphaAt(s.waveform, s.w, x, y) > 0;
+          darkCols += !any;
+        }
+        CHECK_MSG(darkCols == 0, "pass %d H=%u: %d dark columns", pass, H, darkCols);
+      }
+    }
+  }
+  // (b) flat mid-grey: energy in 1..3 rows around the expected one, any height
+  {
+    Img gy(256, 64);
+    std::fill(gy.y.begin(), gy.y.end(), static_cast<uint8_t>(128));
+    std::fill(gy.uv.begin(), gy.uv.end(), static_cast<uint8_t>(128));
+    for (uint32_t H : {128u, 256u, 512u}) {
+      ScopeOptions og;
+      og.height = H;
+      og.full_range = true;
+      computeScopes(gy.y.data(), gy.w, gy.uv.data(), gy.w, gy.w, gy.h, og, s);
+      const uint32_t x = s.w / 2;
+      int lit = 0, brightest = 0;
+      uint32_t best = 0;
+      for (uint32_t y = 0; y < s.h; ++y) {
+        const uint8_t a = alphaAt(s.waveform, s.w, x, y);
+        lit += a > 0;
+        if (a > brightest) brightest = a, best = y;
+      }
+      const double expect = (H - 1) * (1 - 128 / 255.0);
+      CHECK_MSG(lit >= 1 && lit <= 3 && std::fabs(best - expect) <= 1.0, "flat grey H=%u: %d rows, best %u expect %.1f", H,
+                lit, best, expect);
+    }
+  }
+  // (c) vectorscope of a smooth chroma disc: continuous, no lattice
+  {
+    Img dc(1024, 1024);
+    std::fill(dc.y.begin(), dc.y.end(), static_cast<uint8_t>(120));
+    std::fill(dc.uv.begin(), dc.uv.end(), static_cast<uint8_t>(128));
+    const double R = 100;  // chroma codes
+    for (uint32_t r2 = 0; r2 < dc.h / 2; ++r2)
+      for (uint32_t x2 = 0; x2 < dc.w / 2; ++x2) {
+        const double dx = (x2 + 0.5) / (dc.w / 2.0) * 2 - 1, dy = (r2 + 0.5) / (dc.h / 2.0) * 2 - 1;
+        if (dx * dx + dy * dy > 1) continue;
+        dc.uv[r2 * dc.w + x2 * 2] = static_cast<uint8_t>(std::lround(128 + R * dx));
+        dc.uv[r2 * dc.w + x2 * 2 + 1] = static_cast<uint8_t>(std::lround(128 + R * dy));
+      }
+    for (uint32_t VS : {128u, 256u, 512u}) {
+      ScopeOptions ov;
+      ov.vector_size = VS;
+      ov.step = 1;
+      ov.matrix = 1;
+      computeScopes(dc.y.data(), dc.w, dc.uv.data(), dc.w, dc.w, dc.h, ov, s);
+      const double rpx = 0.95 * R / 224.0 * 0.9 * VS;  // footprint radius in pixels
+      int inside = 0, zero = 0;
+      for (uint32_t y = 0; y < VS; ++y)
+        for (uint32_t x = 0; x < VS; ++x) {
+          const double ddx = x + 0.5 - VS / 2.0, ddy = y + 0.5 - VS / 2.0;
+          if (ddx * ddx + ddy * ddy > rpx * rpx) continue;
+          ++inside;
+          zero += alphaAt(s.vectorscope, VS, x, y) == 0;
+        }
+      std::printf("  vectorscope disc VS=%u: %d px inside, %d empty\n", VS, inside, zero);
+      CHECK_MSG(inside > 0 && zero * 100 < inside, "VS=%u: %d of %d footprint pixels empty", VS, zero, inside);
+    }
+  }
+  // (d) histogram of a limited-range gradient: no empty column in the range
+  {
+    Img gr(1024, 16);
+    std::fill(gr.uv.begin(), gr.uv.end(), static_cast<uint8_t>(128));
+    for (uint32_t r = 0; r < gr.h; ++r)
+      for (uint32_t x = 0; x < gr.w; ++x) gr.y[r * gr.w + x] = static_cast<uint8_t>(16 + 219 * x / (gr.w - 1));
+    for (uint32_t W : {240u, 512u, 1024u}) {
+      ScopeOptions oh;
+      oh.width = W;
+      oh.step = 1;
+      computeScopes(gr.y.data(), gr.w, gr.uv.data(), gr.w, gr.w, gr.h, oh, s);
+      int empty = 0;
+      for (uint32_t x = 0; x < W; ++x) empty += alphaAt(s.histogram, W, x, s.h - 1) == 0;
+      CHECK_MSG(empty == 0, "histogram W=%u: %d empty columns", W, empty);
+    }
+  }
+}
+
+void testGradeAllOnBenchmark() {
+  // Everything active: wheels, every curve, hue curves, a .cube file LUT.
+  const uint32_t w = 1920, h = 1080;
+  Img in(w, h);
+  std::mt19937 rng(2);
+  for (uint32_t r = 0; r < h; ++r)
+    for (uint32_t x = 0; x < w; ++x)
+      in.y[r * w + x] = static_cast<uint8_t>(std::min<uint32_t>(235, 16 + (x + r) * 219 / (w + h) + rng() % 8));
+  for (uint32_t r = 0; r < h / 2; ++r)
+    for (uint32_t x = 0; x < w / 2; ++x) {
+      in.uv[r * w + 2 * x] = static_cast<uint8_t>(96 + x * 64 / (w / 2) + rng() % 4);
+      in.uv[r * w + 2 * x + 1] = static_cast<uint8_t>(160 - r * 64 / (h / 2) + rng() % 4);
+    }
+  std::string err;
+  const std::string cube = tempPath("owc_test_allon.cube");
+  ColorGrade look;
+  look.contrast = 0.2f;
+  look.temperature = 0.3f;
+  look.vibrance = 0.3f;
+  CHECK(exportCube(look, cube, 33, err));
+  ColorGrade g;
+  g.enabled = true;
+  g.exposure_ev = 0.2f;
+  g.temperature = 0.1f;
+  g.contrast = 0.2f;
+  g.shadows = 0.1f;
+  g.vibrance = 0.2f;
+  g.lift = {0.05f, -0.025f, -0.025f, 0.02f};
+  g.gamma = {-0.02f, 0.01f, 0.01f, 0.05f};
+  g.gain = {0, 0.02f, -0.02f, 0.05f};
+  g.offset = {0.01f, 0, -0.01f, 0};
+  g.curve_y = {{0, 0}, {0.25f, 0.22f}, {0.75f, 0.8f}, {1, 1}};
+  g.curve_r = {{0, 0}, {0.5f, 0.52f}, {1, 1}};
+  g.curve_g = {{0, 0.02f}, {1, 1}};
+  g.curve_b = {{0, 0}, {0.5f, 0.47f}, {1, 0.98f}};
+  g.hue_vs_hue = {{0.05f, 0.52f}, {0.3f, 0.48f}, {0.6f, 0.5f}};
+  g.hue_vs_sat = {{0.0f, 0.55f}, {0.33f, 0.45f}, {0.66f, 0.6f}};
+  g.luma_vs_sat = {{0, 0.4f}, {0.5f, 0.5f}, {1, 0.45f}};
+  g.lut = cube;
+  g.lut_strength = 0.8f;
+  ColorGrader gr;
+  std::vector<uint8_t> buf;
+  Img out(w, h);
+  CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+  CHECK_MSG(gr.status().error.empty() && gr.status().lutSize == 33, "%s", gr.status().error.c_str());
+  double bakeBest = 1e9;
+  for (int i = 0; i < 5; ++i) {
+    g.contrast = 0.21f + 0.01f * i;  // steady-state re-bakes (LUT cached)
+    CHECK(gradeFrame(gr, g, 2, false, in, out, buf));
+    bakeBest = std::min(bakeBest, gr.status().bakeMs);
+  }
+  GradePipeline p;
+  std::shared_ptr<const CubeLut> lut = cachedCubeFile(cube, err);
+  auto t0 = std::chrono::steady_clock::now();
+  p.prepare(g, lut);
+  const double prepMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  GradeTable t;
+  t0 = std::chrono::steady_clock::now();
+  bakeGradeTable(p, 2, false, t, 1);
+  const double bake1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  // apply: the ColorGrade (7 curve vectors) is passed per frame as present() does
+  double total = 0, best = 1e9;
+  const int frames = 60;
+  for (int i = 0; i < frames + 5; ++i) {
+    const ColorGrade perFrame = g;  // the getOpt() copy
+    const uint8_t* y = in.y.data();
+    const uint8_t* uv = in.uv.data();
+    uint32_t ys = w, uvs = w;
+    const auto a = std::chrono::steady_clock::now();
+    gr.apply(perFrame, 2, false, y, ys, uv, uvs, w, h, buf);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    if (i >= 5) {
+      total += ms;
+      best = std::min(best, ms);
+    }
+  }
+  std::printf("  all-on bake: %.1f ms (%d threads, best of 5), %.1f ms single-threaded (prepare %.2f ms)\n", bakeBest,
+              std::max(1, std::min(4, static_cast<int>(std::thread::hardware_concurrency()) / 2)), bake1, prepMs);
+  std::printf("  all-on 1080p apply: avg %.2f ms, best %.2f ms\n", total / frames, best);
+  CHECK(bakeBest < 200);
+
+  // gallery thumbnail: 1080p -> 192x108, then graded RGBA (cached .cube), single thread
+  std::vector<uint8_t> small, rgba;
+  t0 = std::chrono::steady_clock::now();
+  downscaleNV12(in.y.data(), w, in.uv.data(), w, w, h, 192, 108, small);
+  const double dsMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(renderGradedRgba(g, small.data(), 192, 108, 2, false, rgba, &err));  // warm the cache
+  double rBest = 1e9, rTotal = 0;
+  for (int i = 0; i < 10; ++i) {
+    t0 = std::chrono::steady_clock::now();
+    renderGradedRgba(g, small.data(), 192, 108, 2, false, rgba, &err);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    rBest = std::min(rBest, ms);
+    rTotal += ms;
+  }
+  std::printf("  thumbnail 192x108 all-on: avg %.2f ms, best %.2f ms (downscale from 1080p %.2f ms)\n", rTotal / 10,
+              rBest, dsMs);
+
+  // scopes, 1080p, step 2, single thread
+  ScopeOptions so;
+  so.matrix = 2;
+  ScopeImages si;
+  double sBest = 1e9, sTotal = 0;
+  for (int i = 0; i < 10; ++i) {
+    t0 = std::chrono::steady_clock::now();
+    computeScopes(in.y.data(), w, in.uv.data(), w, w, h, so, si);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    sBest = std::min(sBest, ms);
+    sTotal += ms;
+  }
+  std::printf("  scopes 1080p step 2 (512x256, VS 256): avg %.2f ms, best %.2f ms\n", sTotal / 10, sBest);
+  so.width = 1024;
+  so.height = 512;
+  so.vector_size = 512;
+  sBest = 1e9, sTotal = 0;
+  for (int i = 0; i < 10; ++i) {
+    t0 = std::chrono::steady_clock::now();
+    computeScopes(in.y.data(), w, in.uv.data(), w, w, h, so, si);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    sBest = std::min(sBest, ms);
+    sTotal += ms;
+  }
+  std::printf("  scopes 1080p step 2 (W=1024 H=512 VS=512): avg %.2f ms, best %.2f ms\n", sTotal / 10, sBest);
+}
+
 }  // namespace
 
 int main() {
@@ -1235,6 +2086,15 @@ int main() {
   RUN(testGradeLutFileErrorAndReload);
   RUN(testExportCube);
   RUN(testGradeBenchmark);
+  RUN(testWheels);
+  RUN(testCurveEval);
+  RUN(testGradeWheels);
+  RUN(testGradeCurvesStage);
+  RUN(testGradeNeutralNewFields);
+  RUN(testExportCubeWheels);
+  RUN(testRenderGradedRgba);
+  RUN(testScopes);
+  RUN(testGradeAllOnBenchmark);
   std::printf("%s (%d failure(s))\n", owctest::failures() ? "FAILED" : "ALL PASSED", owctest::failures());
   return owctest::failures() ? 1 : 0;
 }

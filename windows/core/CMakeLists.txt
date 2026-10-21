@@ -10,6 +10,7 @@ add_library(owc_core STATIC
   src/metrics.cpp
   src/presets.cpp
   src/record_setup.cpp
+  src/scopes.cpp
   src/recorder.cpp
   src/sps_patch.cpp
   src/transform.cpp

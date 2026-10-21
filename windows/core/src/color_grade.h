@@ -32,14 +32,55 @@ namespace detail {
 // Built-in look as a 33^3 3D LUT (generated once, cached). null if unknown key.
 std::shared_ptr<const CubeLut> builtinLookLut(const std::string& key);
 
+// .cube file through a process-wide cache keyed by path + modification stamp
+// (thread-safe, bounded by memory). null + err when it cannot be loaded.
+std::shared_ptr<const CubeLut> cachedCubeFile(const std::string& path, std::string& err);
+
+// "" -> null (ok), "builtin:<key>" -> generated look, else a .cube path (cached).
+bool resolveLut(const std::string& spec, std::shared_ptr<const CubeLut>& lut, std::string& title,
+                std::string& err);
+
+// A custom / hue / luma-vs-sat curve prepared once for fast evaluation (the
+// public evalCurve / evalHueCurve / evalLumaSatCurve use it too, with a
+// per-thread cache of the last curve of each kind).
+// Monotone cubic Hermite (Fritsch-Carlson tangents) through the cleaned points.
+class PreparedCurve {
+ public:
+  enum class Kind { Custom, Hue, LumaSat };
+  PreparedCurve(const std::vector<CurvePoint>& pts, Kind kind);
+  float eval(float x) const;
+  // Custom: y == x everywhere. Hue / LumaSat: y == 0.5 everywhere.
+  bool neutral() const { return neutral_; }
+
+ private:
+  Kind kind_;
+  bool neutral_ = true;
+  std::vector<float> x_, y_, m_;  // knots (periodic: x_ in [0,1), wrap implied)
+};
+
+// Saturation gain of a hue-vs-sat / luma-vs-sat y value: 2^(4(y-0.5)) for
+// y >= 0.5; below, 2^(4(y-0.5)) - 0.25(1-2y)^2 so that y = 0 is exactly 0
+// (grey), C1 at 0.5, monotonic.
+float satGainOfCurveY(float y);
+
+// Hue coordinate of the hue curves (0..1, R 0, Yl 1/6, G 1/3, Cy 1/2, B 2/3,
+// Mg 5/6; piecewise linear in the BT.709 Cb/Cr angle between those anchors)
+// <-> Cb/Cr angle (radians, counter-clockwise from +Cb).
+float hueFromChromaAngle(float rad);
+float chromaAngleFromHue(float hue);
+
 // The RGB pipeline of a ColorGrade, prepared once (curves precomputed into 1D
 // tables). Works on the stream's gamma-encoded RGB (0..1); luminance-based
 // steps use BT.709 weights so the result does not depend on the YUV matrix
 // (exportCube() and the live grade match).
 class GradePipeline {
  public:
-  // `lut` may be null. Keeps a reference to it.
-  void prepare(const ColorGrade& g, std::shared_ptr<const CubeLut> lut);
+  // `lut` may be null. Keeps a reference to it. `curveN` = resolution of the
+  // 1D tables (4096 for the table bake / export; the gallery thumbnails use
+  // 1024: 4x cheaper to prepare, differences far below 8-bit on screen).
+  void prepare(const ColorGrade& g, std::shared_ptr<const CubeLut> lut, int curveN = kCurveN);
+  // Replaces the LUT (mixed by `strength`) of a prepared pipeline.
+  void setLut(std::shared_ptr<const CubeLut> lut, float strength);
   // In-place. Any input is accepted: the steps see the input clamped to 0..1,
   // the result is clamped to 0..1 and the input's out-of-range excess is added
   // back (luma as is, chroma through the grade's local chroma transform), so
@@ -47,17 +88,28 @@ class GradePipeline {
   // turns it grey.
   void run(float rgb[3]) const;
   // True when run() is an exact identity.
-  bool noop() const { return !useA_ && !useContrast_ && !useTone_ && !useSat_ && !useLut_; }
+  bool noop() const { return !usePre_ && !useTone_ && !useCurves_ && !useHue_ && !useSat_ && !useLut_; }
 
  private:
+  static constexpr int kCurveN = 4096;
+  static constexpr int kHueN = 1024;  // periodic angle tables (power of two)
+
   void core(float c[3]) const;  // the steps, on 0..1 input, unclamped output
+  void hueStage(float c[3]) const;
   void chromaRatio(const float* in, const float* out, float& re, float& im) const;
 
-  static constexpr int kCurveN = 4096;
-  bool useA_ = false, useContrast_ = false, useTone_ = false, useSat_ = false, useLut_ = false;
-  std::vector<float> curveA_[3];   // per channel: white balance + exposure
-  std::vector<float> curveC_;      // contrast
+  bool usePre_ = false, useTone_ = false, useCurves_ = false, useSat_ = false, useLut_ = false;
+  bool useHue_ = false, useHueShift_ = false, useHueSat_ = false, useLumaSat_ = false;
+  bool postOn_[3] = {false, false, false};  // custom curves active on this channel
+  // per channel: white balance + exposure -> offset -> lift / gamma / gain ->
+  // contrast (pivot), folded into one table on 0..1 (output unclamped)
+  std::vector<float> curvePre_[3];
   std::vector<float> curveTone_;   // luminance delta (shadows / highlights)
+  std::vector<float> curvePost_[3];  // custom curves: channel curve of the master curve
+  // over the Cb/Cr angle 0..2pi (kHueN steps, periodic):
+  std::vector<float> hueRot_;      // [kHueN][2] cos, sin of the hue vs hue rotation
+  std::vector<float> hueSat_;      // [kHueN] saturation gain (hue vs sat)
+  std::vector<float> lumaSat_;     // [curveN] saturation gain over luma 0..1
   float sat_ = 0, vib_ = 0, lutMix_ = 0;
   float ratioRe_ = 1, ratioIm_ = 0;  // global chroma ratio (see chromaRatio)
   std::shared_ptr<const CubeLut> lut_;
@@ -161,6 +213,8 @@ class ColorGrader {
   std::condition_variable cv_, bakedCv_;
   std::thread bakeThread_;
   std::unique_ptr<BandPool> pool_;   // decode thread only
+  Key probe_;                        // decode thread only: reassigned per frame (keeps its
+                                     // vectors' capacity, so the key check does not allocate)
   bool engaged_ = false;             // decode thread only: a non-identity grade was requested
   bool quit_ = false;
   bool haveWant_ = false;

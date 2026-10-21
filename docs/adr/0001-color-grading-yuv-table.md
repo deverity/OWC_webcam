@@ -1,6 +1,7 @@
 # ADR 0001: PC colour grading as a baked YUV-domain table
 
-Status: accepted (2026-10-21)
+Status: accepted (2026-10-21); extended by [ADR 0002](0002-color-page-wheels-curves-scopes.md)
+(wheels, curves, hue curves, scopes, gallery thumbnails: same table, more RGB stages)
 Code: `windows/core/src/color_grade.{h,cpp}`, `Client::Impl::present()`.
 
 ## Context
