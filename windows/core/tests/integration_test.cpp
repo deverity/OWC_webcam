@@ -1,7 +1,9 @@
 // owc_core integration test: in-process FakePhone (loopback, ephemeral ports)
-// <-> owc::Client. Verifies handshake, discovery, TCP and UDP (+loss, +FEC)
-// streaming, decoded frame counters, shared-memory output, B-frame handling,
-// transforms, Busy / NoResponse errors; prints measured latencies.
+// <-> owc::Client. Verifies handshake, authentication / pairing (protocol v2),
+// discovery, TCP and UDP (+loss, +FEC) streaming, decoded frame counters,
+// shared-memory output, B-frame handling, transforms, Busy / NoResponse
+// errors; prints measured latencies. Every streaming scenario authenticates
+// with a pairing preloaded on the fake phone (AuthProof path).
 #include "test_util.h"
 
 #include "decoder.h"
@@ -25,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -34,6 +37,32 @@ using namespace owc;
 namespace {
 
 void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// This test PC's identity and the key the fake phone has for it (preloaded).
+const ClientId kTestClientId = {0x0c, 0x11, 0xe2, 0x7a, 0x55, 0x01, 0x9b, 0x3d,
+                                0x42, 0x6f, 0x80, 0x13, 0xc4, 0x29, 0xd7, 0x6e};
+const Key32 kTestKey = {0x51, 0x2e, 0x93, 0x04, 0xaa, 0x7c, 0x18, 0xf0, 0x3b, 0x66, 0xd1,
+                        0x82, 0x0e, 0x49, 0xb5, 0x27, 0xc8, 0x1d, 0x74, 0x9a, 0x36, 0xef,
+                        0x05, 0x58, 0xbc, 0x63, 0x20, 0x8f, 0xd2, 0x47, 0x9e, 0x11};
+
+// The fake phone knows kTestClientId with kTestKey.
+fake::FakePhoneConfig& preload(fake::FakePhoneConfig& pc) {
+  fake::FakePhoneConfig::PairedClient c;
+  c.client_id = kTestClientId;
+  c.key = kTestKey;
+  c.name = "integration-test";
+  pc.paired_clients.push_back(c);
+  return pc;
+}
+
+// The client holds the key for this phone.
+void authorize(ConnectParams& cp, const fake::FakePhone& phone) {
+  cp.client_id = kTestClientId;
+  PairedPhone pp;
+  pp.phone_id = phone.phoneId();
+  pp.key = kTestKey;
+  cp.paired.push_back(pp);
+}
 
 struct Recorder : ClientEvents {
   std::mutex mx;
@@ -181,7 +210,7 @@ ClientStats runScenario(const Scenario& sc) {
   pc.logger = [](const std::string& s) { std::printf("    phone: %s\n", s.c_str()); };
   fake::FakePhone phone;
   std::string err;
-  if (!phone.start(pc, err)) {
+  if (!phone.start(preload(pc), err)) {
     CHECK_MSG(false, "fakephone start: %s", err.c_str());
     return ClientStats();
   }
@@ -196,6 +225,7 @@ ClientStats runScenario(const Scenario& sc) {
   ConnectParams cp;
   cp.host = "127.0.0.1";
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   cp.transport = sc.transport;
   cp.client_name = "integration-test";
   CHECK(client.connect(cp));
@@ -317,7 +347,7 @@ void testDiscovery() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Discovery::Options o;
   o.port = phone.discoveryPort();
   o.broadcast = false;
@@ -356,7 +386,7 @@ void testBusyAndNoResponse() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   ClientOptions o;
   o.auto_reconnect = false;
   o.auto_start_stream = false;
@@ -364,6 +394,7 @@ void testBusyAndNoResponse() {
   Client c1(&r1, o), c2(&r2, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c1.connect(cp);
   for (int i = 0; i < 300 && c1.state() != ClientState::Connected; ++i) sleepMs(5);
   CHECK(c1.state() == ClientState::Connected);
@@ -403,6 +434,7 @@ void testBusyAndNoResponse() {
   Recorder r3;
   Client c3(&r3, o3);
   ConnectParams cp3;
+  cp3.client_id = kTestClientId;
   cp3.port = ntohs(a.sin_port);
   const int64_t t0 = detail::steadyMs();
   c3.connect(cp3);
@@ -417,6 +449,7 @@ void testBusyAndNoResponse() {
   Recorder r4;
   Client c4(&r4, o);
   ConnectParams cp4;
+  cp4.client_id = kTestClientId;
   cp4.port = Adb::pickFreeTcpPort();
   c4.connect(cp4);
   for (int i = 0; i < 400 && c4.state() != ClientState::Failed; ++i) sleepMs(5);
@@ -434,7 +467,7 @@ void testTransformAndControls() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Recorder rec;
   ClientOptions o;
   o.auto_reconnect = false;
@@ -446,6 +479,7 @@ void testTransformAndControls() {
   Client c(&rec, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c.connect(cp);
   for (int i = 0; i < 1000 && rec.frames < 20; ++i) sleepMs(5);
   {
@@ -551,7 +585,7 @@ void testDiscoveryAnnounceAndSweep() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Discovery::Options o;
   o.broadcast = false;
   o.subnet_sweep = false;
@@ -631,13 +665,14 @@ ClientStats codecRun(const char* tag, const DecoderCapabilities* caps, int hevcM
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   ClientOptions o;
   o.auto_reconnect = false;
   o.publish_to_shm = false;
   Client c(&rec, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c.connect(cp);
   for (int i = 0; i < 1600 && rec.frames < 40; ++i) sleepMs(5);
   const ClientStats s = c.stats();
@@ -782,7 +817,7 @@ void testRecording() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Recorder rec;
   ClientOptions o;
   o.auto_reconnect = false;
@@ -791,6 +826,7 @@ void testRecording() {
   Client c(&rec, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c.connect(cp);
   for (int i = 0; i < 1000 && rec.frames < 20; ++i) sleepMs(5);
   CHECK(rec.frames >= 20);
@@ -869,13 +905,14 @@ struct SetupPhone {
     pc.hevc_stats_fps_scale = hevcFpsScale;
     pc.logger = [](const std::string&) {};
     std::string err;
-    if (!phone.start(pc, err)) return false;
+    if (!phone.start(preload(pc), err)) return false;
     ClientOptions o;
     o.auto_reconnect = false;
     o.publish_to_shm = false;
     c.reset(new Client(&rec, o));
     ConnectParams cp;
     cp.port = phone.controlPort();
+    authorize(cp, phone);
     c->connect(cp);
     for (int i = 0; i < 1000 && rec.frames < 15; ++i) sleepMs(5);
     return rec.frames >= 15;
@@ -976,7 +1013,7 @@ void testRecordingEpochSplit() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Recorder rec;
   ClientOptions o;
   o.auto_reconnect = false;
@@ -984,6 +1021,7 @@ void testRecordingEpochSplit() {
   Client c(&rec, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c.connect(cp);
   for (int i = 0; i < 1000 && rec.frames < 10; ++i) sleepMs(5);
   RecordOptions ro;
@@ -1027,13 +1065,14 @@ void testShmBusOwnedByOther() {
   pc.logger = [](const std::string&) {};
   fake::FakePhone phone;
   std::string err;
-  CHECK(phone.start(pc, err));
+  CHECK(phone.start(preload(pc), err));
   Recorder rec;
   ClientOptions o;
   o.auto_reconnect = false;
   Client c(&rec, o);
   ConnectParams cp;
   cp.port = phone.controlPort();
+  authorize(cp, phone);
   c.connect(cp);
   for (int i = 0; i < 1000 && rec.frames < 15; ++i) sleepMs(5);
   ClientStats s = c.stats();
@@ -1051,6 +1090,553 @@ void testShmBusOwnedByOther() {
   c.disconnect();
 }
 
+// ---------------------------------------------------------------- pairing (protocol v2)
+constexpr const char* kCode = "246810";
+
+struct PairRec : Recorder {
+  std::mutex pmx;
+  std::vector<PairingInfo> prompts;  // onPairing
+  std::vector<PhoneId> rejected;     // onKeyRejected
+  bool paired = false, pairedBeforeConnected = false;
+  PhoneId pairedPhone{};
+  Key32 pairedKey{};
+  DeviceInfo pairedInfo;
+  std::atomic<int> connects{0};
+
+  void onPairing(const PairingInfo& i) override {
+    std::lock_guard<std::mutex> lk(pmx);
+    prompts.push_back(i);
+  }
+  void onPaired(const PhoneId& id, const Key32& key, const DeviceInfo& di) override {
+    std::lock_guard<std::mutex> lk(pmx);
+    paired = true;
+    pairedBeforeConnected = connects.load() == 0;
+    pairedPhone = id;
+    pairedKey = key;
+    pairedInfo = di;
+  }
+  void onKeyRejected(const PhoneId& id) override {
+    std::lock_guard<std::mutex> lk(pmx);
+    rejected.push_back(id);
+  }
+  void onConnected(const DeviceInfo& d) override {
+    Recorder::onConnected(d);
+    ++connects;
+  }
+  size_t promptCount() {
+    std::lock_guard<std::mutex> lk(pmx);
+    return prompts.size();
+  }
+  bool sawState(ClientState s) {
+    std::lock_guard<std::mutex> lk(mx);
+    for (ClientState x : states)
+      if (x == s) return true;
+    return false;
+  }
+};
+
+// A phone that knows nobody, with a fixed code.
+fake::FakePhoneConfig pairPhoneConfig() {
+  fake::FakePhoneConfig pc;
+  pc.bind_address = "127.0.0.1";
+  pc.control_port = pc.udp_port = pc.discovery_port = 0;
+  pc.enable_discovery = false;
+  pc.width = 640;
+  pc.height = 480;
+  pc.pair_code = kCode;
+  pc.logger = [](const std::string& s) { std::printf("    phone: %s\n", s.c_str()); };
+  return pc;
+}
+
+ClientOptions pairOptions(bool autoReconnect) {
+  ClientOptions o;
+  o.auto_reconnect = autoReconnect;
+  o.reconnect_delay_ms = 200;
+  o.publish_to_shm = false;
+  return o;
+}
+
+ConnectParams freshParams(const fake::FakePhone& phone, const ClientId& id) {
+  ConnectParams cp;
+  cp.port = phone.controlPort();
+  cp.client_id = id;
+  cp.client_name = "pairing-test";
+  return cp;
+}
+
+bool waitFor(const std::function<bool()>& pred, int ms) {
+  const int64_t t0 = detail::steadyMs();
+  while (detail::steadyMs() - t0 < ms) {
+    if (pred()) return true;
+    sleepMs(5);
+  }
+  return pred();
+}
+
+bool waitState(Client& c, ClientState s, int ms) {
+  return waitFor([&] { return c.state() == s; }, ms);
+}
+
+bool waitSession(Client& c, int ms) {
+  return waitFor([&] {
+    const ClientState s = c.state();
+    return s == ClientState::Connected || s == ClientState::Streaming;
+  }, ms);
+}
+
+void testConnectRequiresClientId() {
+  Client c(nullptr, pairOptions(false));
+  ConnectParams cp;  // client_id all zeros
+  cp.port = Adb::pickFreeTcpPort();  // nothing listens: never reaches a real phone
+  CHECK(!c.connect(cp));
+  const ClientId a = newClientId(), b = newClientId();
+  CHECK(a != ClientId{} && b != ClientId{} && a != b);
+  cp.client_id = a;
+  CHECK(c.connect(cp));
+  c.disconnect();
+}
+
+// First connection of a new PC: code shown, typed, key delivered; nothing else
+// (no Ping, no StartStream) reaches the phone before AuthResult Ok.
+void testPairingFirstTime() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  Client c(&rec, pairOptions(true));
+  const ClientId me = newClientId();
+  CHECK(c.connect(freshParams(phone, me)));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  PairingInfo pi = c.pairingInfo();
+  CHECK(pi.active && !pi.code_pending && !pi.wrong_code);
+  CHECK(pi.phone_id == phone.phoneId() && pi.device_name == "FakePhone" && pi.model == "OWC-Fake");
+  CHECK_MSG(pi.attempts_left == kPairCodeAttempts && pi.code_lifetime_s == kPairCodeLifetimeS,
+            "attempts %u lifetime %u", pi.attempts_left, pi.code_lifetime_s);
+  CHECK_MSG(pi.ms_left > 110000 && pi.ms_left <= 120000u, "ms_left %u", pi.ms_left);
+  CHECK(rec.promptCount() == 1);
+  CHECK(phone.lastPairCode() == kCode);
+  DeviceInfo di;
+  CHECK(!c.deviceInfo(di) && !rec.connected);
+  sleepMs(600);  // the client must stay quiet (no Ping before authentication)
+  auto pc = phone.counters();
+  CHECK_MSG(pc.unauth_msgs == 0 && pc.pings == 0, "unauth msgs %llu pings %llu",
+            static_cast<unsigned long long>(pc.unauth_msgs), static_cast<unsigned long long>(pc.pings));
+  CHECK(c.state() == ClientState::Pairing);  // not bounded by handshake/idle timeouts
+  CHECK(c.submitPairingCode(std::string(" ") + kCode + " "));
+  CHECK(!c.submitPairingCode(kCode));  // already being checked (or already paired)
+  CHECK(waitSession(c, 3000));
+  CHECK(waitFor([&] { return rec.frames.load() >= 10; }, 5000));
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    CHECK(rec.paired && rec.pairedBeforeConnected);
+    CHECK(rec.pairedPhone == phone.phoneId() && rec.pairedInfo.phone_id == phone.phoneId());
+    const auto known = phone.pairedClients();
+    CHECK(known.size() == 1 && !known.empty() && known[0].client_id == me && known[0].key == rec.pairedKey &&
+          known[0].name == "pairing-test");
+    CHECK(rec.rejected.empty());
+    const ConnectParams now = c.connectParams();
+    CHECK(now.paired.size() == 1 && !now.paired.empty() && now.paired[0].phone_id == phone.phoneId() &&
+          now.paired[0].key == rec.pairedKey);
+  }
+  CHECK(c.deviceInfo(di) && di.phone_id == phone.phoneId());
+  CHECK(!c.pairingInfo().active);
+  pc = phone.counters();
+  CHECK(pc.pair_begins == 1 && pc.pair_ok == 1 && pc.unauth_msgs == 0 && pc.auth_proofs == 0);
+  c.disconnect();
+  CHECK(waitState(c, ClientState::Idle, 2000));
+}
+
+// A paired PC reconnects with AuthProof only (auto-reconnect and a new Client
+// that got the key from onPaired, like the app after a restart).
+void testPairingReconnectUsesProof() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  Client c(&rec, pairOptions(true));
+  const ClientId me = newClientId();
+  CHECK(c.connect(freshParams(phone, me)));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  CHECK(waitFor([&] { return rec.frames.load() >= 5; }, 5000));
+  phone.kickClient();  // connection lost without Bye -> auto-reconnect
+  CHECK(waitFor([&] { return rec.connects.load() >= 2; }, 6000));
+  CHECK(waitFor([&] { return phone.streaming(); }, 3000));
+  auto pc = phone.counters();
+  CHECK_MSG(pc.pair_begins == 1 && pc.auth_proofs == 1 && pc.auth_ok == 1,
+            "pair_begins %llu proofs %llu ok %llu", static_cast<unsigned long long>(pc.pair_begins),
+            static_cast<unsigned long long>(pc.auth_proofs), static_cast<unsigned long long>(pc.auth_ok));
+  CHECK(rec.promptCount() == 1 && c.stats().reconnect_count >= 1);
+  Key32 key;
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    key = rec.pairedKey;
+  }
+  c.disconnect();
+  CHECK(waitState(c, ClientState::Idle, 2000));
+
+  PairRec rec2;
+  Client c2(&rec2, pairOptions(true));  // the phone may still be closing the last session (Busy)
+  ConnectParams cp = freshParams(phone, me);
+  PairedPhone pp;
+  pp.phone_id = phone.phoneId();
+  pp.key = key;
+  cp.paired.push_back(pp);
+  CHECK(c2.connect(cp));
+  CHECK(waitSession(c2, 3000));
+  pc = phone.counters();
+  CHECK(pc.pair_begins == 1 && pc.auth_ok == 2);
+  CHECK(rec2.promptCount() == 0 && !rec2.paired && rec2.rejected.empty());
+  CHECK(!rec2.sawState(ClientState::Pairing));
+  c2.disconnect();
+}
+
+void testPairingWrongThenRight() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  Client c(&rec, pairOptions(false));
+  CHECK(!c.submitPairingCode(kCode));  // not pairing
+  CHECK(c.connect(freshParams(phone, newClientId())));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(!c.submitPairingCode("12345"));
+  CHECK(!c.submitPairingCode("12a456"));
+  CHECK(!c.submitPairingCode("1234567"));
+  CHECK(!c.submitPairingCode(""));
+  CHECK(c.submitPairingCode("000000"));
+  CHECK(waitFor([&] { return c.pairingInfo().wrong_code; }, 3000));
+  const PairingInfo pi = c.pairingInfo();
+  CHECK_MSG(pi.active && !pi.code_pending && pi.attempts_left == kPairCodeAttempts - 1, "attempts left %u",
+            pi.attempts_left);
+  CHECK(c.state() == ClientState::Pairing);
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    CHECK(rec.prompts.size() == 2 && rec.prompts.size() >= 2 && rec.prompts[1].wrong_code &&
+          rec.prompts[1].attempts_left == kPairCodeAttempts - 1);
+  }
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  CHECK(rec.paired);
+  const auto pc = phone.counters();
+  CHECK(pc.pair_wrong == 1 && pc.pair_ok == 1 && pc.pair_begins == 1);
+  c.disconnect();
+}
+
+// The PC holds a key the phone no longer accepts: forget it, pair again on the
+// same connection.
+void testPairingStaleKey() {
+  const ClientId me = newClientId();
+  Key32 oldKey{}, phoneKey{};
+  for (size_t i = 0; i < oldKey.size(); ++i) {
+    oldKey[i] = static_cast<uint8_t>(i + 1);
+    phoneKey[i] = static_cast<uint8_t>(0xA0 + i);
+  }
+  fake::FakePhoneConfig cfg = pairPhoneConfig();
+  fake::FakePhoneConfig::PairedClient known;
+  known.client_id = me;
+  known.key = phoneKey;  // the phone knows this PC, but with another key
+  cfg.paired_clients.push_back(known);
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(cfg, err));
+
+  // (a) HelloAck paired=true -> AuthProof -> NotPaired -> onKeyRejected -> PairBegin
+  PairRec rec;
+  Client c(&rec, pairOptions(true));
+  ConnectParams cp = freshParams(phone, me);
+  PairedPhone pp;
+  pp.phone_id = phone.phoneId();
+  pp.key = oldKey;
+  cp.paired.push_back(pp);
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  auto pc = phone.counters();
+  CHECK(pc.auth_proofs == 1 && pc.auth_not_paired == 1 && pc.pair_begins == 1);
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    CHECK(rec.rejected.size() == 1 && !rec.rejected.empty() && rec.rejected[0] == phone.phoneId());
+  }
+  CHECK(c.connectParams().paired.empty());
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    CHECK(rec.paired && rec.pairedKey != oldKey && rec.pairedKey != phoneKey);
+    CHECK(c.connectParams().paired.size() == 1);
+  }
+  c.disconnect();
+  CHECK(waitState(c, ClientState::Idle, 2000));
+
+  // (b) the PC was removed on the phone (HelloAck paired=false): no AuthProof
+  // at all, the key is dropped and a pairing starts.
+  phone.setPairedClients({});
+  PairRec rec2;
+  Client c2(&rec2, pairOptions(true));
+  ConnectParams cp2 = freshParams(phone, me);
+  pp.key = rec.pairedKey;
+  cp2.paired.push_back(pp);
+  CHECK(c2.connect(cp2));
+  CHECK(waitState(c2, ClientState::Pairing, 3000));
+  pc = phone.counters();
+  CHECK(pc.auth_proofs == 1 && pc.pair_begins == 2);
+  CHECK(rec2.rejected.size() == 1 && c2.connectParams().paired.empty());
+  CHECK(c2.cancelPairing());
+  CHECK(waitState(c2, ClientState::Idle, 2000));
+}
+
+// Too many wrong codes: Failed (PairingLocked) and NO auto-reconnect.
+void testPairingLockedNoReconnect() {
+  fake::FakePhoneConfig cfg = pairPhoneConfig();
+  cfg.pair_attempts = 2;
+  cfg.pair_lockout_s = 30;
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(cfg, err));
+  PairRec rec;
+  Client c(&rec, pairOptions(true));  // auto-reconnect ON: must still not retry
+  const ConnectParams cp = freshParams(phone, newClientId());
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(c.pairingInfo().attempts_left == 2);
+  CHECK(c.submitPairingCode("111111"));
+  CHECK(waitFor([&] { return c.pairingInfo().wrong_code; }, 3000));
+  CHECK(c.submitPairingCode("222222"));
+  CHECK(waitState(c, ClientState::Failed, 3000));
+  CHECK(c.lastDisconnectReason() == DisconnectReason::PairingLocked);
+  PairingInfo pi = c.pairingInfo();
+  CHECK_MSG(pi.last_status == AuthStatus::Locked && pi.retry_after_s == 30 && !pi.active,
+            "status %d retry %u", static_cast<int>(pi.last_status), pi.retry_after_s);
+  {
+    std::lock_guard<std::mutex> lk(rec.mx);
+    CHECK_MSG(rec.lastMsg.find("retry in 30 s") != std::string::npos, "message '%s'", rec.lastMsg.c_str());
+  }
+  sleepMs(1500);
+  CHECK(c.state() == ClientState::Failed);
+  CHECK(!rec.sawState(ClientState::Reconnecting));
+  auto pc = phone.counters();
+  CHECK(pc.pair_begins == 1 && pc.pair_locked == 1 && pc.pair_wrong == 2);
+
+  // A new connect() during the cooldown: the phone answers Locked at once.
+  CHECK(c.connect(cp));
+  CHECK(waitFor([&] { return phone.counters().pair_begins == 2; }, 3000));
+  CHECK(waitState(c, ClientState::Failed, 3000));
+  pi = c.pairingInfo();
+  CHECK(c.lastDisconnectReason() == DisconnectReason::PairingLocked);
+  CHECK_MSG(pi.retry_after_s >= 1 && pi.retry_after_s <= 30, "retry %u", pi.retry_after_s);
+  sleepMs(800);
+  CHECK(phone.counters().pair_begins == 2 && c.state() == ClientState::Failed);
+}
+
+void testCancelPairing() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  Client c(&rec, pairOptions(true));
+  const ConnectParams cp = freshParams(phone, newClientId());
+  CHECK(!c.cancelPairing());  // not pairing
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(c.cancelPairing());
+  CHECK(waitState(c, ClientState::Idle, 2000));
+  CHECK(c.lastDisconnectReason() == DisconnectReason::UserRequested);
+  CHECK(!c.pairingInfo().active);
+  sleepMs(500);
+  CHECK(c.state() == ClientState::Idle && phone.counters().pair_begins == 1);
+  // the phone is free again (the cancelled connection was closed)
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(phone.counters().pair_begins == 2);
+  CHECK(c.cancelPairing());
+  CHECK(waitState(c, ClientState::Idle, 2000));
+}
+
+void testPairingExpiredAndRejected() {
+  {  // the code expires on the phone
+    fake::FakePhoneConfig cfg = pairPhoneConfig();
+    cfg.pair_code_lifetime_s = 1;
+    fake::FakePhone phone;
+    std::string err;
+    CHECK(phone.start(cfg, err));
+    PairRec rec;
+    Client c(&rec, pairOptions(true));
+    CHECK(c.connect(freshParams(phone, newClientId())));
+    CHECK(waitState(c, ClientState::Pairing, 3000));
+    CHECK(c.pairingInfo().code_lifetime_s == 1);
+    CHECK(waitState(c, ClientState::Failed, 4000));
+    CHECK(c.lastDisconnectReason() == DisconnectReason::PairingExpired);
+    sleepMs(800);
+    CHECK(c.state() == ClientState::Failed && phone.counters().pair_begins == 1);
+    CHECK(phone.counters().pair_expired == 1);
+  }
+  {  // "cancel" tapped on the phone
+    fake::FakePhone phone;
+    std::string err;
+    CHECK(phone.start(pairPhoneConfig(), err));
+    PairRec rec;
+    Client c(&rec, pairOptions(true));
+    CHECK(c.connect(freshParams(phone, newClientId())));
+    CHECK(waitState(c, ClientState::Pairing, 3000));
+    phone.rejectPairing();
+    CHECK(waitState(c, ClientState::Failed, 3000));
+    CHECK(c.lastDisconnectReason() == DisconnectReason::PairingRejected);
+    CHECK(c.pairingInfo().last_status == AuthStatus::Rejected);
+    sleepMs(800);
+    CHECK(c.state() == ClientState::Failed && phone.counters().pair_begins == 1);
+  }
+}
+
+// The PC is removed on the phone while connected (the phone sends Bye and
+// closes): the auto-reconnect must NOT start a pairing (no new code on the
+// phone) but end in Failed/NotPaired. Same for a refused key on auto-reconnect.
+void testAutoReconnectNeverPairs() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  Client c(&rec, pairOptions(true));
+  const ClientId me = newClientId();
+  CHECK(c.connect(freshParams(phone, me)));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  CHECK(waitFor([&] { return rec.frames.load() >= 5; }, 5000));
+
+  // (a) removed on the phone: Bye -> auto-reconnect -> HelloAck paired=false -> Failed
+  phone.setPairedClients({});
+  CHECK(waitState(c, ClientState::Failed, 6000));
+  CHECK_MSG(c.lastDisconnectReason() == DisconnectReason::NotPaired, "reason %s",
+            toString(c.lastDisconnectReason()));
+  CHECK(rec.sawState(ClientState::Reconnecting));
+  {
+    std::lock_guard<std::mutex> lk(rec.pmx);
+    CHECK(rec.rejected.size() == 1 && !rec.rejected.empty() && rec.rejected[0] == phone.phoneId());
+  }
+  CHECK(c.connectParams().paired.empty());
+  sleepMs(1000);
+  auto pc = phone.counters();
+  CHECK_MSG(pc.pair_begins == 1 && c.state() == ClientState::Failed, "pair_begins %llu state %s",
+            static_cast<unsigned long long>(pc.pair_begins), toString(c.state()));
+  CHECK(rec.promptCount() == 1);
+
+  // (b) a user connect() may pair again; then the key goes stale and an
+  // auto-reconnect gets NotPaired for its AuthProof: Failed, still no PairBegin
+  CHECK(c.connect(freshParams(phone, me)));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(phone.counters().pair_begins == 2);
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  fake::FakePhoneConfig::PairedClient other;
+  other.client_id = me;
+  other.key[0] = 0x5A;  // the phone now holds another key for this PC
+  phone.setPairedClients({other});
+  phone.kickClient();
+  CHECK(waitFor([&] { return c.state() == ClientState::Failed; }, 6000));
+  CHECK(c.lastDisconnectReason() == DisconnectReason::NotPaired);
+  sleepMs(800);
+  pc = phone.counters();
+  CHECK_MSG(pc.pair_begins == 2 && pc.auth_not_paired == 1 && c.state() == ClientState::Failed,
+            "pair_begins %llu not_paired %llu", static_cast<unsigned long long>(pc.pair_begins),
+            static_cast<unsigned long long>(pc.auth_not_paired));
+}
+
+// A raw "phone" answering Hello with a fixed HelloAck, to check the client's
+// order of checks: a v1 phone (status Ok, version 1, zero nonce) must be a
+// VersionMismatch; a v2 phone answering status Ok is a protocol error (never
+// "authenticated").
+DisconnectReason helloAckOutcome(const HelloAck& reply, std::string& msg) {
+  detail::winsockInit();
+  SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  bind(l, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+  listen(l, 4);
+  int al = sizeof(a);
+  getsockname(l, reinterpret_cast<sockaddr*>(&a), &al);
+  std::atomic<bool> stop{false};
+  std::thread srv([&] {
+    while (!stop) {
+      fd_set r;
+      FD_ZERO(&r);
+      FD_SET(l, &r);
+      timeval tv{0, 50000};
+      if (select(0, &r, nullptr, nullptr, &tv) <= 0) continue;
+      SOCKET s = accept(l, nullptr, nullptr);
+      if (s == INVALID_SOCKET) continue;
+      char buf[512];
+      recv(s, buf, sizeof buf, 0);  // the Hello
+      std::vector<uint8_t> out;
+      appendTcpMessage(out, MsgType::HelloAck, encode(reply));
+      send(s, reinterpret_cast<const char*>(out.data()), static_cast<int>(out.size()), 0);
+      sleepMs(300);
+      closesocket(s);
+    }
+  });
+  Recorder rec;
+  ClientOptions o = pairOptions(false);
+  Client c(&rec, o);
+  ConnectParams cp;
+  cp.port = ntohs(a.sin_port);
+  cp.client_id = newClientId();
+  c.connect(cp);
+  waitState(c, ClientState::Failed, 4000);
+  const DisconnectReason r = c.lastDisconnectReason();
+  {
+    std::lock_guard<std::mutex> lk(rec.mx);
+    msg = rec.lastMsg;
+  }
+  CHECK(!rec.connected);
+  stop = true;
+  srv.join();
+  closesocket(l);
+  return r;
+}
+
+void testHelloAckChecks() {
+  std::string msg;
+  HelloAck v1;
+  v1.version = 1;
+  v1.status = HelloStatus::Ok;  // what a v1 phone sends; its v2 trailer decodes as zeros
+  DisconnectReason r = helloAckOutcome(v1, msg);
+  CHECK_MSG(r == DisconnectReason::VersionMismatch, "v1 phone: %s (%s)", toString(r), msg.c_str());
+  HelloAck v1busy = v1;
+  v1busy.status = HelloStatus::Busy;
+  r = helloAckOutcome(v1busy, msg);
+  CHECK_MSG(r == DisconnectReason::VersionMismatch, "v1 busy phone: %s", toString(r));
+  HelloAck okV2;
+  okV2.status = HelloStatus::Ok;  // v2 must say AuthRequired
+  r = helloAckOutcome(okV2, msg);
+  CHECK_MSG(r == DisconnectReason::ProtocolError, "v2 status Ok: %s (%s)", toString(r), msg.c_str());
+}
+
+// The phone counts wrong codes globally: a new code may allow fewer attempts.
+void testPairingGlobalAttempts() {
+  fake::FakePhone phone;
+  std::string err;
+  CHECK(phone.start(pairPhoneConfig(), err));
+  PairRec rec;
+  // Auto-reconnect: the phone may still be closing the cancelled connection
+  // (Busy); a Busy attempt does not use up the connect()'s right to pair.
+  Client c(&rec, pairOptions(true));
+  const ConnectParams cp = freshParams(phone, newClientId());
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 3000));
+  CHECK(c.pairingInfo().attempts_left == kPairCodeAttempts);
+  CHECK(c.submitPairingCode("999999"));
+  CHECK(waitFor([&] { return c.pairingInfo().wrong_code; }, 3000));
+  CHECK(c.cancelPairing());
+  CHECK(waitState(c, ClientState::Idle, 2000));
+  CHECK(c.connect(cp));
+  CHECK(waitState(c, ClientState::Pairing, 5000));
+  CHECK_MSG(c.pairingInfo().attempts_left == kPairCodeAttempts - 1, "attempts %u", c.pairingInfo().attempts_left);
+  CHECK(c.submitPairingCode(kCode));
+  CHECK(waitSession(c, 3000));
+  c.disconnect();
+}
+
 }  // namespace
 
 int main() {
@@ -1064,6 +1650,17 @@ int main() {
   RUN(testDiscovery);
   RUN(testDiscoveryAnnounceAndSweep);
   RUN(testBusyAndNoResponse);
+  RUN(testConnectRequiresClientId);
+  RUN(testPairingFirstTime);
+  RUN(testPairingReconnectUsesProof);
+  RUN(testPairingWrongThenRight);
+  RUN(testPairingStaleKey);
+  RUN(testPairingLockedNoReconnect);
+  RUN(testCancelPairing);
+  RUN(testPairingExpiredAndRejected);
+  RUN(testAutoReconnectNeverPairs);
+  RUN(testPairingGlobalAttempts);
+  RUN(testHelloAckChecks);
   RUN(testTransformAndControls);
   RUN(testShmBusOwnedByOther);
   RUN(testCodecNegotiation);

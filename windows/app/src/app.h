@@ -115,7 +115,18 @@ class App : public owc::ClientEvents {
   void connectUsb(const std::string& serial, const std::string& label);
   void disconnect();
   bool sessionUp() const;  // Connected or Streaming
-  bool live() const;       // keep running in tray (Connecting..Streaming/Reconnecting)
+  bool live() const;       // keep running in tray (Connecting..Streaming/Reconnecting, Pairing)
+
+  // ---- pairing (protocol v2). Keys live in settings.paired_phones (DPAPI on disk).
+  struct PairedView {
+    std::string phone_hex;  // phone_id, lower-case hex
+    PairedPhoneEntry entry;
+  };
+  std::vector<PairedView> pairedPhones();  // snapshot for the UI (sorted by label)
+  // Forgets a phone on this PC only (the phone keeps listing this PC until the
+  // user removes it there). Also drops it from the client's reconnect copy.
+  void forgetPairedPhone(const std::string& phoneHex);
+  std::string clientIdHex();
 
   // ---- USB flow
   UsbPhase usbPhase();
@@ -190,6 +201,8 @@ class App : public owc::ClientEvents {
   // ---- ClientEvents
   void onStateChanged(owc::ClientState, owc::DisconnectReason, const std::string&) override;
   void onConnected(const owc::DeviceInfo&) override;
+  void onPaired(const owc::PhoneId&, const owc::Key32&, const owc::DeviceInfo&) override;
+  void onKeyRejected(const owc::PhoneId&) override;
   void onCapabilities(const owc::Capabilities&) override;
   void onParamState(const owc::ParamState&) override;
   void onFrame(const owc::DecodedFrame&) override;
@@ -203,6 +216,7 @@ class App : public owc::ClientEvents {
 
   std::mutex mu_;
   std::atomic<bool> dirty_{false};
+  std::atomic<bool> save_asap_{false};  // pairing changes: saved on the next tick, no debounce
   ULONGLONG dirty_since_ = 0;
   HANDLE frame_event_ = nullptr;
 

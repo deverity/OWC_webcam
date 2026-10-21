@@ -5,6 +5,7 @@
 #include "color_grade.h"
 #include "decoder.h"
 #include "metrics.h"
+#include "pairing.h"
 #include "record_setup.h"
 #include "recorder.h"
 #include "sps_patch.h"
@@ -37,6 +38,7 @@ const char* toString(ClientState s) {
     case ClientState::Idle: return "Idle";
     case ClientState::Connecting: return "Connecting";
     case ClientState::Handshaking: return "Handshaking";
+    case ClientState::Pairing: return "Pairing";
     case ClientState::Connected: return "Connected";
     case ClientState::Streaming: return "Streaming";
     case ClientState::Reconnecting: return "Reconnecting";
@@ -59,6 +61,11 @@ const char* toString(DisconnectReason r) {
     case DisconnectReason::Timeout: return "Timeout";
     case DisconnectReason::ProtocolError: return "ProtocolError";
     case DisconnectReason::SocketError: return "SocketError";
+    case DisconnectReason::PairingLocked: return "PairingLocked";
+    case DisconnectReason::PairingExpired: return "PairingExpired";
+    case DisconnectReason::PairingRejected: return "PairingRejected";
+    case DisconnectReason::NotAuthorized: return "NotAuthorized";
+    case DisconnectReason::NotPaired: return "NotPaired";
   }
   return "?";
 }
@@ -108,6 +115,12 @@ struct WorkItem {
 struct SessionResult {
   DisconnectReason reason = DisconnectReason::None;
   std::string message;
+  bool noReconnect = false;  // ended during/after a pairing attempt: never auto-reconnect
+};
+
+struct AuthOutcome {
+  bool newKey = false;  // a pairing just succeeded: `key` is new (ClientEvents::onPaired)
+  Key32 key{};
 };
 
 // Estimates lost UDP fragments from frag_count of partially/never seen frames.
@@ -258,6 +271,14 @@ struct Client::Impl {
   VideoTransport transport = VideoTransport::Tcp;
   int64_t sessionStartMs = 0;
   uint32_t reconnects = 0;
+  // pairing of the current/last attempt (see PairingInfo)
+  PairingInfo pairing;
+  int64_t pairCodeExpiresMs = 0;  // steady ms when the shown code expires (0 = no code)
+  std::string pairCodeOut;        // accepted by submitPairingCode(), sent by the net thread
+  // Net thread: a pairing may still be started for the current connect() (true
+  // until its first AuthRequired HelloAck). Auto-reconnects never pair.
+  bool mayPair = false;
+  uint64_t mayPairGen = 0;
 
   // ---- clock
   mutable std::mutex clockMx;
@@ -549,6 +570,10 @@ struct Client::Impl {
         myGen = gen;
         p = params;
       }
+      if (myGen != mayPairGen) {  // a new connect(): its first authentication may pair
+        mayPairGen = myGen;
+        mayPair = true;
+      }
       SessionResult r = runSession(p, myGen);
       bool userStop;
       {
@@ -566,8 +591,10 @@ struct Client::Impl {
         continue;
       }
       const ClientOptions o = getOpt();
+      // Pairing outcomes never auto-reconnect: a reconnect would ask the phone
+      // for yet another code (r.noReconnect covers every end after PairBegin).
       const bool fatal = r.reason == DisconnectReason::VersionMismatch ||
-                         r.reason == DisconnectReason::BadMagic;
+                         r.reason == DisconnectReason::BadMagic || r.noReconnect;
       logf(LogLevel::Warn, "session ended: %s %s", toString(r.reason), r.message.c_str());
       if (o.auto_reconnect && !fatal) {
         setState(ClientState::Reconnecting, r.reason, r.message);
@@ -668,6 +695,254 @@ struct Client::Impl {
     fmt = VideoFormat();
   }
 
+  // ============================================================ authentication
+  // Net thread, right after an AuthRequired HelloAck. Runs the PAIRING exchange
+  // of owc/protocol.h: AuthProof with a known key, else (or after NotPaired)
+  // ONE PairBegin, then waits for the user's code (state Pairing). With
+  // !allowPair (auto-reconnect) a missing/refused key ends in Failed/NotPaired
+  // instead: removing the PC on the phone must not pop a new code there. Returns true
+  // on AuthResult Ok (messages after it stay queued in `parser`). On false `res`
+  // is filled; the caller closes the socket. Never pings, never applies the
+  // idle timeout: the wait is bounded by kAuthTimeoutS per request and, while
+  // Pairing, by the code lifetime + kPairExpiryMarginMs.
+  bool authenticate(SOCKET s, TcpFrameParser& parser, const HelloAck& ack, const ConnectParams& p,
+                    uint64_t myGen, bool allowPair, AuthOutcome& out, SessionResult& res) {
+    const std::string who = (ack.device_name.empty() ? ack.model : ack.device_name) + " [" +
+                            shortHex(ack.phone_id) + "]";
+    {
+      std::lock_guard<std::mutex> lk(stMx);
+      pairing = PairingInfo();
+      pairing.phone_id = ack.phone_id;
+      pairing.device_name = ack.device_name;
+      pairing.model = ack.model;
+      pairCodeExpiresMs = 0;
+      pairCodeOut.clear();
+    }
+    const PairedPhone* known = findPairing(p.paired, ack.phone_id);
+    bool haveKey = known != nullptr;
+    const Key32 key = known ? known->key : Key32{};
+    bool pairBegun = false, codeInFlight = false;
+    const int64_t kRequestTimeoutMs = int64_t(kAuthTimeoutS) * 1000;
+    int64_t deadline = steadyMs() + kRequestTimeoutMs;
+
+    auto fail = [&](DisconnectReason r, const std::string& msg) {
+      res.reason = r;
+      res.message = msg;
+      res.noReconnect = pairBegun || r == DisconnectReason::PairingLocked ||
+                        r == DisconnectReason::PairingExpired || r == DisconnectReason::PairingRejected ||
+                        r == DisconnectReason::NotAuthorized || r == DisconnectReason::NotPaired;
+      return false;
+    };
+    // The phone does not accept our key (any more): drop it everywhere.
+    auto rejectKey = [&](const char* why) {
+      if (!haveKey) return;
+      haveKey = false;
+      {
+        std::lock_guard<std::mutex> lk(ctlMx);
+        if (gen == myGen) removePairing(params.paired, ack.phone_id);
+      }
+      logf(LogLevel::Warn, "%s no longer accepts this PC's key (%s): pairing again", who.c_str(), why);
+      if (ev) ev->onKeyRejected(ack.phone_id);
+    };
+    // Instead of PairBegin on an auto-reconnect.
+    auto unpaired = [&]() {
+      sendMsg(MsgType::Bye, {}, false);
+      return fail(DisconnectReason::NotPaired,
+                  "this PC was removed on the phone (it no longer accepts this PC's key): connect again to pair");
+    };
+    auto beginPairing = [&] {
+      pairBegun = true;
+      deadline = steadyMs() + kRequestTimeoutMs;
+      logf(LogLevel::Info, "pairing with %s: the phone will show a %u-digit code", who.c_str(),
+           static_cast<unsigned>(kPairCodeDigits));
+      sendMsg(MsgType::PairBegin, {}, false);
+    };
+
+    if (haveKey && ack.paired) {
+      AuthProof proof;
+      proof.mac = authMac(key, ack.phone_id, p.client_id, ack.nonce);
+      sendMsg(MsgType::AuthProof, encode(proof), false);
+    } else {
+      rejectKey("the phone does not know this PC");
+      if (!allowPair) return unpaired();
+      beginPairing();
+    }
+
+    for (;;) {
+      if (aborted(myGen)) {
+        sendMsg(MsgType::Bye, {}, false);
+        res.reason = DisconnectReason::UserRequested;
+        res.noReconnect = pairBegun;
+        return false;
+      }
+      drainEvents();
+      int64_t now = steadyMs();
+      if (getState() == ClientState::Pairing && !codeInFlight) {
+        std::string code;
+        {
+          std::lock_guard<std::mutex> lk(stMx);
+          code.swap(pairCodeOut);
+        }
+        if (!code.empty()) {
+          PairCode pc;
+          pc.code = code;
+          sendMsg(MsgType::PairCode, encode(pc), false);
+          codeInFlight = true;
+          deadline = std::max(deadline, now + kRequestTimeoutMs);  // a late code still gets its verdict
+        }
+      }
+      if (now > deadline) {
+        sendMsg(MsgType::Bye, {}, false);
+        if (getState() == ClientState::Pairing) {
+          noteAuthStatus(AuthStatus::Expired, 0);
+          return fail(DisconnectReason::PairingExpired, "pairing code expired (no correct code entered in time)");
+        }
+        if (pairBegun) return fail(DisconnectReason::NotAuthorized, "the phone did not answer the pairing request");
+        res.reason = DisconnectReason::Timeout;
+        res.message = "the phone did not answer the authentication";
+        return false;
+      }
+
+      fd_set r;
+      FD_ZERO(&r);
+      FD_SET(s, &r);
+      timeval tv{0, 20000};
+      int got = 0;
+      if (select(0, &r, nullptr, nullptr, &tv) > 0) {
+        int64_t t = 0;
+        got = pump(s, parser, t);
+      }
+      // Handle what arrived first (a closing phone sends its verdict, then closes).
+      TcpFrameParser::Message m;
+      while (parser.next(m)) {
+        now = steadyMs();
+        if (m.type == MsgType::Log) {
+          LogMsg lm;
+          if (decode(m.payload.data(), m.payload.size(), lm)) log(lm.level, LogSource::Phone, lm.text);
+          continue;
+        }
+        if (m.type == MsgType::Bye) {
+          if (pairBegun) return fail(DisconnectReason::NotAuthorized, "the phone ended the connection during pairing");
+          res.reason = DisconnectReason::PeerBye;
+          res.message = "the phone ended the session during authentication";
+          return false;
+        }
+        if (m.type != MsgType::AuthResult) continue;  // nothing else is valid before AuthResult Ok
+        AuthResult ar;
+        if (!decode(m.payload.data(), m.payload.size(), ar)) {
+          sendMsg(MsgType::Bye, {}, false);
+          return fail(pairBegun ? DisconnectReason::NotAuthorized : DisconnectReason::ProtocolError,
+                      "malformed AuthResult");
+        }
+        noteAuthStatus(ar.status, ar.status == AuthStatus::Locked ? ar.seconds : 0);
+        switch (ar.status) {
+          case AuthStatus::Ok:
+            if (pairBegun) {
+              if (isZero(ar.key)) {
+                logf(LogLevel::Warn, "%s accepted the pairing but sent no key: the next connection will "
+                     "need a new pairing", who.c_str());
+              } else {
+                out.newKey = true;
+                out.key = ar.key;
+                std::lock_guard<std::mutex> lk(ctlMx);
+                if (gen == myGen) upsertPairing(params.paired, ack.phone_id, ar.key);
+              }
+              logf(LogLevel::Info, "paired with %s", who.c_str());
+            } else {
+              logf(LogLevel::Info, "authenticated by %s", who.c_str());
+            }
+            return true;
+          case AuthStatus::CodeShown: {
+            if (!pairBegun) break;  // not asked for: ignore
+            const uint16_t life = ar.seconds ? ar.seconds : kPairCodeLifetimeS;
+            PairingInfo snap;
+            {
+              std::lock_guard<std::mutex> lk(stMx);
+              pairCodeExpiresMs = now + int64_t(life) * 1000;
+              pairing.active = true;
+              pairing.code_pending = false;
+              pairing.wrong_code = false;
+              pairing.attempts_left = ar.attempts_left;
+              pairing.code_lifetime_s = life;
+              pairing.ms_left = life * 1000u;
+              pairCodeOut.clear();
+              snap = pairing;
+            }
+            deadline = now + int64_t(life) * 1000 + kPairExpiryMarginMs;
+            logf(LogLevel::Info, "%s shows a pairing code (valid %u s, %u attempts): waiting for the user",
+                 who.c_str(), life, ar.attempts_left);
+            setState(ClientState::Pairing);
+            if (ev) ev->onPairing(snap);
+            break;
+          }
+          case AuthStatus::WrongCode: {
+            if (!codeInFlight) break;
+            codeInFlight = false;
+            PairingInfo snap;
+            {
+              std::lock_guard<std::mutex> lk(stMx);
+              pairing.code_pending = false;
+              pairing.wrong_code = true;
+              pairing.attempts_left = ar.attempts_left;
+              pairing.ms_left = static_cast<uint32_t>(std::max<int64_t>(0, pairCodeExpiresMs - now));
+              pairCodeOut.clear();
+              snap = pairing;
+            }
+            deadline = std::max<int64_t>(pairCodeExpiresMs + kPairExpiryMarginMs, now);
+            logf(LogLevel::Warn, "wrong pairing code (%u attempts left)", ar.attempts_left);
+            if (ev) ev->onPairing(snap);
+            break;
+          }
+          case AuthStatus::NotPaired:
+            rejectKey("AuthProof refused");
+            if (pairBegun) {
+              sendMsg(MsgType::Bye, {}, false);
+              return fail(DisconnectReason::NotAuthorized, "the phone refused the pairing");
+            }
+            if (!allowPair) return unpaired();
+            beginPairing();
+            break;
+          case AuthStatus::Locked: {
+            char b[160];
+            snprintf(b, sizeof(b), "pairing locked on the phone (too many wrong codes): retry in %u s",
+                     static_cast<unsigned>(ar.seconds));
+            return fail(DisconnectReason::PairingLocked, b);
+          }
+          case AuthStatus::Expired:
+            return fail(DisconnectReason::PairingExpired, "the pairing code expired on the phone");
+          case AuthStatus::Rejected:
+            return fail(DisconnectReason::PairingRejected, "pairing cancelled on the phone");
+          default:
+            sendMsg(MsgType::Bye, {}, false);
+            return fail(DisconnectReason::NotAuthorized,
+                        "unexpected AuthResult status " + std::to_string(static_cast<int>(ar.status)));
+        }
+      }
+      if (got < 0) {
+        const std::string why = got == -1 ? "connection closed by the phone"
+                                : got == -3 ? "bad TCP framing"
+                                            : "recv error " + std::to_string(WSAGetLastError());
+        if (pairBegun) return fail(DisconnectReason::NotAuthorized, why + " during pairing");
+        res.reason = got == -1 ? DisconnectReason::PeerClosed
+                     : got == -3 ? DisconnectReason::ProtocolError
+                                 : DisconnectReason::SocketError;
+        res.message = why + " during authentication";
+        return false;
+      }
+    }
+  }
+
+  // Records the last AuthResult in the pairing snapshot (Locked: retry-after seconds).
+  void noteAuthStatus(AuthStatus st, uint16_t retryAfter) {
+    std::lock_guard<std::mutex> lk(stMx);
+    pairing.last_status = st;
+    if (st == AuthStatus::Locked) pairing.retry_after_s = retryAfter;
+    if (st != AuthStatus::CodeShown && st != AuthStatus::WrongCode) {
+      pairing.active = false;
+      pairing.code_pending = false;
+    }
+  }
+
   SessionResult runSession(const ConnectParams& p, uint64_t myGen) {
     SessionResult res;
     const ClientOptions o = getOpt();
@@ -708,6 +983,7 @@ struct Client::Impl {
       Hello h;
       h.transport = p.transport;
       h.client_name = p.client_name;
+      h.client_id = p.client_id;
       {
         std::lock_guard<std::mutex> lk(sendMx);
         tcp = s;
@@ -767,17 +1043,46 @@ struct Client::Impl {
       res.message = "peer is not an OWC phone";
       return res;
     }
+    // Version first: a v1 phone's HelloAck decodes as status Ok with a zero nonce
+    // and must never reach the status handling below.
+    if (ack.status == HelloStatus::VersionMismatch || ack.version != kProtocolVersion) {
+      closeTcp();
+      res.reason = DisconnectReason::VersionMismatch;
+      res.message = "protocol version mismatch (phone v" + std::to_string(ack.version) +
+                    ", PC v" + std::to_string(kProtocolVersion) + ") - update OWC on " +
+                    (ack.version < kProtocolVersion ? "the phone" : "this PC");
+      return res;
+    }
     if (ack.status == HelloStatus::Busy) {
       closeTcp();
       res.reason = DisconnectReason::Busy;
       res.message = "phone is busy (another PC is connected)";
       return res;
     }
-    if (ack.status == HelloStatus::VersionMismatch || ack.version != kProtocolVersion) {
+    if (ack.status != HelloStatus::AuthRequired) {
+      // A v2 phone always requires authentication: status Ok is a protocol
+      // error, never "authenticated".
       closeTcp();
-      res.reason = DisconnectReason::VersionMismatch;
-      res.message = "protocol version mismatch (phone v" + std::to_string(ack.version) +
-                    ", PC v" + std::to_string(kProtocolVersion) + ")";
+      res.reason = DisconnectReason::ProtocolError;
+      res.message = "phone did not request authentication (HelloAck status " +
+                    std::to_string(static_cast<int>(ack.status)) + ")";
+      return res;
+    }
+
+    // ---- authentication / pairing (nothing else is valid before AuthResult Ok)
+    // Only the first authentication of a connect() may start a pairing (see
+    // mayPair): an auto-reconnect never makes the phone show a code.
+    const bool allowPair = mayPair;
+    mayPair = false;
+    AuthOutcome auth;
+    if (!authenticate(s, parser, ack, p, myGen, allowPair, auth, res)) {
+      {
+        std::lock_guard<std::mutex> lk(stMx);
+        pairing.active = false;
+        pairing.code_pending = false;
+        pairCodeOut.clear();
+      }
+      closeTcp();
       return res;
     }
 
@@ -790,11 +1095,15 @@ struct Client::Impl {
     di.android_api = ack.android_api;
     di.codec_mask = ack.codec_mask;
     di.udp_port = ack.udp_port;
+    di.phone_id = ack.phone_id;
     {
       std::lock_guard<std::mutex> lk(stMx);
       dev = di;
       haveDev = true;
       sessionStartMs = steadyMs();
+      pairing.active = false;
+      pairing.code_pending = false;
+      pairCodeExpiresMs = 0;
     }
     {
       std::lock_guard<std::mutex> lk(clockMx);
@@ -818,6 +1127,7 @@ struct Client::Impl {
     logf(LogLevel::Info, "connected to %s (%s, Android API %u) via %s", di.device_name.c_str(),
          di.model.c_str(), di.android_api, p.transport == VideoTransport::Udp ? "UDP" : "TCP");
     setState(ClientState::Connected);
+    if (auth.newKey && ev) ev->onPaired(ack.phone_id, auth.key, di);
     if (ev) ev->onConnected(di);
 
     // ---- UDP
@@ -2197,7 +2507,7 @@ Client::~Client() {
 }
 
 bool Client::connect(const ConnectParams& p) {
-  if (p.host.empty() || p.port == 0) return false;
+  if (p.host.empty() || p.port == 0 || detail::isZero(p.client_id)) return false;
   std::lock_guard<std::mutex> lk(impl_->ctlMx);
   impl_->params = p;
   impl_->wantConnected = true;
@@ -2224,6 +2534,37 @@ DisconnectReason Client::lastDisconnectReason() const {
 ConnectParams Client::connectParams() const {
   std::lock_guard<std::mutex> lk(impl_->ctlMx);
   return impl_->params;
+}
+
+bool Client::submitPairingCode(const std::string& code) {
+  const std::string c = detail::normalizePairCode(code);
+  if (c.empty()) return false;
+  std::lock_guard<std::mutex> lk(impl_->stMx);
+  if (impl_->state != ClientState::Pairing || impl_->pairing.code_pending) return false;
+  impl_->pairing.code_pending = true;
+  impl_->pairing.wrong_code = false;
+  impl_->pairCodeOut = c;  // the net thread sends it within ~20 ms
+  return true;
+}
+
+bool Client::cancelPairing() {
+  if (impl_->getState() != ClientState::Pairing) return false;
+  disconnect();  // the net thread sends Bye and goes Idle (UserRequested)
+  return true;
+}
+
+PairingInfo Client::pairingInfo() const {
+  std::lock_guard<std::mutex> lk(impl_->stMx);
+  PairingInfo pi = impl_->pairing;
+  pi.ms_left = pi.active && impl_->pairCodeExpiresMs
+                   ? static_cast<uint32_t>(std::max<int64_t>(0, impl_->pairCodeExpiresMs - steadyMs()))
+                   : 0;
+  return pi;
+}
+
+void Client::forgetPairing(const PhoneId& phone_id) {
+  std::lock_guard<std::mutex> lk(impl_->ctlMx);
+  detail::removePairing(impl_->params.paired, phone_id);
 }
 
 ClientOptions Client::options() const { return impl_->getOpt(); }

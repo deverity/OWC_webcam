@@ -523,8 +523,10 @@ void drawPreview(App& app, Renderer& r, ImVec2 size) {
 
   if (!g_hasVideo) {
     const char* l1 = "Sem vídeo";
-    const char* l2 = app.live() ? "Aguardando o stream do celular..."
-                                : "Selecione um dispositivo na barra lateral para conectar";
+    const char* l2 = app.stats.state == owc::ClientState::Pairing
+                         ? "Pareamento: digite o código de 6 dígitos mostrado no celular"
+                     : app.live() ? "Aguardando o stream do celular..."
+                                  : "Selecione um dispositivo na barra lateral para conectar";
     ImGui::PushFont(fontTitle);
     ImVec2 s1 = ImGui::CalcTextSize(l1);
     dl->AddText(ImVec2(base.x + (size.x - s1.x) / 2, base.y + size.y / 2 - s1.y - sc(4)), IM_COL32(120, 130, 145, 255), l1);
@@ -665,7 +667,12 @@ void drawCenter(App& app, Renderer& r) {
   const owc::ClientStats& st = app.stats;
   ImGui::PushFont(fontTitle);
   std::string title = "Nenhum dispositivo";
-  if (app.dev_valid && app.live()) title = app.dev.device_name.empty() ? app.dev.model : app.dev.device_name;
+  if (st.state == owc::ClientState::Pairing) {
+    const owc::PairingInfo pi = app.client.pairingInfo();
+    title = pi.device_name.empty() ? pi.model : pi.device_name;
+  } else if (app.dev_valid && app.live()) {
+    title = app.dev.device_name.empty() ? app.dev.model : app.dev.device_name;
+  }
   ImGui::TextUnformatted(title.c_str());
   ImGui::PopFont();
   {
@@ -691,7 +698,9 @@ void drawCenter(App& app, Renderer& r) {
     ImGui::EndDisabled();
   }
   drawOrientationRow(app);
-  if (app.dev_valid && app.live())
+  if (st.state == owc::ClientState::Pairing)
+    ImGui::TextColored(col::warn(), "Pareamento: digite no OWC o código mostrado no celular.");
+  else if (app.dev_valid && app.live())
     ImGui::TextColored(col::dim(), "%s  -  Android API %u  -  %s", app.dev.model.c_str(), app.dev.android_api,
                        app.stateMessage().empty() ? stateText(st.state) : app.stateMessage().c_str());
   else
@@ -755,6 +764,105 @@ void drawRight(App& app) {
     default: break;
   }
   ImGui::EndChild();
+  ImGui::PopStyleVar();
+}
+
+// ---------------------------------------------------------------------------
+// Pairing (protocol v2): while the client is in state Pairing the phone shows a
+// 6-digit code; this modal asks for it. It closes itself when the state
+// changes (success: toast "Pareado com ..."; failure: toast from App::onStateChanged).
+constexpr const char* kPairPopup = "###owc_pairing";
+char g_pairCode[8] = "";
+bool g_pairFocus = false;
+bool g_pairWasOpen = false;
+uint32_t g_pairWrongSeen = 0;  // attempts_left of the last wrong-code answer already shown
+
+int digitsOnly(ImGuiInputTextCallbackData* d) {
+  return (d->EventChar >= '0' && d->EventChar <= '9') ? 0 : 1;
+}
+
+void drawPairingModal(App& app) {
+  const bool pairing = app.stats.state == owc::ClientState::Pairing;
+  if (pairing && !g_pairWasOpen) {
+    ImGui::OpenPopup(kPairPopup);
+    g_pairCode[0] = 0;
+    g_pairFocus = true;
+    g_pairWrongSeen = 0;
+  }
+  g_pairWasOpen = pairing;
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x / 2, vp->Pos.y + vp->Size.y / 2), ImGuiCond_Always,
+                          ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(std::min(sc(440), vp->Size.x - sc(40)), 0));
+  const owc::PairingInfo pi = app.client.pairingInfo();
+  const std::string who = pi.device_name.empty() ? (pi.model.empty() ? "o celular" : pi.model) : pi.device_name;
+  const std::string title = "Parear com " + who + kPairPopup;
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(sc(18), sc(16)));
+  if (ImGui::BeginPopupModal(title.c_str(), nullptr,
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+    if (!pairing) {
+      ImGui::CloseCurrentPopup();
+    } else {
+      ImGui::PushTextWrapPos(0.0f);
+      ImGui::TextUnformatted("Digite o código de 6 dígitos que apareceu no celular.");
+      ImGui::PushStyleColor(ImGuiCol_Text, col::dim());
+      ImGui::TextUnformatted("Só é preciso parear uma vez por PC. Para desfazer, remova este PC no app do celular.");
+      ImGui::PopStyleColor();
+      ImGui::PopTextWrapPos();
+      ImGui::Dummy(ImVec2(0, sc(4)));
+
+      if (pi.wrong_code && pi.attempts_left != g_pairWrongSeen) {  // new wrong answer: clear and retype
+        g_pairWrongSeen = pi.attempts_left;
+        g_pairCode[0] = 0;
+        g_pairFocus = true;
+      }
+      const bool busy = pi.code_pending;
+      auto submit = [&] {
+        if (std::strlen(g_pairCode) == owc::kPairCodeDigits && !busy) app.client.submitPairingCode(g_pairCode);
+      };
+      ImGui::PushFont(fontTitle);
+      ImGui::SetNextItemWidth(ImGui::CalcTextSize("000000").x + ImGui::GetStyle().FramePadding.x * 2 + sc(16));
+      if (g_pairFocus) {
+        ImGui::SetKeyboardFocusHere();
+        g_pairFocus = false;
+      }
+      ImGui::BeginDisabled(busy);
+      const bool enter = ImGui::InputText("##paircode", g_pairCode, owc::kPairCodeDigits + 1,
+                                          ImGuiInputTextFlags_CallbackCharFilter | ImGuiInputTextFlags_EnterReturnsTrue,
+                                          digitsOnly);
+      ImGui::EndDisabled();
+      ImGui::PopFont();
+      if (enter) {
+        submit();
+        g_pairFocus = std::strlen(g_pairCode) != owc::kPairCodeDigits;  // keep typing on an incomplete code
+      }
+      ImGui::SameLine(0, sc(14));
+      {
+        const unsigned s = (pi.ms_left + 999) / 1000;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(s <= 15 ? col::warn() : col::dim(), "Expira em %u:%02u", s / 60, s % 60);
+      }
+      if (busy) {
+        ImGui::TextColored(col::dim(), "Verificando...");
+      } else if (pi.wrong_code) {
+        ImGui::TextColored(col::bad(), "Código incorreto — %u tentativa%s restante%s", pi.attempts_left,
+                           pi.attempts_left == 1 ? "" : "s", pi.attempts_left == 1 ? "" : "s");
+      } else {
+        ImGui::TextColored(col::dim(), "%u tentativas", pi.attempts_left);
+      }
+      ImGui::Dummy(ImVec2(0, sc(6)));
+      const float bw = sc(120);
+      ImGui::BeginDisabled(busy || std::strlen(g_pairCode) != owc::kPairCodeDigits);
+      if (primaryButton("Parear", ImVec2(bw, 0))) submit();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      if (ImGui::Button("Cancelar", ImVec2(bw, 0))) {
+        app.client.cancelPairing();
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    ImGui::EndPopup();
+  }
   ImGui::PopStyleVar();
 }
 
@@ -910,6 +1018,7 @@ void uiDraw(App& app, Renderer& r) {
     drawTabPills();
     ImGui::Dummy(ImVec2(0, sc(2)));
     colorPage(app, r);
+    drawPairingModal(app);
     ImGui::End();
     drawToasts(app);
     return;
@@ -938,6 +1047,7 @@ void uiDraw(App& app, Renderer& r) {
   ImGui::EndChild();
   ImGui::PopStyleVar(2);
 
+  drawPairingModal(app);
   ImGui::End();
   drawToasts(app);
 }

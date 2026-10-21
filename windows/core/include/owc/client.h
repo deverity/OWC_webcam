@@ -1,7 +1,9 @@
 // owc_core — PC side of the OWC phone-webcam link.
 //
 // One owc::Client = one session with one phone:
-//   connect -> Hello/HelloAck -> Capabilities/ParamState cache -> StartStream
+//   connect -> Hello/HelloAck -> authentication (AuthProof, or pairing with a
+//   6-digit code shown on the phone, see PAIRING below) -> Capabilities/
+//   ParamState cache -> StartStream
 //   -> receive H.264/HEVC over TCP (VideoFrame) or UDP (fragments)
 //   -> Media Foundation decoder (D3D11/DXVA hardware, software fallback)
 //   -> optional rotate/mirror on NV12 -> owc::ShmWriter (virtual cam / OBS)
@@ -56,8 +58,12 @@ namespace owc {
 enum class ClientState : uint8_t {
   Idle = 0,          // not connected and not trying (initial / after disconnect())
   Connecting,        // TCP connect in progress
-  Handshaking,       // Hello sent, waiting HelloAck
-  Connected,         // session up, not streaming (call startStream())
+  Handshaking,       // Hello sent, waiting HelloAck; then authenticating (AuthProof /
+                     // PairBegin sent, waiting AuthResult)
+  Pairing,           // the phone shows a pairing code: waiting for the user to type it
+                     // (submitPairingCode() / cancelPairing()). Bounded by the code
+                     // lifetime (PairingInfo), not by handshake/idle timeouts.
+  Connected,         // session up (AuthResult Ok), not streaming (call startStream())
   Streaming,         // StartStream sent and VideoFormat received
   Reconnecting,      // lost/failed; waiting ClientOptions::reconnect_delay_ms to retry
   Failed,            // gave up (auto_reconnect off). See lastDisconnectReason().
@@ -78,6 +84,18 @@ enum class DisconnectReason : uint8_t {
   Timeout,           // no message from phone for ClientOptions::idle_timeout_ms
   ProtocolError,     // malformed stream
   SocketError,       // any other socket failure
+  // Authentication / pairing failures. State Failed, NEVER auto-reconnected (a
+  // reconnect would make the phone show yet another code). Details in the
+  // onStateChanged message and pairingInfo().
+  PairingLocked,     // AuthResult Locked: too many wrong codes, or the phone is still in
+                     // its pairing cooldown; retry after PairingInfo::retry_after_s
+  PairingExpired,    // the code expired before a correct one was submitted
+  PairingRejected,   // the user cancelled the pairing on the phone
+  NotAuthorized,     // the phone refused authentication otherwise (refused a fresh pairing,
+                     // closed the connection or went silent during pairing, bad AuthResult)
+  NotPaired,         // auto-reconnect found that the phone no longer accepts this PC (it was
+                     // removed on the phone; onKeyRejected fired). Auto-reconnects never start a
+                     // pairing: call connect() again to pair.
 };
 
 enum class DecoderMode : uint8_t {
@@ -325,21 +343,82 @@ struct ClientOptions {
   std::string udp_bind_address = "0.0.0.0";
 };
 
+// ------------------------------------------------------------------ pairing
+// Protocol v2 (PAIRING in owc/protocol.h): the phone accepts nothing before
+// the connection is authenticated. This PC is identified by
+// ConnectParams::client_id; a phone by HelloAck::phone_id. Pairing gives the PC
+// a 32-byte key for that phone. owc::Client never stores anything on disk: the
+// application persists client_id and the keys (protect the keys at rest).
+//   have a key for phone_id AND HelloAck::paired -> AuthProof, no user interaction
+//   phone refuses it (AuthResult NotPaired) or does not know this PC
+//        -> ClientEvents::onKeyRejected (forget the key), then pairing:
+//   no key -> PairBegin: the phone shows a 6-digit code, state Pairing,
+//        ClientEvents::onPairing; the user types it -> submitPairingCode()
+//        -> AuthResult Ok + key -> ClientEvents::onPaired (persist it) -> Connected
+//        WrongCode -> onPairing (wrong_code, attempts_left), still Pairing
+//        Locked / Expired / Rejected -> Failed (PairingLocked/Expired/Rejected)
+// Only a connect() may start a pairing (PairBegin), at most once, in its first
+// authentication (attempts that failed before reaching the phone's HelloAck,
+// e.g. app not started yet, do not count). Auto-reconnects only authenticate
+// with AuthProof: if the phone no longer knows this PC (removed there) they end
+// in Failed/NotPaired. A session that ends once a pairing was started (failure,
+// cancel, network loss) is never auto-reconnected either, so the phone never
+// shows a code the user did not ask for. The number of attempts per code comes
+// from the phone (it counts wrong codes globally): always use attempts_left.
+using PhoneId = Id16;   // HelloAck::phone_id: random, persisted per phone install
+using ClientId = Id16;  // Hello::client_id: random, persisted per PC install
+
+// One pairing held by this PC.
+struct PairedPhone {
+  PhoneId phone_id{};
+  Key32 key{};           // secret: keep it protected at rest (e.g. DPAPI)
+};
+
+// A new random client id (BCryptGenRandom, never all zeros). Generate it ONCE
+// per installation and persist it: it is what the phone pairs with.
+ClientId newClientId();
+
+// Progress of the pairing of the current/last connection attempt
+// (Client::pairingInfo(), ClientEvents::onPairing). Reset at every attempt.
+struct PairingInfo {
+  bool active = false;           // state() == Pairing: the phone shows a code
+  PhoneId phone_id{};            // phone being authenticated (HelloAck::phone_id)
+  std::string device_name, model;// from HelloAck, e.g. for "Parear com <device_name>"
+  bool code_pending = false;     // submitPairingCode() accepted, waiting for the phone's verdict
+  bool wrong_code = false;       // the last code was wrong (attempts_left tries remain)
+  uint8_t attempts_left = 0;     // wrong codes the phone still accepts for this code
+  uint16_t code_lifetime_s = 0;  // code validity announced by the phone (CodeShown)
+  uint32_t ms_left = 0;          // time left before the code expires, at snapshot time
+                                 // (pairingInfo() recomputes it; count down locally)
+  AuthStatus last_status = AuthStatus::Ok;  // last AuthResult (Locked/Expired/Rejected after a failure)
+  uint16_t retry_after_s = 0;    // Locked: the phone accepts a new pairing after this many seconds
+};
+
 // Parameters of connect().
 struct ConnectParams {
   std::string host = "127.0.0.1";          // IPv4 literal or hostname
   uint16_t port = kDefaultControlPort;     // TCP control port (USB: adb-forwarded local port)
   VideoTransport transport = VideoTransport::Tcp;  // USB must use Tcp
-  std::string client_name = "OWC PC";      // shown on the phone
+  std::string client_name = "OWC PC";      // shown on the phone (also in its paired-PC list)
+  // This PC's identity (Hello::client_id). REQUIRED: all zeros = connect()
+  // returns false. Create it once with newClientId() and persist it.
+  ClientId client_id{};
+  // Pairing keys this PC holds (any number of phones; the one matching
+  // HelloAck::phone_id is used). The client keeps its own copy (see
+  // connectParams()): a key obtained by pairing is added and a key the phone
+  // rejects is removed, so auto-reconnects authenticate with the current set.
+  std::vector<PairedPhone> paired;
 };
 
-// Phone identity from HelloAck.
+// Phone identity from HelloAck (available once the session is up, i.e. after
+// AuthResult Ok).
 struct DeviceInfo {
   uint32_t session_id = 0;
   std::string device_name, model;
   uint16_t android_api = 0;
   uint32_t codec_mask = 0;          // codecBit(Codec::H264) | codecBit(Codec::Hevc)
   uint16_t udp_port = 0;
+  PhoneId phone_id{};               // stable per phone install: key of the pairing
 };
 
 // ------------------------------------------------------------------ frames
@@ -581,6 +660,19 @@ class ClientEvents {
   // Every state transition. reason is meaningful for Reconnecting/Failed/Idle.
   virtual void onStateChanged(ClientState /*state*/, DisconnectReason /*reason*/,
                               const std::string& /*message*/) {}
+  // The phone shows a pairing code (state Pairing; also called again after a
+  // wrong code: info.wrong_code, info.attempts_left). Ask the user for the code
+  // and call Client::submitPairingCode(); poll Client::pairingInfo() for the
+  // countdown. Do not block here.
+  virtual void onPairing(const PairingInfo& /*info*/) {}
+  // Pairing succeeded: PERSIST {phone_id, key} and pass it in
+  // ConnectParams::paired from now on (the client already uses it for its own
+  // reconnects). Called right before onConnected; info = the new session.
+  virtual void onPaired(const PhoneId& /*phone_id*/, const Key32& /*key*/, const DeviceInfo& /*info*/) {}
+  // The phone no longer accepts this PC's key for phone_id (the PC was removed
+  // on the phone): delete it. The client then starts a pairing on the same
+  // connection (onPairing follows).
+  virtual void onKeyRejected(const PhoneId& /*phone_id*/) {}
   virtual void onConnected(const DeviceInfo&) {}
   virtual void onCapabilities(const Capabilities&) {}
   // Phone reply to setParam() (status != Ok = rejected) or unsolicited change.
@@ -604,14 +696,32 @@ class Client {
 
   // ---- session control (asynchronous; progress via onStateChanged/state())
   // Starts connecting (drops any current session first). Returns false only
-  // on invalid arguments (empty host, port 0).
+  // on invalid arguments (empty host, port 0, all-zero client_id).
   bool connect(const ConnectParams& params);
   // Sends Bye, closes sockets, stops reconnecting, state -> Idle.
   void disconnect();
 
   ClientState state() const;
   DisconnectReason lastDisconnectReason() const;
+  // The client's copy of the last connect() params, with `paired` updated by
+  // pairings / rejected keys / forgetPairing() since.
   ConnectParams connectParams() const;
+
+  // ---- pairing (see PAIRING above and PairingInfo)
+  // Sends the code the user typed: exactly kPairCodeDigits ASCII digits
+  // (surrounding spaces ignored). Returns false if the state is not Pairing, a
+  // code is already being checked, or the code is malformed. Outcome:
+  // onPaired + Connected, or onPairing (wrong_code), or Failed (PairingLocked).
+  bool submitPairingCode(const std::string& code);
+  // Gives up the pairing: sends Bye, state -> Idle (UserRequested), like
+  // disconnect(). Returns false (and does nothing) if the state is not Pairing.
+  bool cancelPairing();
+  // Snapshot of the pairing of the current/last connection attempt.
+  PairingInfo pairingInfo() const;
+  // Removes the key of phone_id from the client's copy of ConnectParams::paired
+  // (e.g. the user chose "forget this phone"). Effect: next connection attempt;
+  // a running session is not affected.
+  void forgetPairing(const PhoneId& phone_id);
 
   // ---- options
   ClientOptions options() const;
@@ -659,7 +769,7 @@ class Client {
   bool slowMotionActive() const;
 
   // ---- snapshots (thread-safe copies)
-  bool deviceInfo(DeviceInfo& out) const;          // false before HelloAck
+  bool deviceInfo(DeviceInfo& out) const;          // false before the session is up (AuthResult Ok)
   bool capabilities(Capabilities& out) const;      // false before Capabilities
   // Current value of a param (from Capabilities, updated by ParamState).
   bool paramValue(ParamId id, ParamValue& out) const;

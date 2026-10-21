@@ -3,6 +3,9 @@
 //                 [--bind 0.0.0.0] [--width 1280] [--height 720] [--fps 30]
 //                 [--bitrate 4000000] [--bframes 0] [--profile 0] [--gop-ms 2000]
 //                 [--loss 0] [--fec 0] [--name FakePhone] [--no-discovery] [--verbose]
+//                 [--pair-code 123456] [--pairings-file F] [--paired CLIENT_HEX:KEY_HEX] ...
+// Protocol v2: every client must authenticate. A new PC gets a pairing code,
+// printed on the console (like the phone's notification); type it in OWC.exe.
 // Runs until Ctrl+C / Enter.
 #include "fake_phone.h"
 
@@ -41,6 +44,14 @@ void usage() {
       "  --replay-fps N     replay frame rate (default 30)\n"
       "  --rotation DEG     VideoFormat rotation hint\n"
       "  --strip-ps         send IDRs without inline SPS/PPS (csd only)\n"
+      "  pairing (protocol v2; every client must authenticate):\n"
+      "  --pair-code NNNNNN fixed pairing code (default: random, printed when a PC pairs)\n"
+      "  --pairings-file F  keep pairings across runs in this file\n"
+      "  --paired C:K       preload a pairing: client_id hex (32) : key hex (64)\n"
+      "  --phone-id HEX     phone_id (32 hex; default derived from --name)\n"
+      "  --pair-attempts N  wrong codes before Locked (default 3)\n"
+      "  --pair-lifetime S  code lifetime in seconds (default 120)\n"
+      "  --pair-lockout S   lockout after Locked (default 30)\n"
       "  --verbose\n");
 }
 }  // namespace
@@ -79,6 +90,28 @@ int main(int argc, char** argv) {
     else if (a == "--replay-fps") cfg.replay_fps = u32("--replay-fps");
     else if (a == "--rotation") cfg.rotation_deg = static_cast<int16_t>(atoi(next("--rotation")));
     else if (a == "--strip-ps") cfg.inline_param_sets = false;
+    else if (a == "--pair-code") cfg.pair_code = next("--pair-code");
+    else if (a == "--pairings-file") cfg.pairings_file = next("--pairings-file");
+    else if (a == "--pair-attempts") cfg.pair_attempts = static_cast<uint8_t>(u32("--pair-attempts"));
+    else if (a == "--pair-lifetime") cfg.pair_code_lifetime_s = u16("--pair-lifetime");
+    else if (a == "--pair-lockout") cfg.pair_lockout_s = u16("--pair-lockout");
+    else if (a == "--phone-id") {
+      if (!owc::fromHex(next("--phone-id"), cfg.phone_id.data(), cfg.phone_id.size())) {
+        fprintf(stderr, "--phone-id: expected 32 hex digits\n");
+        return 2;
+      }
+    } else if (a == "--paired") {
+      const std::string v = next("--paired");
+      const size_t c = v.find(':');
+      owc::fake::FakePhoneConfig::PairedClient pc;
+      if (c == std::string::npos || !owc::fromHex(v.substr(0, c), pc.client_id.data(), pc.client_id.size()) ||
+          !owc::fromHex(v.substr(c + 1), pc.key.data(), pc.key.size())) {
+        fprintf(stderr, "--paired: expected CLIENT_ID_HEX(32):KEY_HEX(64)\n");
+        return 2;
+      }
+      pc.name = "preloaded";
+      cfg.paired_clients.push_back(pc);
+    }
     else if (a == "--verbose") cfg.verbose = true;
     else if (a == "--help" || a == "-h") { usage(); return 0; }
     else { fprintf(stderr, "unknown argument %s\n", a.c_str()); usage(); return 2; }
@@ -92,6 +125,11 @@ int main(int argc, char** argv) {
   printf("fakephone '%s': TCP %u, UDP %u, discovery %u, %ux%u@%u %u bps, bframes %u, loss %.1f%%, fec %d%%\n",
          cfg.device_name.c_str(), phone.controlPort(), phone.udpPort(), phone.discoveryPort(),
          cfg.width, cfg.height, cfg.fps, cfg.bitrate, cfg.bframes, cfg.loss_percent, cfg.fec_percent);
+  {
+    const owc::Id16 id = phone.phoneId();
+    printf("phone_id %s, %zu paired PC(s), pairing code: %s\n", owc::toHex(id.data(), id.size()).c_str(),
+           phone.pairedClients().size(), cfg.pair_code.empty() ? "random (printed on PairBegin)" : cfg.pair_code.c_str());
+  }
   printf("Ctrl+C to quit\n");
   fflush(stdout);
   SetConsoleCtrlHandler(onCtrl, TRUE);

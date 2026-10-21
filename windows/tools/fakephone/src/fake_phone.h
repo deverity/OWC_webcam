@@ -3,12 +3,21 @@
 //   TCP control server (+ VideoFrame in Tcp mode), UDP punch/video, discovery.
 //   Synthetic NV12 pattern with the frame-counter strip (see pattern.h),
 //   encoded by the Media Foundation H.264 encoder.
+//   Protocol v2 authentication (PAIRING in owc/protocol.h), mirroring the
+//   Android phone: AuthProof check, pairing codes (fixed for tests or random +
+//   logged), wrong codes counted GLOBALLY until lockout/success (forgotten after
+//   10 min, so a new code may get fewer attempts), lockout, expiry, "cancel on
+//   the phone" (rejectPairing()), zero client_id -> Rejected, removing the
+//   connected PC (setPairedClients) -> Bye + close, preloaded pairings.
 #pragma once
+
+#include <owc/protocol.h>
 
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace owc {
 namespace fake {
@@ -55,6 +64,22 @@ struct FakePhoneConfig {
   float hevc_stats_fps_scale = 1.0f;
   bool verbose = false;
   std::function<void(const std::string&)> logger;  // default: stdout
+
+  // ---- authentication / pairing (protocol v2). Every connection must
+  // authenticate before anything else is accepted (Ping, SetParam, UDP punch...).
+  struct PairedClient {
+    Id16 client_id{};
+    Key32 key{};
+    std::string name;  // Hello::client_name at pairing time
+  };
+  Id16 phone_id{};                  // all zeros = derived from device_name (stable across runs)
+  std::string pair_code;            // code shown on PairBegin; "" = random 6 digits (logged)
+  std::vector<PairedClient> paired_clients;  // preloaded pairings (e.g. tests)
+  std::string pairings_file;        // load at start / save on change ("" = memory only)
+  uint8_t pair_attempts = kPairCodeAttempts;      // wrong codes (global) before Locked
+  uint16_t pair_code_lifetime_s = kPairCodeLifetimeS;
+  uint16_t pair_lockout_s = kPairLockoutS;        // PairBegin answered Locked this long after a lock
+  uint16_t auth_timeout_s = kAuthTimeoutS;        // unauthenticated connection closed after this
 };
 
 class FakePhone {
@@ -64,6 +89,11 @@ class FakePhone {
     uint64_t datagrams_sent = 0, datagrams_dropped = 0, fec_datagrams = 0;
     uint64_t keyframe_requests = 0, pings = 0, receiver_reports = 0, sessions = 0;
     uint64_t busy_rejects = 0;
+    // authentication
+    uint64_t auth_proofs = 0, auth_ok = 0, auth_not_paired = 0;
+    uint64_t pair_begins = 0, pair_codes = 0, pair_wrong = 0, pair_ok = 0;
+    uint64_t pair_locked = 0, pair_expired = 0, pair_rejected = 0;
+    uint64_t unauth_msgs = 0;  // non-auth messages received before authentication (ignored)
     float last_rr_jitter_ms = 0, last_rr_delay_gradient_ms = 0, last_rr_decode_ms = 0;
     uint32_t last_rr_frames_lost = 0;
   };
@@ -77,6 +107,18 @@ class FakePhone {
   uint16_t discoveryPort() const;
   Counters counters() const;
   bool streaming() const;
+
+  // ---- authentication
+  Id16 phoneId() const;
+  std::string lastPairCode() const;  // code of the last PairBegin ("" = none yet)
+  std::vector<FakePhoneConfig::PairedClient> pairedClients() const;
+  // Replaces the pairing list (e.g. {} = "the user removed every PC on the phone").
+  // If the connected PC is no longer listed, it gets Bye and is disconnected.
+  void setPairedClients(const std::vector<FakePhoneConfig::PairedClient>& v);
+  // Simulates "cancel" tapped on the phone: a pending pairing gets AuthResult Rejected.
+  void rejectPairing();
+  // Drops the current connection without Bye (tests auto-reconnect).
+  void kickClient();
 
  private:
   struct Impl;

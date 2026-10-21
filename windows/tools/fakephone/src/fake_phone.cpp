@@ -13,7 +13,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <random>
@@ -154,6 +157,23 @@ struct FakePhone::Impl {
   std::mt19937 rng{12345};      // session ids (session thread)
   std::mt19937 lossRng{777};    // loss simulation (stream thread)
 
+  // authentication (amx)
+  mutable std::mutex amx;
+  Id16 phoneId{};
+  std::vector<FakePhoneConfig::PairedClient> pairings;
+  std::string lastCode;
+  int64_t lockUntilUs = 0;
+  // Like the phone: wrong codes are counted GLOBALLY (across codes and
+  // connections) until a lockout or a success, forgotten after 10 min.
+  int wrongCodes = 0;
+  int64_t lastWrongUs = 0;
+  Id16 authClient{};                       // client of the current authenticated session
+  std::atomic<bool> sessionAuthed{false};
+  std::atomic<bool> unpairKick{false};     // the connected PC was removed: Bye + close
+  std::atomic<bool> rejectReq{false};
+  std::atomic<bool> kick{false};
+  std::random_device secureRng;  // codes, keys, nonces (rand_s on MSVC); session thread only
+
   void log(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -161,7 +181,10 @@ struct FakePhone::Impl {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (cfg.logger) cfg.logger(buf);
-    else printf("[fakephone] %s\n", buf);
+    else {
+      printf("[fakephone] %s\n", buf);
+      fflush(stdout);  // pairing codes must show up at once (console or redirected)
+    }
   }
   void vlog(const char* fmt, ...) {
     if (!cfg.verbose) return;
@@ -389,8 +412,15 @@ struct FakePhone::Impl {
       return;
     }
     HelloAck ack;
+    ack.status = HelloStatus::AuthRequired;
     if (h.magic != kMagic) ack.status = HelloStatus::BadMagic;
     else if (h.version != kProtocolVersion) ack.status = HelloStatus::VersionMismatch;
+    {
+      std::lock_guard<std::mutex> lk(amx);
+      ack.phone_id = phoneId;
+      ack.paired = findPairing(h.client_id) != nullptr;
+    }
+    randomBytes(ack.nonce.data(), ack.nonce.size());
     std::uniform_int_distribution<uint32_t> d(1, 0xFFFFFFFEu);
     ack.session_id = d(rng);
     ack.udp_port = uport;
@@ -406,7 +436,10 @@ struct FakePhone::Impl {
       client = s;
     }
     sendMsg(MsgType::HelloAck, encode(ack));
-    if (ack.status != HelloStatus::Ok) {
+    kick = false;
+    rejectReq = false;
+    unpairKick = false;
+    if (ack.status != HelloStatus::AuthRequired || !authenticate(s, parser, h, ack)) {
       Sleep(50);
       {
         std::lock_guard<std::mutex> lk(sendMx);
@@ -437,7 +470,19 @@ struct FakePhone::Impl {
     int64_t nextStats = pcUs() + 1000000;
     uint64_t lastEnc = 0;
     bool run = true;
+    {
+      std::lock_guard<std::mutex> lk(amx);
+      authClient = h.client_id;
+    }
+    sessionAuthed = true;
     while (run && !stopFlag) {
+      if (kick.exchange(false)) break;
+      if (unpairKick.exchange(false)) {  // like the phone: removing a connected PC drops it
+        log("this PC was removed: Bye");
+        sendMsg(MsgType::Bye, {});
+        Sleep(20);
+        break;
+      }
       if (pcUs() >= nextStats) {
         nextStats += 1000000;
         Stats st;
@@ -471,6 +516,7 @@ struct FakePhone::Impl {
       if (n <= 0) break;
       if (!parser.feed(buf, static_cast<size_t>(n))) break;
     }
+    sessionAuthed = false;
     stopStream();
     {
       std::lock_guard<std::mutex> lk(sendMx);
@@ -479,6 +525,219 @@ struct FakePhone::Impl {
     closesocket(s);
     log("client disconnected");
     sessionActive = false;
+  }
+
+  // ---------------------------------------------------------------- auth
+  void randomBytes(uint8_t* p, size_t n) {
+    for (size_t i = 0; i < n; i += 4) {
+      const uint32_t v = secureRng();
+      for (size_t k = 0; k < 4 && i + k < n; ++k) p[i + k] = static_cast<uint8_t>(v >> (8 * k));
+    }
+  }
+  // amx held.
+  const FakePhoneConfig::PairedClient* findPairing(const Id16& clientId) const {
+    for (const auto& pc : pairings)
+      if (pc.client_id == clientId) return &pc;
+    return nullptr;
+  }
+  // amx held. Format: one "client_hex key_hex name" per line.
+  void savePairings() {
+    if (cfg.pairings_file.empty()) return;
+    std::ofstream f(cfg.pairings_file, std::ios::trunc);
+    for (const auto& pc : pairings)
+      f << toHex(pc.client_id.data(), pc.client_id.size()) << ' ' << toHex(pc.key.data(), pc.key.size())
+        << ' ' << pc.name << '\n';
+  }
+  // amx held.
+  void loadPairings() {
+    if (cfg.pairings_file.empty()) return;
+    std::ifstream f(cfg.pairings_file);
+    std::string line;
+    while (std::getline(f, line)) {
+      FakePhoneConfig::PairedClient pc;
+      const size_t a = line.find(' ');
+      const size_t b = a == std::string::npos ? a : line.find(' ', a + 1);
+      if (b == std::string::npos || !fromHex(line.substr(0, a), pc.client_id.data(), pc.client_id.size()) ||
+          !fromHex(line.substr(a + 1, b - a - 1), pc.key.data(), pc.key.size()))
+        continue;
+      pc.name = line.substr(b + 1);
+      if (!findPairing(pc.client_id)) pairings.push_back(pc);
+    }
+  }
+  void authResult(AuthStatus st, uint8_t attempts, uint16_t seconds, const Key32& key = Key32{}) {
+    AuthResult r;
+    r.status = st;
+    r.attempts_left = attempts;
+    r.seconds = seconds;
+    r.key = key;
+    sendMsg(MsgType::AuthResult, encode(r));
+  }
+  void count(uint64_t Counters::*field) {
+    std::lock_guard<std::mutex> lk(cmx);
+    ++(c.*field);
+  }
+
+  // Protocol v2 PAIRING, phone side. true = authenticated (the session may start).
+  bool authenticate(SOCKET s, TcpFrameParser& parser, const Hello& h, const HelloAck& ack) {
+    int64_t deadline = pcUs() + int64_t(cfg.auth_timeout_s) * 1000000;
+    bool codeActive = false;
+    std::string code;
+    int attempts = 0;
+    int64_t codeExpiry = 0;
+    uint8_t buf[4096];
+    if (std::all_of(h.client_id.begin(), h.client_id.end(), [](uint8_t b) { return b == 0; })) {
+      log("client '%s' has no client_id: Rejected", h.client_name.c_str());
+      authResult(AuthStatus::Rejected, 0, 0);
+      return false;
+    }
+    while (!stopFlag) {
+      const int64_t now = pcUs();
+      if (kick.exchange(false)) return false;
+      if (codeActive && rejectReq.exchange(false)) {
+        log("pairing cancelled on the phone");
+        authResult(AuthStatus::Rejected, 0, 0);
+        count(&Counters::pair_rejected);
+        return false;
+      }
+      if (codeActive && now >= codeExpiry) {
+        log("pairing code expired");
+        authResult(AuthStatus::Expired, 0, 0);
+        count(&Counters::pair_expired);
+        return false;
+      }
+      if (!codeActive && now >= deadline) {
+        log("authentication timeout: closing");
+        return false;
+      }
+      TcpFrameParser::Message m;
+      if (!parser.next(m)) {
+        if (!readable(s, 20)) continue;
+        const int got = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
+        if (got <= 0 || !parser.feed(buf, static_cast<size_t>(got))) return false;
+        continue;
+      }
+      const uint8_t* p = m.payload.data();
+      const size_t n = m.payload.size();
+      switch (m.type) {
+        case MsgType::AuthProof: {
+          count(&Counters::auth_proofs);
+          AuthProof ap;
+          if (codeActive || !decode(p, n, ap)) break;  // a pairing is pending: only PairCode counts
+          bool ok = false;
+          {
+            std::lock_guard<std::mutex> lk(amx);
+            if (const auto* pc = findPairing(h.client_id)) {
+              const Key32 want = authMac(pc->key, phoneId, h.client_id, ack.nonce);
+              ok = constantTimeEqual(want.data(), ap.mac.data(), want.size());
+            }
+          }
+          if (ok) {
+            authResult(AuthStatus::Ok, 0, 0);
+            count(&Counters::auth_ok);
+            vlog("client '%s' authenticated (AuthProof)", h.client_name.c_str());
+            return true;
+          }
+          authResult(AuthStatus::NotPaired, 0, 0);
+          count(&Counters::auth_not_paired);
+          log("AuthProof from '%s' refused (not paired)", h.client_name.c_str());
+          deadline = now + int64_t(cfg.auth_timeout_s) * 1000000;
+          break;
+        }
+        case MsgType::PairBegin: {
+          count(&Counters::pair_begins);
+          if (codeActive) break;
+          int64_t lockUntil;
+          {
+            std::lock_guard<std::mutex> lk(amx);
+            lockUntil = lockUntilUs;
+          }
+          if (lockUntil > now) {
+            const uint16_t left = static_cast<uint16_t>((lockUntil - now + 999999) / 1000000);
+            authResult(AuthStatus::Locked, 0, left);
+            count(&Counters::pair_locked);
+            log("PairBegin during lockout (%u s left)", static_cast<unsigned>(left));
+            return false;
+          }
+          if (cfg.pair_code.empty()) {
+            char b[16];
+            snprintf(b, sizeof(b), "%06u", static_cast<unsigned>(secureRng() % 1000000u));
+            code = b;
+          } else {
+            code = cfg.pair_code;
+          }
+          {
+            std::lock_guard<std::mutex> lk(amx);
+            lastCode = code;
+          }
+          {
+            std::lock_guard<std::mutex> lk(amx);
+            if (wrongCodes && now - lastWrongUs > 600LL * 1000000) wrongCodes = 0;  // forgotten after 10 min
+            attempts = std::max(1, int(cfg.pair_attempts ? cfg.pair_attempts : 1) - wrongCodes);
+          }
+          codeExpiry = now + int64_t(cfg.pair_code_lifetime_s) * 1000000;
+          codeActive = true;
+          log("PAIRING CODE for '%s': %s (valid %u s)", h.client_name.c_str(), code.c_str(),
+              static_cast<unsigned>(cfg.pair_code_lifetime_s));
+          authResult(AuthStatus::CodeShown, static_cast<uint8_t>(attempts), cfg.pair_code_lifetime_s);
+          break;
+        }
+        case MsgType::PairCode: {
+          if (!codeActive) break;
+          count(&Counters::pair_codes);
+          PairCode pcm;
+          if (!decode(p, n, pcm)) break;
+          if (pcm.code.size() == code.size() &&
+              constantTimeEqual(reinterpret_cast<const uint8_t*>(pcm.code.data()),
+                                reinterpret_cast<const uint8_t*>(code.data()), code.size())) {
+            FakePhoneConfig::PairedClient pc;
+            pc.client_id = h.client_id;
+            randomBytes(pc.key.data(), pc.key.size());
+            pc.name = h.client_name;
+            {
+              std::lock_guard<std::mutex> lk(amx);
+              pairings.erase(std::remove_if(pairings.begin(), pairings.end(),
+                                            [&](const FakePhoneConfig::PairedClient& e) {
+                                              return e.client_id == h.client_id;
+                                            }),
+                             pairings.end());
+              pairings.push_back(pc);
+              savePairings();
+              wrongCodes = 0;
+            }
+            authResult(AuthStatus::Ok, 0, 0, pc.key);
+            count(&Counters::pair_ok);
+            log("paired with '%s'", h.client_name.c_str());
+            return true;
+          }
+          count(&Counters::pair_wrong);
+          {
+            std::lock_guard<std::mutex> lk(amx);
+            ++wrongCodes;
+            lastWrongUs = now;
+          }
+          if (--attempts <= 0) {
+            {
+              std::lock_guard<std::mutex> lk(amx);
+              lockUntilUs = now + int64_t(cfg.pair_lockout_s) * 1000000;
+              wrongCodes = 0;
+            }
+            authResult(AuthStatus::Locked, 0, cfg.pair_lockout_s);
+            count(&Counters::pair_locked);
+            log("wrong pairing code: locked for %u s", static_cast<unsigned>(cfg.pair_lockout_s));
+            return false;
+          }
+          authResult(AuthStatus::WrongCode, static_cast<uint8_t>(attempts), 0);
+          log("wrong pairing code (%d attempts left)", attempts);
+          break;
+        }
+        case MsgType::Bye:
+          return false;
+        default:
+          count(&Counters::unauth_msgs);  // ignored before authentication
+          break;
+      }
+    }
+    return false;
   }
 
   bool handle(const TcpFrameParser::Message& m) {
@@ -978,6 +1237,20 @@ bool FakePhone::start(const FakePhoneConfig& cfg, std::string& err) {
   m.stopFlag = false;
   m.name = cfg.device_name;
   m.resetParams();
+  {
+    std::lock_guard<std::mutex> lk(m.amx);
+    m.phoneId = cfg.phone_id;
+    if (std::all_of(m.phoneId.begin(), m.phoneId.end(), [](uint8_t b) { return b == 0; })) {
+      const std::string seed = "owc-fakephone:" + cfg.device_name;
+      const Key32 hsh = sha256(reinterpret_cast<const uint8_t*>(seed.data()), seed.size());
+      std::memcpy(m.phoneId.data(), hsh.data(), m.phoneId.size());
+    }
+    m.pairings = cfg.paired_clients;
+    m.loadPairings();
+    m.lastCode.clear();
+    m.lockUntilUs = 0;
+    m.wrongCodes = 0;
+  }
   m.lsock = bindSock(SOCK_STREAM, cfg.bind_address, cfg.control_port, err);
   if (m.lsock == INVALID_SOCKET) return false;
   listen(m.lsock, 4);
@@ -1023,6 +1296,32 @@ FakePhone::Counters FakePhone::counters() const {
   std::lock_guard<std::mutex> lk(impl_->cmx);
   return impl_->c;
 }
+
+Id16 FakePhone::phoneId() const {
+  std::lock_guard<std::mutex> lk(impl_->amx);
+  return impl_->phoneId;
+}
+
+std::string FakePhone::lastPairCode() const {
+  std::lock_guard<std::mutex> lk(impl_->amx);
+  return impl_->lastCode;
+}
+
+std::vector<FakePhoneConfig::PairedClient> FakePhone::pairedClients() const {
+  std::lock_guard<std::mutex> lk(impl_->amx);
+  return impl_->pairings;
+}
+
+void FakePhone::setPairedClients(const std::vector<FakePhoneConfig::PairedClient>& v) {
+  std::lock_guard<std::mutex> lk(impl_->amx);
+  impl_->pairings = v;
+  impl_->savePairings();
+  if (impl_->sessionAuthed && !impl_->findPairing(impl_->authClient)) impl_->unpairKick = true;
+}
+
+void FakePhone::rejectPairing() { impl_->rejectReq = true; }
+
+void FakePhone::kickClient() { impl_->kick = true; }
 
 }  // namespace fake
 }  // namespace owc

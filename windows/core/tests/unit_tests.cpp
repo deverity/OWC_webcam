@@ -1,6 +1,6 @@
 // owc_core unit tests: transforms, clock sync, jitter/delay trend, keyframe
 // policy, adb parsing, process exec, Annex-B helpers, counter strip, presets,
-// colour grading (.cube parsing, YUV table bake/apply, export).
+// colour grading (.cube parsing, YUV table bake/apply, export), pairing helpers.
 #include "test_util.h"
 
 #include "annexb.h"
@@ -8,6 +8,7 @@
 #include "color_grade.h"
 #include "record_setup.h"
 #include "metrics.h"
+#include "pairing.h"
 #include "transform.h"
 #include "util.h"
 
@@ -2053,6 +2054,62 @@ void testGradeAllOnBenchmark() {
   std::printf("  scopes 1080p step 2 (W=1024 H=512 VS=512): avg %.2f ms, best %.2f ms\n", sTotal / 10, sBest);
 }
 
+// ------------------------------------------------------------------ pairing
+void testPairingHelpers() {
+  CHECK(normalizePairCode("123456") == "123456");
+  CHECK(normalizePairCode(" 012345\r\n") == "012345");
+  CHECK(normalizePairCode("12345").empty());
+  CHECK(normalizePairCode("1234567").empty());
+  CHECK(normalizePairCode("12 456").empty());
+  CHECK(normalizePairCode("12a456").empty());
+  CHECK(normalizePairCode("").empty());
+  CHECK(normalizePairCode("\xd9\xa1\xd9\xa2\xd9\xa3").empty());  // non-ASCII digits
+
+  std::vector<PairedPhone> v;
+  PhoneId a{}, b{};
+  a[0] = 1;
+  b[0] = 2;
+  Key32 k1{}, k2{};
+  k1[0] = 0x11;
+  k2[0] = 0x22;
+  CHECK(findPairing(v, a) == nullptr);
+  upsertPairing(v, a, k1);
+  upsertPairing(v, b, k1);
+  upsertPairing(v, a, k2);  // replaces
+  CHECK(v.size() == 2);
+  CHECK(findPairing(v, a) && findPairing(v, a)->key == k2);
+  CHECK(removePairing(v, a) && !removePairing(v, a));
+  CHECK(v.size() == 1 && findPairing(v, b) && !findPairing(v, a));
+
+  CHECK(isZero(Id16{}) && isZero(Key32{}) && !isZero(a) && !isZero(k1));
+  const ClientId c1 = newClientId(), c2 = newClientId();
+  CHECK(!isZero(c1) && c1 != c2);
+  CHECK(shortHex(c1) == toHex(c1.data(), 4) && shortHex(c1).size() == 8);
+
+  CHECK(std::string(toString(ClientState::Pairing)) == "Pairing");
+  CHECK(std::string(toString(DisconnectReason::PairingLocked)) == "PairingLocked");
+  CHECK(std::string(toString(DisconnectReason::PairingExpired)) == "PairingExpired");
+  CHECK(std::string(toString(DisconnectReason::PairingRejected)) == "PairingRejected");
+  CHECK(std::string(toString(DisconnectReason::NotAuthorized)) == "NotAuthorized");
+  CHECK(std::string(toString(DisconnectReason::NotPaired)) == "NotPaired");
+
+  // Client API guards without a session.
+  Client c;
+  CHECK(!c.submitPairingCode("123456") && !c.cancelPairing() && !c.pairingInfo().active);
+  ConnectParams cp;
+  CHECK(!c.connect(cp));  // all-zero client_id
+  cp.client_id = c1;
+  PairedPhone pp;
+  pp.phone_id = a;
+  pp.key = k1;
+  cp.paired.push_back(pp);
+  cp.port = Adb::pickFreeTcpPort();  // nothing listens there
+  CHECK(c.connect(cp));
+  c.forgetPairing(a);
+  CHECK(c.connectParams().paired.empty() && c.connectParams().client_id == c1);
+  c.disconnect();
+}
+
 }  // namespace
 
 int main() {
@@ -2073,6 +2130,7 @@ int main() {
   RUN(testQpcConversions);
   RUN(testDiscoveryHelpers);
   RUN(testCodecSelection);
+  RUN(testPairingHelpers);
   RUN(testLinkClassification);
   RUN(testRecordSetupPlanner);
   RUN(testCubeParse);

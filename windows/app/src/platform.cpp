@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -225,6 +226,51 @@ std::string formatClock(long long unixMs) {
   char buf[32];
   std::snprintf(buf, sizeof buf, "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
   return buf;
+}
+
+std::string formatDateTime(long long unixSeconds) {
+  FILETIME ft;
+  ULARGE_INTEGER u;
+  u.QuadPart = static_cast<unsigned long long>(unixSeconds) * 10000000ull + 116444736000000000ull;
+  ft.dwLowDateTime = u.LowPart;
+  ft.dwHighDateTime = u.HighPart;
+  FILETIME lt;
+  SYSTEMTIME st;
+  FileTimeToLocalFileTime(&ft, &lt);
+  FileTimeToSystemTime(&lt, &st);
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%02u/%02u/%04u %02u:%02u", st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
+  return buf;
+}
+
+namespace {
+
+bool dpapi(bool protect, const std::vector<unsigned char>& in, const std::string& entropy,
+           std::vector<unsigned char>& out) {
+  out.clear();
+  DATA_BLOB src{static_cast<DWORD>(in.size()), const_cast<BYTE*>(in.data())};
+  DATA_BLOB ent{static_cast<DWORD>(entropy.size()),
+                reinterpret_cast<BYTE*>(const_cast<char*>(entropy.data()))};
+  DATA_BLOB dst{0, nullptr};
+  const BOOL ok = protect ? CryptProtectData(&src, L"OWC", &ent, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &dst)
+                          : CryptUnprotectData(&src, nullptr, &ent, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &dst);
+  if (!ok) return false;
+  out.assign(dst.pbData, dst.pbData + dst.cbData);
+  SecureZeroMemory(dst.pbData, dst.cbData);  // may hold the plaintext
+  LocalFree(dst.pbData);
+  return true;
+}
+
+}  // namespace
+
+bool protectForUser(const std::vector<unsigned char>& plain, const std::string& entropy,
+                    std::vector<unsigned char>& blob) {
+  return dpapi(true, plain, entropy, blob);
+}
+
+bool unprotectForUser(const std::vector<unsigned char>& blob, const std::string& entropy,
+                      std::vector<unsigned char>& plain) {
+  return dpapi(false, blob, entropy, plain);
 }
 
 }  // namespace owcapp

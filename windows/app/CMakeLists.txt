@@ -40,7 +40,7 @@ add_executable(OWC WIN32
 target_compile_options(OWC PRIVATE /W4)
 target_include_directories(OWC PRIVATE src)
 target_link_libraries(OWC PRIVATE owc_core owc_imgui
-  d3d11 dxgi d3dcompiler windowscodecs shell32 ole32 user32 gdi32 advapi32 dwmapi)
+  d3d11 dxgi d3dcompiler windowscodecs shell32 ole32 user32 gdi32 advapi32 dwmapi crypt32)
 # The manifest (per-monitor-v2 DPI) is a resource of OWC.rc.
 target_link_options(OWC PRIVATE /MANIFEST:NO)
 set_target_properties(OWC PROPERTIES OUTPUT_NAME OWC)

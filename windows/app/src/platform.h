@@ -40,5 +40,15 @@ bool obsPluginInstalled();
 
 // Local time "HH:MM:SS.mmm" from ms since Unix epoch (UTC).
 std::string formatClock(long long unixMs);
+// Local date/time "dd/mm/aaaa HH:MM" from seconds since Unix epoch (UTC).
+std::string formatDateTime(long long unixSeconds);
+
+// DPAPI, current user, no UI (CryptProtectData / CryptUnprotectData). `entropy`
+// binds a blob to its purpose: unprotecting with another value fails. false on
+// failure (e.g. a blob from another Windows user or machine).
+bool protectForUser(const std::vector<unsigned char>& plain, const std::string& entropy,
+                    std::vector<unsigned char>& blob);
+bool unprotectForUser(const std::vector<unsigned char>& blob, const std::string& entropy,
+                      std::vector<unsigned char>& plain);
 
 }  // namespace owcapp

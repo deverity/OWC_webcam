@@ -16,6 +16,11 @@
 //       F = Float, E = Enum (e.g. --set 18=E0 --set 2=1920 --set 29=F2.5).
 //       --shm publishes to the shared-memory bus (off by default so the probe
 //       never fights the OWC app for it). Exit code 0 if frames were decoded.
+//       Authentication (protocol v2): [--client-id HEX32] [--key PHONE_ID_HEX:KEY_HEX]
+//       [--pair-code NNNNNN]. Without --client-id a random id is used (a new
+//       pairing every run). When the phone shows a code, --pair-code is sent, else
+//       the code is read from stdin. The key of a new pairing is printed so it can
+//       be passed with --client-id/--key next time.
 #include "decoder.h"
 #include "util.h"
 
@@ -100,6 +105,19 @@ struct Events : ClientEvents {
     std::printf("[state] %s %s %s\n", toString(s), r != DisconnectReason::None ? toString(r) : "",
                 m.c_str());
   }
+  std::atomic<bool> pairingPrompt{false};
+  void onPairing(const PairingInfo& i) override {
+    std::printf("[pairing] '%s' shows a code: %u attempts left, %u s%s\n", i.device_name.c_str(), i.attempts_left,
+                i.code_lifetime_s, i.wrong_code ? " (last code was WRONG)" : "");
+    pairingPrompt = true;
+  }
+  void onPaired(const PhoneId& id, const Key32& key, const DeviceInfo&) override {
+    std::printf("[paired] reuse with: --key %s:%s\n", toHex(id.data(), id.size()).c_str(),
+                toHex(key.data(), key.size()).c_str());
+  }
+  void onKeyRejected(const PhoneId& id) override {
+    std::printf("[pairing] phone %s rejected our key\n", toHex(id.data(), id.size()).c_str());
+  }
   void onConnected(const DeviceInfo& d) override {
     std::printf("[connected] %s (%s) API %u codecs 0x%x session %u udp %u\n", d.device_name.c_str(),
                 d.model.c_str(), d.android_api, d.codec_mask, d.session_id, d.udp_port);
@@ -151,6 +169,7 @@ int connectMode(int argc, char** argv) {
   bool quality = false;
   uint32_t qW = 0, qH = 0, qFps = 0;
   RecordSetupStatus setup;
+  std::string pairCode;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -201,12 +220,36 @@ int connectMode(int argc, char** argv) {
       qFps = static_cast<uint32_t>(atoi(next()));
     } else if (a == "--no-present") {
       noPresent = true;
+    } else if (a == "--client-id") {
+      if (!fromHex(next(), cp.client_id.data(), cp.client_id.size())) {
+        std::fprintf(stderr, "--client-id: expected 32 hex digits\n");
+        return 2;
+      }
+    } else if (a == "--key") {
+      const std::string v = next();
+      const size_t c = v.find(':');
+      PairedPhone pp;
+      if (c == std::string::npos || !fromHex(v.substr(0, c), pp.phone_id.data(), pp.phone_id.size()) ||
+          !fromHex(v.substr(c + 1), pp.key.data(), pp.key.size())) {
+        std::fprintf(stderr, "--key: expected PHONE_ID_HEX(32):KEY_HEX(64)\n");
+        return 2;
+      }
+      cp.paired.push_back(pp);
+    } else if (a == "--pair-code") {
+      pairCode = next();
     } else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
       return 2;
     }
   }
   cp.client_name = "owc_core_probe";
+  if (cp.client_id == ClientId{}) {
+    cp.client_id = newClientId();
+    std::printf("[pairing] random client id %s (pass --client-id to keep it)\n",
+                toHex(cp.client_id.data(), cp.client_id.size()).c_str());
+  } else {
+    std::printf("[pairing] client id %s\n", toHex(cp.client_id.data(), cp.client_id.size()).c_str());
+  }
   Events ev;
   Client client(&ev, o);
   client.connect(cp);
@@ -215,6 +258,17 @@ int connectMode(int argc, char** argv) {
   uint64_t logId = 0;
   for (int t = 0; t < seconds * 10; ++t) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (ev.pairingPrompt.exchange(false) && client.state() == ClientState::Pairing) {
+      std::string code = pairCode;
+      pairCode.clear();  // a wrong --pair-code is not resent: ask on stdin
+      if (code.empty()) {
+        std::printf("pairing code shown on the phone: ");
+        std::fflush(stdout);
+        char line[64] = {};
+        if (std::fgets(line, sizeof line, stdin)) code = line;
+      }
+      if (!client.submitPairingCode(code)) std::printf("[pairing] code not accepted (6 digits?)\n");
+    }
     if (!sent && (client.state() == ClientState::Connected || client.state() == ClientState::Streaming)) {
       for (auto& kv : sets) client.setParam(kv.first, kv.second);
       if (prepareFps) client.prepareSlowMotion(prepareFps);

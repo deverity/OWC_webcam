@@ -10,6 +10,7 @@
 #include <future>
 #include <set>
 
+#include "platform.h"
 #include "ui_internal.h"
 
 namespace owcapp {
@@ -596,6 +597,31 @@ void tabPc(App& app) {
   { bool c2 = false; sliderU32("##hatt", o.handshake_attempts, 1, 10, "%d", true, c2); commit |= c2; }
   optLabel("Timeout de inatividade", "Desconecta se o celular ficar mudo por este tempo. Efeito imediato.");
   { bool c2 = false; sliderU32("##idle", o.idle_timeout_ms, 1000, 30000, "%d ms", true, c2); commit |= c2; }
+
+  sectionTitle("Celulares pareados");
+  {
+    ImGui::PushStyleColor(ImGuiCol_Text, col::dim());
+    ImGui::TextWrapped("Na primeira conexão o celular mostra um código de 6 dígitos; depois deste pareamento a conexão é automática. Outro PC na mesma rede não consegue usar o celular sem parear.");
+    ImGui::PopStyleColor();
+    const auto phones = app.pairedPhones();
+    if (phones.empty()) ImGui::TextDisabled("Nenhum celular pareado ainda.");
+    for (const auto& p : phones) {
+      ImGui::PushID(p.phone_hex.c_str());
+      const float bw = sc(90);
+      const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw;
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextUnformatted(p.entry.label.empty() ? "(sem nome)" : p.entry.label.c_str());
+      ImGui::SameLine(0, 0);
+      ImGui::SameLine(std::max(ImGui::GetCursorPosX() + sc(8), right));
+      if (ImGui::Button("Esquecer", ImVec2(bw, 0))) app.forgetPairedPhone(p.phone_hex);
+      tip("Apaga a chave de pareamento só neste PC: na próxima conexão o celular pedirá um novo código. Para desparear de vez, remova este PC na lista de PCs pareados do app no celular.");
+      ImGui::TextColored(col::dim(), "%s  -  pareado em %s", p.phone_hex.substr(0, 8).c_str(),
+                         p.entry.paired_at ? formatDateTime(p.entry.paired_at).c_str() : "?");
+      ImGui::PopID();
+    }
+    ImGui::TextColored(col::dim(), "ID deste PC: %s", app.clientIdHex().substr(0, 8).c_str());
+    tip("Identidade deste PC no pareamento (gerada uma vez, salva em %APPDATA%\\OWC). As chaves ficam protegidas pelo Windows (DPAPI) para o seu usuário.");
+  }
 
   sectionTitle("Saída");
   if (ImGui::Checkbox("Publicar na webcam virtual / OBS", &o.publish_to_shm)) commit = true;

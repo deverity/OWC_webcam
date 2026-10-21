@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 
 #include <owc/firewall.h>
 
@@ -20,8 +21,13 @@ AppSettings initialSettings(bool persist) {
     loadSettings(s);
     s.opts.keep_latest_frame = false;
   }
+  // This PC's pairing identity: created once, saved by the constructor.
+  // (Self-test / no-persist runs get a throwaway identity.)
+  if (s.client_id == owc::ClientId{}) s.client_id = owc::newClientId();
   return s;
 }
+
+std::string hexOf(const owc::Id16& id) { return owc::toHex(id.data(), id.size()); }
 
 std::string toUtf8Smart(const std::string& raw) {
   if (raw.empty()) return raw;
@@ -51,6 +57,11 @@ const char* reasonText(owc::DisconnectReason r) {
     case R::Timeout: return "o celular parou de responder";
     case R::ProtocolError: return "erro de protocolo";
     case R::SocketError: return "erro de rede";
+    case R::PairingLocked: return "pareamento bloqueado no celular (muitas tentativas)";
+    case R::PairingExpired: return "o código de pareamento expirou";
+    case R::PairingRejected: return "pareamento recusado no celular";
+    case R::NotAuthorized: return "o celular recusou a autenticação deste PC";
+    case R::NotPaired: return "este PC foi removido no celular — conecte de novo para parear";
   }
   return "";
 }
@@ -61,6 +72,7 @@ const char* stateText(owc::ClientState s) {
     case S::Idle: return "Desconectado";
     case S::Connecting: return "Conectando...";
     case S::Handshaking: return "Negociando...";
+    case S::Pairing: return "Pareando...";
     case S::Connected: return "Conectado";
     case S::Streaming: return "Transmitindo";
     case S::Reconnecting: return "Reconectando...";
@@ -77,6 +89,7 @@ App::App(bool persist_)
   frame_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   lat_ring_.assign(120, 0.0);
   if (persist) loadUserPresets(user_presets);
+  if (persist) save_asap_ = true;  // persists a newly created client_id (and drops undecryptable keys)
   vcam_registered = virtualCamRegistered(&vcam_per_user);
   obs_installed = obsPluginInstalled();
 }
@@ -183,6 +196,7 @@ void App::tick() {
     toasts_.erase(std::remove_if(toasts_.begin(), toasts_.end(), [&](const Toast& t) { return t.until < now; }),
                   toasts_.end());
   }
+  if (save_asap_.exchange(false) && persist) saveNow();
   if (dirty_ && persist) {
     if (dirty_since_ == 0) dirty_since_ = now;
     else if (now - dirty_since_ > 800) saveNow();
@@ -276,6 +290,8 @@ void App::connectNet(const std::string& host, int port, owc::VideoTransport t, c
   if (GetComputerNameA(name, &n)) cp.client_name = std::string("OWC PC (") + name + ")";
   {
     std::lock_guard<std::mutex> l(mu_);
+    cp.client_id = settings.client_id;
+    cp.paired = pairedPhoneList(settings);
     settings.last_host = host;
     settings.last_port = port;
     settings.last_transport = t == owc::VideoTransport::Udp ? 1 : 0;
@@ -300,8 +316,40 @@ bool App::sessionUp() const {
 bool App::live() const {
   auto s = client.state();
   return s == owc::ClientState::Connecting || s == owc::ClientState::Handshaking ||
-         s == owc::ClientState::Connected || s == owc::ClientState::Streaming ||
-         s == owc::ClientState::Reconnecting;
+         s == owc::ClientState::Pairing || s == owc::ClientState::Connected ||
+         s == owc::ClientState::Streaming || s == owc::ClientState::Reconnecting;
+}
+
+std::vector<App::PairedView> App::pairedPhones() {
+  std::vector<PairedView> v;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    for (const auto& kv : settings.paired_phones) v.push_back(PairedView{kv.first, kv.second});
+  }
+  std::sort(v.begin(), v.end(), [](const PairedView& a, const PairedView& b) { return a.entry.label < b.entry.label; });
+  for (auto& e : v) e.entry.key = owc::Key32{};  // the UI never needs the secret
+  return v;
+}
+
+void App::forgetPairedPhone(const std::string& phoneHex) {
+  owc::PhoneId id;
+  if (owc::fromHex(phoneHex, id.data(), id.size())) client.forgetPairing(id);
+  std::string label;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = settings.paired_phones.find(phoneHex);
+    if (it == settings.paired_phones.end()) return;
+    label = it->second.label;
+    SecureZeroMemory(it->second.key.data(), it->second.key.size());
+    settings.paired_phones.erase(it);
+  }
+  save_asap_ = true;
+  toast("\"" + label + "\" esquecido neste PC. Para desparear de vez, remova este PC no app do celular.", false, 6000);
+}
+
+std::string App::clientIdHex() {
+  std::lock_guard<std::mutex> l(mu_);
+  return hexOf(settings.client_id);
 }
 
 std::string App::stateMessage() {
@@ -311,15 +359,58 @@ std::string App::stateMessage() {
 
 // ---------------------------------------------------------------- events
 void App::onStateChanged(owc::ClientState s, owc::DisconnectReason r, const std::string& msg) {
+  using R = owc::DisconnectReason;
+  std::string pairText;  // pairing failures get their own (actionable) message
+  if (s == owc::ClientState::Failed) {
+    const owc::PairingInfo pi = client.pairingInfo();
+    const std::string who = pi.device_name.empty() ? (pi.model.empty() ? "o celular" : pi.model) : pi.device_name;
+    if (r == R::PairingLocked)
+      pairText = "Pareamento com " + who + " bloqueado (muitas tentativas). Tente de novo em " +
+                 std::to_string(pi.retry_after_s ? pi.retry_after_s : owc::kPairLockoutS) + " s.";
+    else if (r == R::PairingExpired)
+      pairText = "O código de pareamento expirou. Conecte de novo para gerar outro código.";
+    else if (r == R::PairingRejected)
+      pairText = "Pareamento recusado no celular (" + who + ").";
+    else if (r == R::NotAuthorized)
+      pairText = "O celular " + who + " recusou a autenticação deste PC. Conecte de novo para parear.";
+    else if (r == R::NotPaired)
+      pairText = "Este PC foi removido no celular " + who + ". Conecte de novo para parear (o celular mostrará um código).";
+  }
   std::lock_guard<std::mutex> l(mu_);
   state_msg_ = msg;
   if (s == owc::ClientState::Failed || (s == owc::ClientState::Reconnecting && r != owc::DisconnectReason::None)) {
     Toast t;
-    t.text = std::string(stateText(s)) + ": " + reasonText(r);
+    t.text = !pairText.empty() ? pairText : std::string(stateText(s)) + ": " + reasonText(r);
     t.error = true;
-    t.until = GetTickCount64() + 6000;
+    t.until = GetTickCount64() + (pairText.empty() ? 6000 : 8000);
     toasts_.push_back(t);
   }
+}
+
+void App::onPaired(const owc::PhoneId& id, const owc::Key32& key, const owc::DeviceInfo& info) {
+  const std::string name = info.device_name.empty() ? info.model : info.device_name;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    PairedPhoneEntry e;
+    e.key = key;
+    e.label = info.model.empty() || info.model == name ? name : name + " (" + info.model + ")";
+    e.paired_at = static_cast<long long>(time(nullptr));
+    settings.paired_phones[hexOf(id)] = e;
+  }
+  save_asap_ = true;  // saved by the UI thread (DPAPI + file), not on owc-net
+  toast("Pareado com " + name + ".", false, 5000);
+}
+
+void App::onKeyRejected(const owc::PhoneId& id) {
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = settings.paired_phones.find(hexOf(id));
+    if (it == settings.paired_phones.end()) return;
+    SecureZeroMemory(it->second.key.data(), it->second.key.size());
+    settings.paired_phones.erase(it);
+  }
+  save_asap_ = true;
+  toast("O celular não reconhece mais este PC (foi removido lá): é preciso parear de novo.", false, 6000);
 }
 
 void App::onConnected(const owc::DeviceInfo& info) {
@@ -720,10 +811,12 @@ void App::connectUsb(const std::string& serial, const std::string& label) {
 }
 
 bool App::usbWaitState(uint32_t timeoutMs) {
-  const ULONGLONG t0 = GetTickCount64();
+  ULONGLONG t0 = GetTickCount64();
   while (!usb_cancel_ && GetTickCount64() - t0 < timeoutMs) {
     auto s = client.state();
     if (s == owc::ClientState::Connected || s == owc::ClientState::Streaming) return true;
+    // The user is typing the pairing code: keep waiting (the client bounds it by the code lifetime).
+    if (s == owc::ClientState::Pairing) t0 = GetTickCount64();
     if ((s == owc::ClientState::Failed || s == owc::ClientState::Idle) && GetTickCount64() - t0 > 1500) return false;
     Sleep(100);
   }

@@ -8,6 +8,7 @@ add_library(owc_core STATIC
   src/discovery.cpp
   src/firewall.cpp
   src/metrics.cpp
+  src/pairing.cpp
   src/presets.cpp
   src/record_setup.cpp
   src/scopes.cpp
@@ -21,7 +22,7 @@ target_include_directories(owc_core
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(owc_core
   PUBLIC owc_protocol owc_common
-  PRIVATE ws2_32 iphlpapi shell32 mfreadwrite mfplat mfuuid wmcodecdspuuid d3d11 dxgi ole32 oleaut32)
+  PRIVATE ws2_32 iphlpapi shell32 bcrypt mfreadwrite mfplat mfuuid wmcodecdspuuid d3d11 dxgi ole32 oleaut32)
 target_compile_features(owc_core PUBLIC cxx_std_17)
 
 if(OWC_BUILD_TESTS)

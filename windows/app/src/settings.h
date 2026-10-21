@@ -23,6 +23,15 @@ struct UserPreset {
   ParamList phone;
 };
 
+// A phone this PC is paired with (protocol v2 pairing). The key is kept in
+// clear only in memory; settings.json stores it protected with DPAPI (current
+// Windows user), so a copied settings file is useless elsewhere.
+struct PairedPhoneEntry {
+  owc::Key32 key{};
+  std::string label;       // device name (model) at pairing time, for the UI
+  long long paired_at = 0; // seconds since the Unix epoch
+};
+
 struct AppSettings {
   // last connection
   std::string last_host;
@@ -55,13 +64,23 @@ struct AppSettings {
   std::map<std::string, ParamList> device_params;
   // per-device orientation: mode -1 = auto (phone hint), else 0/90/180/270; mirror
   std::map<std::string, std::pair<int, bool>> device_orient;
+  // pairing (protocol v2): this PC's identity, generated once (owc::newClientId,
+  // BCryptGenRandom) and persisted; all zeros until loaded/generated.
+  owc::ClientId client_id{};
+  // phones paired with this PC, key = phone_id (lower-case hex)
+  std::map<std::string, PairedPhoneEntry> paired_phones;
 };
 
 std::wstring settingsPath();
 std::wstring presetsPath();
 
+// loadSettings drops paired phones whose key cannot be unprotected (another
+// Windows user / machine, corrupted entry). It never generates client_id.
 bool loadSettings(AppSettings& s);
 bool saveSettings(const AppSettings& s);
+
+// The ConnectParams::paired list for owc::Client.
+std::vector<owc::PairedPhone> pairedPhoneList(const AppSettings& s);
 
 bool loadUserPresets(std::vector<UserPreset>& out);
 bool saveUserPresets(const std::vector<UserPreset>& in);

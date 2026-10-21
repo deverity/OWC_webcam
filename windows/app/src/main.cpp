@@ -54,6 +54,9 @@ struct Args {
   int palette = -1;               // --palette N: colour page palette (0 wheels .. 4 gallery)
   bool color_demo = false;        // --color-demo (self-test): sample grade + 2 scopes, for screenshots
   std::string ui_script;          // --ui-script "cmd; cmd; ..." (self-test): injected ImGui input, one step per frame
+  std::string pair_code;          // --pair-code NNNNNN[,NNNNNN...] (self-test): typed automatically when the
+                                  // phone asks for pairing, one per prompt (e.g. owc_fakephone --pair-code)
+  std::wstring pair_screenshot;   // --pair-screenshot f.png (self-test): the pairing dialog, before the last code
 };
 
 HWND g_hwnd = nullptr;
@@ -143,6 +146,8 @@ bool parseArgs(Args& a) {
     } else if (s == L"--palette") a.palette = _wtoi(next().c_str());
     else if (s == L"--color-demo") a.color_demo = true;
     else if (s == L"--ui-script") a.ui_script = toUtf8(next());
+    else if (s == L"--pair-code") a.pair_code = toUtf8(next());
+    else if (s == L"--pair-screenshot") a.pair_screenshot = next();
     else if (s == L"--help" || s == L"-h" || s == L"/?") a.help = true;
   }
   LocalFree(argv);
@@ -570,6 +575,34 @@ void recordSelftest(ULONGLONG now) {
 
 void selftestTick() {
   const ULONGLONG now = GetTickCount64();
+  // Self-test runs use a throwaway identity: pair with the code(s) given on the command
+  // line, one per prompt (a wrong one first shows the error state), the dialog shown
+  // for ~0.6 s before each; --pair-screenshot captures it before the last code.
+  if (!g_args.pair_code.empty() && g_app->client.state() == owc::ClientState::Pairing) {
+    static std::vector<std::string> codes;
+    static size_t nextCode = 0;
+    static ULONGLONG readySince = 0;
+    static bool shot = false;
+    if (codes.empty()) {
+      std::stringstream ss(g_args.pair_code);
+      for (std::string c; std::getline(ss, c, ',');)
+        if (!c.empty()) codes.push_back(c);
+    }
+    if (g_app->client.pairingInfo().code_pending) readySince = 0;
+    else if (!readySince) readySince = now;
+    if (readySince && now - readySince > 600 && nextCode < codes.size()) {
+      const bool last = nextCode + 1 == codes.size();
+      if (last && !g_args.pair_screenshot.empty() && !shot) {
+        g_renderer.requestScreenshot(g_args.pair_screenshot);
+        shot = true;
+      } else if (!last || g_args.pair_screenshot.empty() || !g_renderer.screenshotPending()) {
+        const bool ok = g_app->client.submitPairingCode(codes[nextCode]);
+        emitf("SELFTEST: código de pareamento %s %s\n", codes[nextCode].c_str(), ok ? "enviado" : "recusado");
+        ++nextCode;
+        readySince = 0;
+      }
+    }
+  }
   if (g_args.idle) {
     const ULONGLONG shotAt = g_args.seconds_set ? static_cast<ULONGLONG>(g_args.seconds * 750.0) : 1500;
     if (now - g_st.t_start > shotAt && !uiScriptActive() && !g_st.shot_requested && !g_args.screenshot.empty()) {
@@ -682,7 +715,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
   parseArgs(g_args);
   g_logPath = g_args.logfile;
   if (g_args.help) {
-    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--size WxH] [--palette 0-4] [--color-demo] [--ui-script \"...\"] [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]]\n");
+    emit("OWC.exe [--selftest --host H --port P [--transport tcp|udp] [--seconds N] [--screenshot f.png] [--log f.txt] [--tab nome]\n         [--size WxH] [--palette 0-4] [--color-demo] [--ui-script \"...\"] [--record N [--slowmo] [--rec-priority quality|latency] [--rec-dir pasta]]\n         [--pair-code NNNNNN[,NNNNNN] [--pair-screenshot f.png]]]\n");
     return 0;
   }
 

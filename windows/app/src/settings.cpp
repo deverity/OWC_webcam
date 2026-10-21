@@ -1,5 +1,7 @@
 #include "settings.h"
 
+#include <windows.h>
+
 #include <algorithm>
 
 #include "json.h"
@@ -11,6 +13,57 @@ std::wstring settingsPath() { return appDataDir() + L"\\settings.json"; }
 std::wstring presetsPath() { return appDataDir() + L"\\presets.json"; }
 
 std::string deviceKey(const std::string& model, const std::string& name) { return model + "|" + name; }
+
+// DPAPI entropy of a pairing key: binds the blob to its phone entry.
+static std::string pairEntropy(const std::string& phoneHex) { return "OWC pairing key v1|" + phoneHex; }
+
+static Json pairedToJson(const std::map<std::string, PairedPhoneEntry>& m) {
+  Json o = Json::object();
+  for (const auto& kv : m) {
+    std::vector<unsigned char> plain(kv.second.key.begin(), kv.second.key.end()), blob;
+    const bool ok = protectForUser(plain, pairEntropy(kv.first), blob);
+    SecureZeroMemory(plain.data(), plain.size());
+    if (!ok) continue;  // never write a key in clear
+    Json e = Json::object();
+    e.set("key_dpapi", Json::string(owc::toHex(blob.data(), blob.size())));
+    e.set("label", Json::string(kv.second.label));
+    e.set("paired_at", Json::number(static_cast<double>(kv.second.paired_at)));
+    o.set(kv.first, std::move(e));
+  }
+  return o;
+}
+
+static void pairedFromJson(const Json* j, std::map<std::string, PairedPhoneEntry>& m) {
+  m.clear();
+  if (!j || !j->isObj()) return;
+  for (const auto& kv : j->o) {
+    owc::Id16 id;
+    if (!owc::fromHex(kv.first, id.data(), id.size())) continue;
+    const std::string hex = kv.second.str("key_dpapi");
+    std::vector<unsigned char> blob(hex.size() / 2), plain;
+    if (blob.empty() || hex.size() % 2 || !owc::fromHex(hex, blob.data(), blob.size())) continue;
+    if (!unprotectForUser(blob, pairEntropy(owc::toHex(id.data(), id.size())), plain)) continue;
+    if (plain.size() == owc::kKeySize) {
+      PairedPhoneEntry e;
+      std::copy(plain.begin(), plain.end(), e.key.begin());
+      e.label = kv.second.str("label");
+      e.paired_at = static_cast<long long>(kv.second.num("paired_at", 0));
+      m[owc::toHex(id.data(), id.size())] = e;
+    }
+    SecureZeroMemory(plain.data(), plain.size());
+  }
+}
+
+std::vector<owc::PairedPhone> pairedPhoneList(const AppSettings& s) {
+  std::vector<owc::PairedPhone> v;
+  for (const auto& kv : s.paired_phones) {
+    owc::PairedPhone p;
+    if (!owc::fromHex(kv.first, p.phone_id.data(), p.phone_id.size())) continue;
+    p.key = kv.second.key;
+    v.push_back(p);
+  }
+  return v;
+}
 
 static Json paramToJson(owc::ParamId id, const owc::ParamValue& v) {
   Json j = Json::object();
@@ -264,6 +317,11 @@ bool loadSettings(AppSettings& s) {
       if (!l.empty()) s.device_params[kv.first] = std::move(l);
     }
   }
+  {
+    owc::ClientId id;
+    if (owc::fromHex(j.str("client_id"), id.data(), id.size())) s.client_id = id;
+  }
+  pairedFromJson(j.find("paired_phones"), s.paired_phones);
   if (const Json* d = j.find("orient"); d && d->isObj()) {
     for (const auto& kv : d->o)
       s.device_orient[kv.first] = {static_cast<int>(kv.second.num("m", -1)), kv.second.flag("x", false)};
@@ -313,6 +371,8 @@ bool saveSettings(const AppSettings& s) {
     orient.set(kv.first, std::move(e));
   }
   j.set("orient", std::move(orient));
+  if (s.client_id != owc::ClientId{}) j.set("client_id", Json::string(owc::toHex(s.client_id.data(), s.client_id.size())));
+  j.set("paired_phones", pairedToJson(s.paired_phones));
   return writeTextFileAtomic(settingsPath(), j.dump(2));
 }
 
