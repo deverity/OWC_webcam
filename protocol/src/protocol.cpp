@@ -1,5 +1,7 @@
 #include "owc/protocol.h"
 
+#include "owc/crypto.h"  // secureWipe
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -189,7 +191,7 @@ bool getDesc(Reader& r, ParamDesc& d) {
 std::vector<uint8_t> encode(const Hello& m) {
   std::vector<uint8_t> b; Writer w{b};
   w.u32(m.magic); w.u16(m.version); w.u8(static_cast<uint8_t>(m.transport)); w.str(m.client_name);
-  w.raw(m.client_id);
+  w.raw(m.client_id); w.raw(m.eph_pub); w.u32(m.cipher_mask);
   return b;
 }
 bool decode(const uint8_t* p, size_t n, Hello& m) {
@@ -197,9 +199,10 @@ bool decode(const uint8_t* p, size_t n, Hello& m) {
   m.magic = r.u32(); m.version = r.u16();
   m.transport = static_cast<VideoTransport>(r.u8());
   r.str(m.client_name);
-  // v2 trailer: absent (v1 peer) or partial -> all zeros, never a partial read.
-  m.client_id = Id16{};
-  if (r.ok && r.left() >= kIdSize) r.raw(m.client_id);
+  // Trailers: absent (older peer) or partial -> zeros, never a partial read.
+  m.client_id = Id16{}; m.eph_pub = Key32{}; m.cipher_mask = 0;
+  if (r.ok && r.left() >= kIdSize) r.raw(m.client_id);                // v2
+  if (r.ok && r.left() >= kKeySize + 4) { r.raw(m.eph_pub); m.cipher_mask = r.u32(); }  // v3
   return r.ok;
 }
 
@@ -208,7 +211,7 @@ std::vector<uint8_t> encode(const HelloAck& m) {
   w.u32(m.magic); w.u16(m.version); w.u8(static_cast<uint8_t>(m.status));
   w.u32(m.session_id); w.u16(m.udp_port); w.str(m.device_name); w.str(m.model);
   w.u16(m.android_api); w.u32(m.codec_mask);
-  w.raw(m.phone_id); w.raw(m.nonce); w.u8(m.paired ? 1 : 0);
+  w.raw(m.phone_id); w.raw(m.eph_pub); w.u8(m.cipher); w.u8(m.paired ? 1 : 0);
   return b;
 }
 bool decode(const uint8_t* p, size_t n, HelloAck& m) {
@@ -218,50 +221,52 @@ bool decode(const uint8_t* p, size_t n, HelloAck& m) {
   m.session_id = r.u32(); m.udp_port = r.u16();
   r.str(m.device_name); r.str(m.model);
   m.android_api = r.u16(); m.codec_mask = r.u32();
-  // v2 trailer (phone_id, nonce, paired): all-or-nothing, else zeros/false.
-  m.phone_id = Id16{}; m.nonce = Id16{}; m.paired = false;
-  if (r.ok && r.left() >= 2 * kIdSize + 1) {
-    r.raw(m.phone_id); r.raw(m.nonce); m.paired = r.u8() != 0;
+  // v3 trailer (phone_id, eph_pub, cipher, paired): all-or-nothing, else zeros/false.
+  m.phone_id = Id16{}; m.eph_pub = Key32{}; m.cipher = 0; m.paired = false;
+  if (r.ok && r.left() >= kIdSize + kKeySize + 2) {
+    r.raw(m.phone_id); r.raw(m.eph_pub); m.cipher = r.u8(); m.paired = r.u8() != 0;
   }
   return r.ok;
 }
 
+// Pairing/auth messages: every field is mandatory (no zero-fill on truncation)
+// and a failed decode leaves the destination untouched.
 std::vector<uint8_t> encode(const PairCode& m) {
-  std::vector<uint8_t> b; Writer w{b}; w.str(m.code); return b;
+  std::vector<uint8_t> b; Writer w{b}; w.raw(m.cpace_pub); w.raw(m.confirm); return b;
 }
 bool decode(const uint8_t* p, size_t n, PairCode& m) {
   Reader r(p, n);
-  std::string s;
-  if (!r.str(s)) return false;
-  m.code = std::move(s);
+  PairCode t;
+  if (!r.raw(t.cpace_pub) || !r.raw(t.confirm)) return false;
+  m = t;
   return true;
 }
 
 std::vector<uint8_t> encode(const AuthProof& m) {
-  std::vector<uint8_t> b; Writer w{b}; w.raw(m.mac); return b;
+  std::vector<uint8_t> b; Writer w{b}; w.raw(m.confirm); return b;
 }
 bool decode(const uint8_t* p, size_t n, AuthProof& m) {
   Reader r(p, n);
-  Key32 mac;
-  if (!r.raw(mac)) return false;
-  m.mac = mac;
+  AuthProof t;
+  if (!r.raw(t.confirm)) return false;
+  m = t;
   return true;
 }
 
 std::vector<uint8_t> encode(const AuthResult& m) {
   std::vector<uint8_t> b; Writer w{b};
-  w.u8(static_cast<uint8_t>(m.status)); w.u8(m.attempts_left); w.u16(m.seconds); w.raw(m.key);
+  w.u8(static_cast<uint8_t>(m.status)); w.u8(m.attempts_left); w.u16(m.seconds);
+  w.raw(m.cpace_pub); w.raw(m.confirm);
   return b;
 }
 bool decode(const uint8_t* p, size_t n, AuthResult& m) {
   Reader r(p, n);
-  uint8_t status = r.u8();
-  uint8_t attempts = r.u8();
-  uint16_t seconds = r.u16();
-  Key32 key;
-  if (!r.raw(key)) return false;  // the key is mandatory: no zero-fill on truncation
-  m.status = static_cast<AuthStatus>(status);
-  m.attempts_left = attempts; m.seconds = seconds; m.key = key;
+  AuthResult t;
+  t.status = static_cast<AuthStatus>(r.u8());
+  t.attempts_left = r.u8();
+  t.seconds = r.u16();
+  if (!r.raw(t.cpace_pub) || !r.raw(t.confirm)) return false;
+  m = t;
   return true;
 }
 
@@ -649,19 +654,11 @@ Key32 hmacSha256(const uint8_t* key, size_t key_len, const uint8_t* msg, size_t 
   Sha256 out;
   out.update(opad, sizeof(opad));
   out.update(inner.data(), inner.size());
-  return out.finish();
-}
-
-Key32 authMac(const Key32& key, const Id16& phone_id, const Id16& client_id, const Id16& nonce) {
-  // Domain-separation tag: 10 ASCII bytes, no terminator.
-  static const char kTag[] = "OWC-AUTH-2";
-  constexpr size_t kTagLen = sizeof(kTag) - 1;
-  uint8_t msg[kTagLen + 3 * kIdSize];
-  std::memcpy(msg, kTag, kTagLen);
-  std::memcpy(msg + kTagLen, phone_id.data(), kIdSize);
-  std::memcpy(msg + kTagLen + kIdSize, client_id.data(), kIdSize);
-  std::memcpy(msg + kTagLen + 2 * kIdSize, nonce.data(), kIdSize);
-  return hmacSha256(key.data(), key.size(), msg, sizeof(msg));
+  Key32 mac = out.finish();
+  // HKDF runs secrets through here: leave no key material on the stack.
+  secureWipe(k, sizeof(k)); secureWipe(ipad, sizeof(ipad)); secureWipe(opad, sizeof(opad));
+  secureWipe(inner.data(), inner.size()); secureWipe(&in, sizeof(in)); secureWipe(&out, sizeof(out));
+  return mac;
 }
 
 bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
@@ -1011,6 +1008,7 @@ const char* toString(MsgType t) {
     case MsgType::ReceiverReport: return "ReceiverReport";
     case MsgType::Log: return "Log";
     case MsgType::Bye: return "Bye";
+    case MsgType::Sealed: return "Sealed";
   }
   return "Unknown";
 }

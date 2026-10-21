@@ -1,6 +1,9 @@
-// OWC wire protocol v2 — single source of truth shared by the Android NDK core
-// and the Windows client. Portable C++17, no platform headers.
+// OWC wire protocol v3 — single source of truth shared by the Android NDK core
+// and the Windows client. Portable C++17, no platform headers (CPU feature
+// detection for the ciphers lives in protocol/src, see owc/crypto.h).
 // v2 = v1 + mandatory pairing/authentication before the session starts.
+// v3 = ephemeral X25519 key exchange, PAKE pairing (the code never travels),
+//      mutual key confirmation and AEAD encryption of all TCP and UDP traffic.
 //
 // All multi-byte integers are LITTLE-ENDIAN on the wire. Floats are IEEE-754
 // binary32 LE. Strings are u16 byte-length + UTF-8 bytes (no terminator).
@@ -15,14 +18,18 @@
 //         (UDP is not possible over adb; USB always uses Tcp transport).
 //
 // Session flow:
-//   PC  -> Hello            (magic, version, desired transport, client_id)
+//   PC  -> Hello            (magic, version, desired transport, client_id,
+//                            ephemeral X25519 key, cipher mask)
 //   PH  -> HelloAck         (status=AuthRequired, session_id, device info, codec
-//                            mask, phone_id, nonce, paired)
+//                            mask, phone_id, ephemeral key, chosen cipher, paired)
 //   ---- authentication (see PAIRING below); nothing else is accepted before it
-//   PC  -> AuthProof        (paired: HMAC over the nonce with the stored key)
-//      or PairBegin -> PH AuthResult{CodeShown} -> user types the code shown on
-//         the phone -> PC PairCode -> PH AuthResult{Ok, key} (PC stores the key)
-//   PH  -> AuthResult{Ok}   session is up from here on
+//   PC  -> AuthProof        (paired: key confirmation derived from the stored key)
+//      or PairBegin -> PH AuthResult{CodeShown, Yb} -> user types the code shown
+//         on the phone -> PC PairCode{Ya, confirm} -> PH AuthResult{Ok, confirm}
+//         (both derive and store the same pairing key; it is never sent)
+//   PH  -> AuthResult{Ok}   session is up; EVERY later TCP message both ways is
+//                           sealed (MsgType::Sealed) and every UDP datagram too,
+//                           unless the negotiated cipher is None (see ENCRYPTION)
 //   PH  -> Capabilities     (cameras + param descriptors of active camera)
 //   PH  -> ParamState*      (optional, current values)
 //   [Udp only] PC sends UdpType::Punch {session_id} every 1 s to phone UDP port;
@@ -52,7 +59,7 @@ namespace owc {
 
 // ---------------------------------------------------------------- constants
 constexpr uint32_t kMagic = 0x3143574Fu;            // "OWC1" read as LE u32
-constexpr uint16_t kProtocolVersion = 2;
+constexpr uint16_t kProtocolVersion = 3;
 constexpr uint16_t kDefaultControlPort = 47800;
 constexpr uint16_t kDefaultVideoUdpPort = 47801;
 constexpr uint16_t kDefaultDiscoveryPort = 47802;
@@ -72,8 +79,8 @@ enum class MsgType : uint16_t {
   HelloAck = 2,      // phone -> PC
   Capabilities = 3,  // phone -> PC (resent after camera change)
   PairBegin = 4,     // PC -> phone (empty payload): show a pairing code
-  PairCode = 5,      // PC -> phone: the code the user typed
-  AuthProof = 6,     // PC -> phone: HMAC proof of a stored pairing key
+  PairCode = 5,      // PC -> phone: PAKE share + confirmation (no code on the wire)
+  AuthProof = 6,     // PC -> phone: key confirmation from a stored pairing key
   AuthResult = 7,    // phone -> PC
   SetParam = 10,     // PC -> phone
   ParamState = 11,   // phone -> PC (reply to SetParam, or unsolicited change)
@@ -86,6 +93,8 @@ enum class MsgType : uint16_t {
   ReceiverReport = 33,  // PC -> phone (≈4 Hz) feedback for adaptive bitrate
   Log = 40,         // phone -> PC (level + text, for the PC log panel)
   Bye = 50,          // either
+  Sealed = 60,       // either, after AuthResult{Ok}: AEAD record wrapping any
+                     // other message (owc/crypto.h TcpSealer/TcpOpener)
 };
 
 enum class VideoTransport : uint8_t { Tcp = 0, Udp = 1 };
@@ -101,34 +110,40 @@ constexpr uint32_t codecBit(Codec c) { return 1u << static_cast<uint8_t>(c); }
 // magic/version (the receiver decides).
 //
 // Pairing identities and keys (raw bytes; hex in logs/storage).
-constexpr size_t kIdSize = 16;      // client_id / phone_id / nonce
-constexpr size_t kKeySize = 32;     // pairing key / HMAC-SHA256 output
+constexpr size_t kIdSize = 16;      // client_id / phone_id
+constexpr size_t kKeySize = 32;     // pairing key / X25519 keys / confirmations
 using Id16 = std::array<uint8_t, kIdSize>;
 using Key32 = std::array<uint8_t, kKeySize>;
 
 // Hello:    u32 magic, u16 version, u8 transport, str client_name,
-//           [v2] u8[16] client_id
+//           [v2+] u8[16] client_id, [v3] u8[32] eph_pub, u32 cipher_mask
 // client_id: random, generated once per PC installation and persisted; it is
-// the identity the phone pairs with. Decode: missing trailer (v1 peer) ->
-// all zeros (the phone then answers VersionMismatch from `version`).
+// the identity the phone pairs with. eph_pub: fresh X25519 public key per
+// connection (Handshake::ephPublic). cipher_mask: cipherBit(...) the PC
+// accepts (owc/crypto.h). Decode: a missing/partial trailer -> zeros (an older
+// peer; the receiver answers VersionMismatch from `version`).
 struct Hello {
   uint32_t magic = kMagic;
   uint16_t version = kProtocolVersion;
   VideoTransport transport = VideoTransport::Tcp;
   std::string client_name;
   Id16 client_id{};
+  Key32 eph_pub{};
+  uint32_t cipher_mask = 0;
 };
 
-// AuthRequired: v2 answer to every valid Hello; the session only starts after
-// AuthResult{Ok}. A v2 phone never sends Ok in HelloAck.
+// AuthRequired: answer to every valid Hello; the session only starts after
+// AuthResult{Ok}. A v2+ phone never sends Ok in HelloAck.
 enum class HelloStatus : uint8_t {
   Ok = 0, Busy = 1, VersionMismatch = 2, BadMagic = 3, AuthRequired = 4
 };
 
 // HelloAck: u32 magic, u16 version, u8 status, u32 session_id, u16 udp_port,
 //           str device_name, str model, u16 android_api, u32 codec_mask,
-//           [v2] u8[16] phone_id, u8[16] nonce, u8 paired
-// Decode: missing v2 trailer -> zeros/false.
+//           [v2+] u8[16] phone_id, [v3] u8[32] eph_pub, u8 cipher, u8 paired
+// cipher = chooseCipher(Hello::cipher_mask, phone mask) (owc/crypto.h); if the
+// intersection is empty the phone answers VersionMismatch and closes.
+// Decode: missing/partial trailer -> zeros/false.
 struct HelloAck {
   uint32_t magic = kMagic;
   uint16_t version = kProtocolVersion;
@@ -140,7 +155,8 @@ struct HelloAck {
   uint16_t android_api = 0;
   uint32_t codec_mask = 0;     // codecBit(...) of supported HW encoders
   Id16 phone_id{};             // random, generated once per phone install (persisted)
-  Id16 nonce{};                // random per connection; AuthProof challenge
+  Key32 eph_pub{};             // phone's fresh X25519 public key for this connection
+  uint8_t cipher = 0;          // owc::Cipher chosen for this session
   bool paired = false;         // the phone has a key for Hello::client_id
 };
 
@@ -150,21 +166,32 @@ struct HelloAck {
 // but PairBegin / PairCode / AuthProof / Bye. Other messages are ignored, UDP
 // punches are not answered and no video is produced until AuthResult{Ok}.
 //
+// All key material comes from owc::Handshake (owc/crypto.h); both sides feed it
+// the exact Hello and HelloAck payload bytes, so every confirmation is bound
+// to this connection (replays and relays fail). Pairing keys stored by v2
+// builds remain valid.
+//
 // Paired PC (has a key for HelloAck::phone_id AND HelloAck::paired):
-//   PC -> AuthProof{ mac = authMac(key, phone_id, client_id, nonce) }
-//   PH -> AuthResult{Ok}                 (key field all zeros)
-//      or AuthResult{NotPaired}          unknown client or wrong mac; the PC
-//         deletes its key for this phone and may send PairBegin on the SAME
+//   PC -> AuthProof{ confirm = Handshake::pcConfirm() after usePairingKey }
+//   PH -> AuthResult{Ok, confirm = phoneConfirm()}  the PC MUST verify it
+//         (constantTimeEqual) and drop the connection if it differs: whoever
+//         answered does not hold the key (impostor / relay).
+//      or AuthResult{NotPaired}          unknown client or wrong confirm; the
+//         PC deletes its key for this phone and may send PairBegin on the SAME
 //         connection.
-// Not paired:
+// Not paired (CPace PAKE: the code is an input of both sides, never sent; an
+// eavesdropper learns nothing and an active attacker gets one guess per try):
 //   PC -> PairBegin
-//   PH -> AuthResult{CodeShown, attempts_left, seconds = code lifetime}
-//         The phone shows a random 6-digit code (notification + in-app).
+//   PH -> AuthResult{CodeShown, attempts_left, seconds = code lifetime,
+//                    cpace_pub = Yb}     phone shows a random 6-digit code
 //      or AuthResult{Locked, seconds = retry after} and closes (cooldown).
-//   PC -> PairCode{code}                 user typed it on the PC
-//   PH -> AuthResult{Ok, key}            phone stored {client_id, client_name,
-//         key}; PC stores {phone_id, key}. Session is up.
-//      or AuthResult{WrongCode, attempts_left}   (send PairCode again)
+//   PC -> PairCode{cpace_pub = Ya, confirm = pcConfirm()}   after the user
+//         typed the code (cpaceStart(code) + cpaceFinish(Yb))
+//   PH -> AuthResult{Ok, confirm}        code matched; both store
+//         Handshake::newPairingKey() (phone: with client_id + client_name; PC:
+//         with phone_id) — only after the PC verified `confirm`.
+//      or AuthResult{WrongCode, attempts_left, cpace_pub = fresh Yb}  the PC
+//         runs cpaceStart/cpaceFinish again with the new Yb
 //      or AuthResult{Locked} + close     attempts exhausted
 //      or AuthResult{Expired} + close    code lifetime elapsed
 //      or AuthResult{Rejected} + close   user tapped "cancel" on the phone
@@ -185,31 +212,31 @@ constexpr uint16_t kPairLockoutS = 30;
 constexpr uint16_t kAuthTimeoutS = 10;
 
 enum class AuthStatus : uint8_t {
-  Ok = 0,         // authenticated; key != 0 only right after a pairing
-  CodeShown = 1,  // reply to PairBegin
-  WrongCode = 2,  // attempts_left > 0
-  NotPaired = 3,  // reply to AuthProof: unknown client / bad mac
+  Ok = 0,         // authenticated; confirm = phoneConfirm()
+  CodeShown = 1,  // reply to PairBegin; cpace_pub = Yb
+  WrongCode = 2,  // attempts_left > 0; cpace_pub = fresh Yb
+  NotPaired = 3,  // reply to AuthProof: unknown client / bad confirm
   Locked = 4,     // too many wrong codes or PairBegin during lockout; closes
   Expired = 5,    // code expired; closes
   Rejected = 6,   // pairing cancelled on the phone; closes
 };
 
-// PairCode:   str code (ASCII digits)
-// AuthProof:  u8[32] mac
-// AuthResult: u8 status, u8 attempts_left, u16 seconds, u8[32] key
+// PairCode:   u8[32] cpace_pub, u8[32] confirm
+// AuthProof:  u8[32] confirm
+// AuthResult: u8 status, u8 attempts_left, u16 seconds, u8[32] cpace_pub,
+//             u8[32] confirm      (unused fields all zeros; all fields required)
 //   seconds: CodeShown = code lifetime, Locked = retry after, else 0.
-struct PairCode { std::string code; };
-struct AuthProof { Key32 mac{}; };
+struct PairCode { Key32 cpace_pub{}; Key32 confirm{}; };
+struct AuthProof { Key32 confirm{}; };
 struct AuthResult {
   AuthStatus status = AuthStatus::Ok;
   uint8_t attempts_left = 0;
   uint16_t seconds = 0;
-  Key32 key{};
+  Key32 cpace_pub{};
+  Key32 confirm{};
 };
 
-// mac = HMAC-SHA256(key, "OWC-AUTH-2" || phone_id || client_id || nonce)
-Key32 authMac(const Key32& key, const Id16& phone_id, const Id16& client_id, const Id16& nonce);
-// Constant-time comparison (use for macs and codes).
+// Constant-time comparison (use for confirmations and codes).
 bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n);
 // Lower-case hex of `n` bytes, and back (false on bad length/characters).
 std::string toHex(const uint8_t* p, size_t n);
@@ -441,6 +468,12 @@ enum class UdpType : uint8_t { Video = 1, Punch = 2, PunchAck = 3, Fec = 4 };
 // fec_total: on Fec datagrams = total parity shards M of the frame (1..255); on
 // Video datagrams it is informational (0 or M); receivers ignore it there.
 // Punch/PunchAck: only magic..session_id meaningful, rest zero, no payload.
+// Encrypted sessions put version = kUdpVersionSealed on the wire and append a
+// counter + AEAD tag (owc/crypto.h UdpSealer/UdpOpener). UdpOpener turns a
+// sealed datagram back into this plain v1 layout, so readUdpHeader,
+// FrameAssembler and FEC only ever see plaintext. A sealed sender fragments
+// with max_payload = kUdpMaxPayloadSealed (FrameAssembler must accept any
+// sender max_payload, deriving shard sizes from what it receives).
 struct UdpHeader {
   UdpType type = UdpType::Video;
   uint32_t session_id = 0;
