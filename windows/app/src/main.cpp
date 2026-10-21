@@ -134,7 +134,10 @@ bool parseArgs(Args& a) {
 }
 
 // ------------------------------------------------------------------ tray
+// The icon lives as long as the app (not only while hidden), so "Sair" is
+// always one right-click away.
 void trayAdd() {
+  if (g_trayActive) return;
   NOTIFYICONDATAW nid{};
   nid.cbSize = sizeof nid;
   nid.hWnd = g_hwnd;
@@ -145,6 +148,20 @@ void trayAdd() {
                                             GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
   lstrcpynW(nid.szTip, L"OWC - webcam do celular (em execução)", ARRAYSIZE(nid.szTip));
   g_trayActive = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+}
+
+// Windows notification anchored to the tray icon.
+void trayBalloon(const wchar_t* title, const wchar_t* text) {
+  if (!g_trayActive) return;
+  NOTIFYICONDATAW nid{};
+  nid.cbSize = sizeof nid;
+  nid.hWnd = g_hwnd;
+  nid.uID = kTrayId;
+  nid.uFlags = NIF_INFO;
+  nid.dwInfoFlags = NIIF_INFO;
+  lstrcpynW(nid.szInfoTitle, title, ARRAYSIZE(nid.szInfoTitle));
+  lstrcpynW(nid.szInfo, text, ARRAYSIZE(nid.szInfo));
+  Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void trayRemove() {
@@ -159,7 +176,6 @@ void trayRemove() {
 
 void showMainWindow() {
   g_hidden = false;
-  trayRemove();
   ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
   SetForegroundWindow(g_hwnd);
 }
@@ -168,6 +184,13 @@ void hideToTray() {
   g_hidden = true;
   ShowWindow(g_hwnd, SW_HIDE);
   trayAdd();
+  static bool hinted = false;  // once per run
+  if (!hinted) {
+    hinted = true;
+    trayBalloon(L"O OWC continua rodando",
+                L"A webcam virtual e o OBS seguem recebendo vídeo. Para fechar de vez, clique com o botão "
+                L"direito no ícone do OWC aqui na bandeja e escolha Sair.");
+  }
 }
 
 void trayMenu() {
@@ -285,7 +308,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       PostQuitMessage(0);
       return 0;
     default:
-      if (msg == g_taskbarCreated && g_taskbarCreated != 0 && g_hidden) trayAdd();
+      if (msg == g_taskbarCreated && g_taskbarCreated != 0 && !g_args.selftest) {
+        g_trayActive = false;  // Explorer restarted: its icons are gone
+        trayAdd();
+      }
       break;
   }
   return DefWindowProcW(hwnd, msg, wp, lp);
@@ -599,6 +625,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
 
   ShowWindow(g_hwnd, SW_SHOWNORMAL);
   UpdateWindow(g_hwnd);
+  if (!g_args.selftest) trayAdd();
   app.startServices();
 
   if (g_args.selftest) {
