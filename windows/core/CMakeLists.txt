@@ -8,6 +8,7 @@ add_library(owc_core STATIC
   src/firewall.cpp
   src/metrics.cpp
   src/presets.cpp
+  src/record_setup.cpp
   src/recorder.cpp
   src/sps_patch.cpp
   src/transform.cpp

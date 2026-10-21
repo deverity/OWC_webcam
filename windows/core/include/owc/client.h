@@ -340,6 +340,50 @@ struct RecordStatus {
   std::string last_error;
 };
 
+// ------------------------------------------------------------------ recording setup
+// prepareRecording() reconfigures the phone (and the PC preview) for a
+// recording, saving the previous state; endRecordingSetup() restores it.
+//
+// Quality priority (recording first, latency second):
+//   * codec: the most efficient codec the PHONE advertises (HEVC > H.264).
+//     Recording is passthrough, so the PC does not need a decoder for it: if
+//     it has none (allow_codec_without_pc_decoder), the preview is turned off
+//     (preview_available = false) instead of failing.
+//   * AdaptiveBitrate off, LatencyDropPolicy = queue (never drop to keyframe),
+//     MaxSendQueueFrames = max(32, 1 s of frames) clamped to the phone's max,
+//     FEC off on TCP/USB, B-frames 0 (the recorder assumes no reordering).
+//   * Bitrate = 20 Mbps x (pixels/1080p)^0.79 x (fps/30)^0.64, clamped to the
+//     phone's range: 1080p30 = 20, 720p240 ~ 40, 4K30 ~ 60 Mbps.
+//   * BitrateMode VBR (high-quality, predictable size) when the phone lists it
+//     for the codec, else CQ, else unchanged.
+//   * KeyframeIntervalMs 2000 at <= 60 fps (above 60 fps the phone caps its own
+//     GOP at <= 1 s).
+//   * HEVC is watched for ~2 s: if the phone's encode rate stays below 85 % of
+//     the requested fps (or the phone rejects HEVC), the setup falls back to
+//     H.264 automatically and says so in RecordSetupStatus::summary.
+// Latency priority = the previous behaviour: RealTime changes nothing;
+// SlowMotion applies HighSpeedMode/size/fps, 40 Mbps-per-720p bitrate, queue
+// policy, 32-frame queue, 1 s GOP, FEC off on TCP.
+// Both: fps > 60 => HighSpeedMode=1 and the PC preview is capped at 60 fps
+// (every frame is still decoded/recorded). A keyframe is requested right after.
+enum class RecordPriority : uint8_t { Quality, Latency };
+
+struct RecordPreset {
+  RecordMode mode = RecordMode::RealTime;      // RealTime or SlowMotion
+  RecordPriority priority = RecordPriority::Quality;
+  uint32_t width = 0, height = 0, fps = 0;     // 0 = keep current (SlowMotion: default 1280x720 @ 240)
+  uint32_t slowmo_output_fps = 30;             // 30 -> 8x, 60 -> 4x at 240 fps
+  bool allow_codec_without_pc_decoder = true;  // Quality: record HEVC even if this PC can't decode it (preview off)
+};
+
+struct RecordSetupStatus {
+  bool active = false;          // a setup is applied (restore pending)
+  Codec codec = Codec::H264;    // codec in use for the recording
+  bool preview_available = true;// false when the PC can't decode the recorded codec
+  uint32_t width = 0, height = 0, fps = 0, bitrate_bps = 0;
+  std::string summary;          // human-readable pt-BR, e.g. "Qualidade: HEVC 1280x720 @ 240 fps, 40 Mbps, sem preview (HEVC sem decoder)"
+};
+
 // ------------------------------------------------------------------ logs
 struct LogEntry {
   uint64_t id = 0;               // increasing; pass the last seen id to logs()
@@ -493,22 +537,24 @@ class Client {
   RecordStatus stopRecording();         // finalizes; returns the final status
   RecordStatus recordingStatus() const;
 
-  // ---- slow-motion helper. Saves the phone's current values and sends, in
-  // this order: HighSpeedMode=1, VideoWidth/VideoHeight, Fps=fps (encoder at
-  // the full sensor rate), Bitrate=min(40 Mbps * pixels/720p, max),
-  // AdaptiveBitrate=false, LatencyDropPolicy=1 (queue, don't drop),
-  // MaxSendQueueFrames=min(32, max), KeyframeIntervalMs=1000 (some high-speed
-  // encoders ignore RequestKeyframe; bounds the wait for the first keyframe of
-  // a recording), FecPercent=0 on TCP; and sets
-  // ClientOptions::max_present_fps = 60 (decimated preview). Typical use:
-  //   prepareSlowMotion(240, 1280, 720); wait for VideoFormat fps == 240;
-  //   startRecording({.mode = SlowMotion, .slowmo_output_fps = 30}); ...
-  //   stopRecording(); endSlowMotion();   // restores everything
-  // Returns false if not connected. Params the phone lacks are skipped.
+  // ---- recording setup (see RecordPreset / RecordPriority). Saves the current
+  // phone params + PC options, then applies the preset. Returns false (err set)
+  // if not connected or Capabilities are not known yet. Calling it again while
+  // active re-plans from the ORIGINAL saved state. Typical use:
+  //   prepareRecording({RecordMode::SlowMotion});  // Quality, 1280x720 @ 240
+  //   wait for videoFormat().fps == 240 (or recordSetupStatus())
+  //   startRecording({.mode = RecordMode::SlowMotion, .slowmo_output_fps = 30});
+  //   ... stopRecording(); endRecordingSetup();
+  bool prepareRecording(const RecordPreset& p, std::string* err = nullptr); // saves current phone+PC state
+  // Restores everything prepareRecording() changed. If the session is down,
+  // the phone params are re-applied right after the next connection.
+  bool endRecordingSetup();                                                 // restores (also after reconnect)
+  RecordSetupStatus recordSetupStatus() const;
+
+  // ---- legacy slow-motion wrappers (kept for compatibility):
+  // prepareSlowMotion(fps, w, h) == prepareRecording({SlowMotion, Latency, w, h, fps});
+  // endSlowMotion() == endRecordingSetup(); slowMotionActive() == recordSetupStatus().active.
   bool prepareSlowMotion(uint32_t fps = 240, uint32_t width = 1280, uint32_t height = 720);
-  // Restores the saved values (no-op if not prepared). If the session is
-  // down (phone closed / network lost), the values are re-applied right after
-  // the next connection's Capabilities.
   bool endSlowMotion();
   bool slowMotionActive() const;
 

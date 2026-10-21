@@ -136,6 +136,9 @@ struct FakePhone::Impl {
   uint32_t width = 0, height = 0, fps = 0, bitrate = 0, bframes = 0, kfMs = 0;
   int profile = 0, fec = 0;
   int codec = 0;  // VideoCodec param (0 H.264, 1 HEVC label)
+  // Stored-only params (quality knobs; no effect on the synthetic encoder).
+  bool adaptiveBitrate = true;
+  int dropPolicy = 0, sendQueue = 2, bitrateMode = 0;
   float zoom = 1.0f;
   bool torch = false;
   std::string name;
@@ -232,6 +235,14 @@ struct FakePhone::Impl {
     cp.params.push_back(prof);
     cp.params.push_back(desc(ParamId::BFrames, ValueType::Int32, 0, 2, 1, ParamValue::Int(static_cast<int32_t>(bframes)), true));
     cp.params.push_back(desc(ParamId::FecPercent, ValueType::Int32, -1, 100, 1, ParamValue::Int(fec), false));
+    cp.params.push_back(desc(ParamId::AdaptiveBitrate, ValueType::Bool, 0, 1, 1, ParamValue::Bool(adaptiveBitrate), false));
+    ParamDesc dp = desc(ParamId::LatencyDropPolicy, ValueType::Enum, 0, 1, 1, ParamValue::EnumV(dropPolicy), false);
+    dp.options = {EnumOption{0, "drop"}, EnumOption{1, "queue"}};
+    cp.params.push_back(dp);
+    cp.params.push_back(desc(ParamId::MaxSendQueueFrames, ValueType::Int32, 1, 60, 1, ParamValue::Int(sendQueue), false));
+    ParamDesc bm = desc(ParamId::BitrateMode, ValueType::Enum, 0, 1, 1, ParamValue::EnumV(bitrateMode), false);
+    bm.options = {EnumOption{0, "CBR"}, EnumOption{1, "VBR"}};  // like the phone's AVC encoder
+    cp.params.push_back(bm);
     cp.params.push_back(desc(ParamId::Zoom, ValueType::Float, 1.0, 4.0, 0.1, ParamValue::Real(zoom), false));
     cp.params.push_back(desc(ParamId::Torch, ValueType::Bool, 0, 1, 1, ParamValue::Bool(torch), false));
     return cp;
@@ -270,6 +281,16 @@ struct FakePhone::Impl {
         ps.value = ParamValue::Int(static_cast<int32_t>(bframes)); break;
       case ParamId::FecPercent:
         fec = static_cast<int>(v < -1 ? -1 : v > 100 ? 100 : v); break;
+      case ParamId::AdaptiveBitrate:
+        adaptiveBitrate = v != 0; ps.value = ParamValue::Bool(adaptiveBitrate); break;
+      case ParamId::LatencyDropPolicy:
+        dropPolicy = v ? 1 : 0; ps.value = ParamValue::EnumV(dropPolicy); break;
+      case ParamId::MaxSendQueueFrames:
+        if (!inRange(1, 60)) { ps.status = ParamStatus::OutOfRange; ps.value = ParamValue::Int(sendQueue); break; }
+        sendQueue = static_cast<int>(v); break;
+      case ParamId::BitrateMode:
+        if (v != 0 && v != 1) { ps.status = ParamStatus::Unsupported; ps.value = ParamValue::EnumV(bitrateMode); break; }
+        bitrateMode = static_cast<int>(v); break;
       case ParamId::Zoom:
         zoom = sp.value.f; break;
       case ParamId::Torch:
@@ -304,6 +325,10 @@ struct FakePhone::Impl {
     kfMs = cfg.keyframe_interval_ms;
     fec = cfg.fec_percent;
     codec = 0;
+    adaptiveBitrate = true;
+    dropPolicy = 0;
+    sendQueue = 2;
+    bitrateMode = 0;
     zoom = 1.0f;
     torch = false;
   }
@@ -422,6 +447,10 @@ struct FakePhone::Impl {
           enc = c.frames_encoded;
         }
         st.camera_fps = st.encode_fps = st.send_fps = static_cast<float>(enc - lastEnc);
+        {
+          std::lock_guard<std::mutex> lk(pmx);
+          if (codec == 1) st.encode_fps *= cfg.hevc_stats_fps_scale;
+        }
         lastEnc = enc;
         {
           std::lock_guard<std::mutex> lk(pmx);

@@ -50,6 +50,9 @@ struct FakePhoneConfig {
   //                runtime fallback). The encoder is always H.264.
   uint32_t codec_mask = 1;  // codecBit(Codec::H264)
   int hevc_mode = 0;
+  // Stats::encode_fps is multiplied by this while the codec is HEVC (tests
+  // the client's "HEVC can't sustain the fps -> H.264" fallback).
+  float hevc_stats_fps_scale = 1.0f;
   bool verbose = false;
   std::function<void(const std::string&)> logger;  // default: stdout
 };

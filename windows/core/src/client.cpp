@@ -4,6 +4,7 @@
 #include "codec_select.h"
 #include "decoder.h"
 #include "metrics.h"
+#include "record_setup.h"
 #include "recorder.h"
 #include "sps_patch.h"
 #include "transform.h"
@@ -305,7 +306,18 @@ struct Client::Impl {
   std::mutex slowMx;
   bool slowActive = false;
   std::vector<std::pair<ParamId, ParamValue>> slowSaved;
-  std::vector<std::pair<ParamId, ParamValue>> pendingRestore;  // endSlowMotion() while offline
+  std::vector<std::pair<ParamId, ParamValue>> pendingRestore;  // endRecordingSetup() while offline
+  RecordSetupStatus setupStatus;          // slowMx
+  RecordPriority setupPrio = RecordPriority::Quality;
+  std::atomic<int> forcedCodec{-1};       // Codec pinned by a recording setup (-1 = none)
+  std::atomic<bool> previewOff{false};    // the PC can't decode the recorded codec
+  std::atomic<bool> previewOffUntilDecodable{false};  // after endRecordingSetup: wait for a
+                                                      // VideoFormat this PC can decode
+  // HEVC sustain watch (slowMx): did the phone keep up with the requested fps?
+  bool hevcWatch = false;
+  uint32_t hevcTargetFps = 0;
+  int64_t hevcWindowStartMs = 0;
+  float hevcMaxEncodeFps = 0;
   uint32_t slowSavedMaxPresent = 0;
 
   // ---- codec negotiation
@@ -944,6 +956,11 @@ struct Client::Impl {
   void negotiateCodec(uint32_t phoneMask, const ClientOptions& o) {
     CodecChoice ch = chooseCodec(o.codec_preference, phoneMask, Client::decoderCapabilities(),
                                  blockedCodecs.load());
+    const int forced = forcedCodec.load();
+    if (forced >= 0) {  // a recording setup pinned the codec (passthrough: no PC decode needed)
+      ch.codec = static_cast<Codec>(forced);
+      ch.reason = std::string("recording setup: ") + codecName(ch.codec);
+    }
     ParamDesc vc;
     bool haveParam = false;
     {
@@ -969,6 +986,53 @@ struct Client::Impl {
       rx.codecSel = ch.reason;
       rx.requestedCodec = ch.codec;
     }
+  }
+
+  // ---- recording setup: HEVC sustain watch (net thread)
+  void hevcWatchOnFormat(const VideoFormat& f) {
+    std::lock_guard<std::mutex> lk(slowMx);
+    if (!hevcWatch) return;
+    if (f.codec == Codec::Hevc && f.fps == hevcTargetFps) {
+      hevcWindowStartMs = steadyMs();
+      hevcMaxEncodeFps = 0;
+    }
+  }
+  void hevcWatchOnStats(const Stats& st) {
+    std::string fallbackNote;
+    {
+      std::lock_guard<std::mutex> lk(slowMx);
+      if (!hevcWatch || hevcWindowStartMs == 0) return;
+      const int64_t age = steadyMs() - hevcWindowStartMs;
+      if (age >= 1000) hevcMaxEncodeFps = std::max(hevcMaxEncodeFps, st.encode_fps);
+      if (age < 2500) return;
+      hevcWatch = false;
+      if (hevcMaxEncodeFps < 0.85f * static_cast<float>(hevcTargetFps)) {
+        char b[96];
+        snprintf(b, sizeof(b), "HEVC não sustentou %u fps (%.0f fps)", hevcTargetFps, hevcMaxEncodeFps);
+        fallbackNote = b;
+      } else {
+        logf(LogLevel::Info, "recording setup: HEVC sustains %.0f of %u fps", hevcMaxEncodeFps,
+             hevcTargetFps);
+      }
+    }
+    if (!fallbackNote.empty()) setupFallbackToH264(fallbackNote);
+  }
+  // Recording setup wanted HEVC but it doesn't work: switch the phone to H.264.
+  void setupFallbackToH264(const std::string& why) {
+    {
+      std::lock_guard<std::mutex> lk(slowMx);
+      if (!setupStatus.active || setupStatus.codec == Codec::H264) return;
+      hevcWatch = false;
+      forcedCodec = static_cast<int>(Codec::H264);
+      setupStatus.codec = Codec::H264;
+      setupStatus.preview_available = Client::decoderCapabilities().h264.any();
+      if (previewOff.exchange(false)) decodeResume = true;
+      setupStatus.summary = recordSummary(setupPrio, setupStatus, why + " -> H.264");
+    }
+    blockedCodecs |= codecBit(Codec::Hevc);
+    sendMsg(MsgType::SetParam, encode(SetParam{ParamId::VideoCodec, ParamValue::EnumV(0)}));
+    forceKey = true;
+    logf(LogLevel::Warn, "recording setup: %s -> falling back to H.264", why.c_str());
   }
 
   // Returns false to end the session (res filled).
@@ -1032,6 +1096,9 @@ struct Client::Impl {
             if (pd.id == ps.id) pd.current = ps.value;
         }
         if (ps.id == ParamId::BFrames) bframesParam = static_cast<int32_t>(ps.value.i);
+        if (ps.id == ParamId::VideoCodec && ps.status != ParamStatus::Ok && forcedCodec.load() > 0 &&
+            ps.value.i != forcedCodec.load())
+          setupFallbackToH264("o celular recusou " + std::string(codecName(static_cast<Codec>(forcedCodec.load()))));
         if (ps.id == ParamId::VideoCodec && ps.status != ParamStatus::Ok &&
             requestedCodec != Codec::H264 && ps.value.i != static_cast<int64_t>(requestedCodec)) {
           blockedCodecs |= codecBit(requestedCodec);
@@ -1060,6 +1127,7 @@ struct Client::Impl {
         w.fmt = f;
         pushWork(std::move(w));
         setState(ClientState::Streaming);
+        hevcWatchOnFormat(f);
         if (ev) ev->onVideoFormat(f);
         break;
       }
@@ -1071,6 +1139,7 @@ struct Client::Impl {
           phone = st;
           havePhone = true;
         }
+        hevcWatchOnStats(st);
         if (ev) ev->onPhoneStats(st);
         break;
       }
@@ -1423,6 +1492,10 @@ struct Client::Impl {
 
   void onFormat(Dec& ds, const VideoFormat& f) {
     if (recorder.active()) recorder.onFormat(f);
+    if (previewOffUntilDecodable && Client::decoderCapabilities().get(f.codec).any()) {
+      previewOffUntilDecodable = false;
+      previewOff = false;  // the new epoch starts with a keyframe: no resume needed
+    }
     const bool sameGeometry = ds.haveFmt && ds.fmt.codec == f.codec && ds.fmt.width == f.width &&
                               ds.fmt.height == f.height;
     ds.fmt = f;
@@ -1589,7 +1662,7 @@ struct Client::Impl {
       ds.waitKey = true;  // references were skipped while decoding was off
       forceKey = true;
     }
-    if (!decodeEnabled) {  // recording with present=false: the recorder already has them
+    if (!decodeEnabled || previewOff) {  // recording with present=false / codec without PC decoder
       ds.ready.clear();
       return;
     }
@@ -2380,83 +2453,108 @@ RecordStatus Client::stopRecording() {
 
 RecordStatus Client::recordingStatus() const { return impl_->recorder.status(); }
 
-// ================================================================ slow motion
-bool Client::prepareSlowMotion(uint32_t fps, uint32_t width, uint32_t height) {
-  if (!impl_->sessionUp) return false;
-  ConnectParams cp = connectParams();
+// ================================================================ recording setup
+bool Client::prepareRecording(const RecordPreset& p, std::string* err) {
+  if (!impl_->sessionUp) {
+    if (err) *err = "not connected";
+    return false;
+  }
+  Capabilities caps;
+  if (!capabilities(caps)) {
+    if (err) *err = "phone capabilities not known yet";
+    return false;
+  }
+  DeviceInfo di;
+  deviceInfo(di);
+  const ConnectParams cp = connectParams();
   std::lock_guard<std::mutex> lk(impl_->slowMx);
-  struct Want {
-    ParamId id;
-    ParamValue v;
-  };
-  // 40 Mbps for 1280x720, scaled by pixel count, clamped to the phone's range.
-  double bitrate = 40e6 * (static_cast<double>(width) * height) / (1280.0 * 720.0);
-  ParamDesc d;
-  if (paramDesc(ParamId::Bitrate, d) && d.max > 0) bitrate = std::min(bitrate, d.max);
-  int32_t queue = 32;
-  if (paramDesc(ParamId::MaxSendQueueFrames, d) && d.max > 0)
-    queue = static_cast<int32_t>(std::min<double>(queue, d.max));
-  std::vector<Want> wants = {
-      {ParamId::HighSpeedMode, ParamValue::EnumV(1)},
-      {ParamId::VideoWidth, ParamValue::Int(static_cast<int32_t>(width))},
-      {ParamId::VideoHeight, ParamValue::Int(static_cast<int32_t>(height))},
-      {ParamId::Fps, ParamValue::Int(static_cast<int32_t>(fps))},
-      {ParamId::Bitrate, ParamValue::Int(static_cast<int32_t>(bitrate))},
-      {ParamId::AdaptiveBitrate, ParamValue::Bool(false)},
-      {ParamId::LatencyDropPolicy, ParamValue::EnumV(1)},
-      {ParamId::MaxSendQueueFrames, ParamValue::Int(queue)},
-      // The constrained high-speed encoder may ignore RequestKeyframe (seen on a
-      // Note 9): a 1 s GOP bounds the wait for the recording's first keyframe.
-      {ParamId::KeyframeIntervalMs, ParamValue::Int(1000)},
-  };
-  if (cp.transport == VideoTransport::Tcp) wants.push_back({ParamId::FecPercent, ParamValue::Int(0)});
-  if (!impl_->slowActive) {
+  // Re-plan from the ORIGINAL state when a setup is already active.
+  if (impl_->setupStatus.active)
+    for (const auto& kv : impl_->slowSaved)
+      for (ParamDesc& d : caps.params)
+        if (d.id == kv.first) d.current = kv.second;
+  const RecordPlan plan =
+      planRecording(p, caps, di.codec_mask, Client::decoderCapabilities(), cp.transport);
+  // Save what we are about to change (+ the codec), once per setup.
+  if (!impl_->setupStatus.active) {
     impl_->slowSaved.clear();
-    for (const Want& w : wants) {
-      ParamValue cur;
-      if (paramValue(w.id, cur)) impl_->slowSaved.emplace_back(w.id, cur);
-    }
     impl_->slowSavedMaxPresent = options().max_present_fps;
   }
+  auto save = [&](ParamId id) {
+    for (const auto& kv : impl_->slowSaved)
+      if (kv.first == id) return;
+    for (const ParamDesc& d : caps.params)
+      if (d.id == id) impl_->slowSaved.emplace_back(id, d.current);
+  };
+  for (const auto& kv : plan.sets) save(kv.first);
+  if (plan.forceCodec) save(ParamId::VideoCodec);
+  // Apply.
+  impl_->forcedCodec = plan.forceCodec ? static_cast<int>(plan.status.codec) : -1;
+  if (plan.forceCodec) impl_->blockedCodecs &= ~codecBit(plan.status.codec);
+  impl_->previewOffUntilDecodable = false;
+  const bool wasOff = impl_->previewOff.exchange(!plan.status.preview_available);
+  if (wasOff && plan.status.preview_available) impl_->decodeResume = true;
   int sent = 0;
-  for (const Want& w : wants) {
-    ParamDesc pd;
-    if (!paramDesc(w.id, pd) || !(pd.flags & kParamSupported) || (pd.flags & kParamReadOnly)) continue;
-    if (setParam(w.id, w.v)) ++sent;
-  }
+  for (const auto& kv : plan.sets)
+    if (setParam(kv.first, kv.second)) ++sent;
   ClientOptions o = options();
-  o.max_present_fps = 60;
+  o.max_present_fps = plan.maxPresentFps ? plan.maxPresentFps : impl_->slowSavedMaxPresent;
   setOptions(o);
-  impl_->slowActive = true;
-  impl_->logf(LogLevel::Info, "slow motion: requested %ux%u @ %u fps, %.0f Mbps (%d params)", width,
-              height, fps, bitrate / 1e6, sent);
+  impl_->setupStatus = plan.status;
+  impl_->setupStatus.active = true;
+  impl_->setupPrio = p.priority;
+  impl_->hevcWatch = plan.requestedHevc;
+  impl_->hevcTargetFps = plan.status.fps;
+  impl_->hevcWindowStartMs = 0;
+  impl_->hevcMaxEncodeFps = 0;
+  impl_->forceKey = true;  // the recording should start promptly
+  impl_->logf(LogLevel::Info, "recording setup: %s (%d params)", plan.status.summary.c_str(), sent);
   return true;
 }
 
-bool Client::endSlowMotion() {
+bool Client::endRecordingSetup() {
   std::lock_guard<std::mutex> lk(impl_->slowMx);
-  if (!impl_->slowActive) return false;
-  impl_->slowActive = false;
+  if (!impl_->setupStatus.active) return false;
+  impl_->setupStatus.active = false;
+  impl_->hevcWatch = false;
+  impl_->forcedCodec = -1;
+  // Frames of the recorded (undecodable) codec are still in flight: keep the
+  // preview off until a VideoFormat with a decodable codec arrives.
+  if (impl_->previewOff) impl_->previewOffUntilDecodable = true;
   ClientOptions o = options();
   o.max_present_fps = impl_->slowSavedMaxPresent;
   setOptions(o);
   if (!impl_->sessionUp) {
     // Session lost (phone closed / network): re-apply on the next connection.
     impl_->pendingRestore = impl_->slowSaved;
-    impl_->logf(LogLevel::Warn, "slow motion ended while disconnected: %zu params will be restored "
-                "on the next connection", impl_->pendingRestore.size());
+    impl_->logf(LogLevel::Warn, "recording setup ended while disconnected: %zu params will be "
+                "restored on the next connection", impl_->pendingRestore.size());
     return true;
   }
   int sent = 0;
   for (const auto& kv : impl_->slowSaved)
     if (setParam(kv.first, kv.second)) ++sent;
-  impl_->logf(LogLevel::Info, "slow motion ended: %d params restored", sent);
+  impl_->logf(LogLevel::Info, "recording setup ended: %d params restored", sent);
   return sent > 0 || impl_->slowSaved.empty();
 }
 
-bool Client::slowMotionActive() const {
+RecordSetupStatus Client::recordSetupStatus() const {
   std::lock_guard<std::mutex> lk(impl_->slowMx);
-  return impl_->slowActive;
+  return impl_->setupStatus;
 }
+
+bool Client::prepareSlowMotion(uint32_t fps, uint32_t width, uint32_t height) {
+  RecordPreset p;
+  p.mode = RecordMode::SlowMotion;
+  p.priority = RecordPriority::Latency;
+  p.width = width;
+  p.height = height;
+  p.fps = fps;
+  return prepareRecording(p);
+}
+
+bool Client::endSlowMotion() { return endRecordingSetup(); }
+
+bool Client::slowMotionActive() const { return recordSetupStatus().active; }
 
 }  // namespace owc

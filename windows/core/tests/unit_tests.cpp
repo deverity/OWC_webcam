@@ -4,6 +4,7 @@
 
 #include "annexb.h"
 #include "codec_select.h"
+#include "record_setup.h"
 #include "metrics.h"
 #include "transform.h"
 #include "util.h"
@@ -483,6 +484,124 @@ void testLinkClassification() {
                 a.ipv4_metric, toString(a.link));
 }
 
+Capabilities mockPhoneCaps() {
+  Capabilities c;
+  auto add = [&](ParamId id, ValueType t, double mn, double mx, ParamValue cur,
+                 std::vector<EnumOption> opts = {}) {
+    ParamDesc d;
+    d.id = id;
+    d.type = t;
+    d.flags = kParamSupported;
+    d.min = mn;
+    d.max = mx;
+    d.current = cur;
+    d.options = opts;
+    c.params.push_back(d);
+  };
+  add(ParamId::VideoWidth, ValueType::Int32, 160, 3840, ParamValue::Int(1920));
+  add(ParamId::VideoHeight, ValueType::Int32, 120, 2160, ParamValue::Int(1080));
+  add(ParamId::Fps, ValueType::Int32, 1, 240, ParamValue::Int(30));
+  add(ParamId::VideoCodec, ValueType::Enum, 0, 1, ParamValue::EnumV(0), {{0, "H.264"}, {1, "HEVC"}});
+  add(ParamId::Bitrate, ValueType::Int32, 100000, 50000000, ParamValue::Int(8000000));
+  add(ParamId::BitrateMode, ValueType::Enum, 0, 2, ParamValue::EnumV(0), {{0, "CBR"}, {1, "VBR"}, {2, "CQ"}});
+  add(ParamId::AdaptiveBitrate, ValueType::Bool, 0, 1, ParamValue::Bool(true));
+  add(ParamId::LatencyDropPolicy, ValueType::Enum, 0, 1, ParamValue::EnumV(0));
+  add(ParamId::MaxSendQueueFrames, ValueType::Int32, 1, 60, ParamValue::Int(2));
+  add(ParamId::KeyframeIntervalMs, ValueType::Int32, 0, 10000, ParamValue::Int(1000));
+  add(ParamId::BFrames, ValueType::Int32, 0, 4, ParamValue::Int(0));
+  add(ParamId::FecPercent, ValueType::Int32, -1, 100, ParamValue::Int(-1));
+  add(ParamId::HighSpeedMode, ValueType::Enum, 0, 1, ParamValue::EnumV(0));
+  return c;
+}
+
+bool planHas(const RecordPlan& p, ParamId id, int64_t v) {
+  for (auto& kv : p.sets)
+    if (kv.first == id) return kv.second.i == v;
+  return false;
+}
+bool planSets(const RecordPlan& p, ParamId id) {
+  for (auto& kv : p.sets)
+    if (kv.first == id) return true;
+  return false;
+}
+
+void testRecordSetupPlanner() {
+  const Capabilities caps = mockPhoneCaps();
+  DecoderCapabilities noHevc;
+  noHevc.h264.hardware = noHevc.h264.software = true;
+  const uint32_t both = codecBit(Codec::H264) | codecBit(Codec::Hevc);
+  // bitrate rule
+  CHECK(qualityBitrate(1920, 1080, 30) == 20000000u);
+  CHECK_MSG(qualityBitrate(1280, 720, 240) >= 38000000u && qualityBitrate(1280, 720, 240) <= 42000000u,
+            "720p240 %u", qualityBitrate(1280, 720, 240));
+  CHECK_MSG(qualityBitrate(3840, 2160, 30) >= 57000000u && qualityBitrate(3840, 2160, 30) <= 63000000u,
+            "4K30 %u", qualityBitrate(3840, 2160, 30));
+  // (1) Quality slow motion: HEVC though the PC can't decode it -> preview off
+  RecordPreset sm;
+  sm.mode = RecordMode::SlowMotion;
+  RecordPlan p = planRecording(sm, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(p.status.codec == Codec::Hevc && !p.status.preview_available && p.forceCodec && p.requestedHevc);
+  CHECK(p.status.width == 1280 && p.status.height == 720 && p.status.fps == 240);
+  CHECK(planHas(p, ParamId::HighSpeedMode, 1) && planHas(p, ParamId::VideoCodec, 1) &&
+        planHas(p, ParamId::Fps, 240) && planHas(p, ParamId::VideoWidth, 1280));
+  CHECK(planHas(p, ParamId::AdaptiveBitrate, 0) && planHas(p, ParamId::LatencyDropPolicy, 1) &&
+        planHas(p, ParamId::MaxSendQueueFrames, 60) && planHas(p, ParamId::BitrateMode, 1) &&
+        planHas(p, ParamId::BFrames, 0) && planHas(p, ParamId::FecPercent, 0));
+  CHECK(!planSets(p, ParamId::KeyframeIntervalMs));  // > 60 fps: the phone caps its own GOP
+  CHECK(p.maxPresentFps == 60);
+  CHECK(p.status.bitrate_bps >= 38000000u && p.status.bitrate_bps <= 42000000u);
+  CHECK_MSG(p.status.summary == "Qualidade: HEVC 1280x720 @ 240 fps, 40 Mbps, sem preview (HEVC sem decoder)",
+            "%s", p.status.summary.c_str());
+  // order: high-speed + codec before geometry, geometry before rate control
+  CHECK(p.sets.size() > 4 && p.sets[0].first == ParamId::HighSpeedMode && p.sets[1].first == ParamId::VideoCodec);
+  // (2) Quality real time, keep geometry: only quality knobs
+  RecordPreset rt;
+  p = planRecording(rt, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(!planSets(p, ParamId::VideoWidth) && !planSets(p, ParamId::Fps) && !planSets(p, ParamId::HighSpeedMode));
+  CHECK(planHas(p, ParamId::Bitrate, 20000000) && planHas(p, ParamId::KeyframeIntervalMs, 2000) &&
+        planHas(p, ParamId::MaxSendQueueFrames, 32));
+  CHECK(p.status.width == 1920 && p.status.fps == 30 && p.maxPresentFps == 0);
+  // (3) don't allow a codec the PC can't decode -> H.264, preview on
+  rt.allow_codec_without_pc_decoder = false;
+  p = planRecording(rt, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(p.status.codec == Codec::H264 && p.status.preview_available && planHas(p, ParamId::VideoCodec, 0));
+  // (4) phone without HEVC
+  rt.allow_codec_without_pc_decoder = true;
+  p = planRecording(rt, caps, codecBit(Codec::H264), noHevc, VideoTransport::Tcp);
+  CHECK(p.status.codec == Codec::H264 && !p.requestedHevc);
+  // (5) PC with HEVC decode: HEVC + preview
+  DecoderCapabilities hevc = noHevc;
+  hevc.hevc.hardware = true;
+  p = planRecording(rt, caps, both, hevc, VideoTransport::Udp);
+  CHECK(p.status.codec == Codec::Hevc && p.status.preview_available);
+  CHECK(!planSets(p, ParamId::FecPercent));  // UDP keeps FEC
+  // (6) explicit 1080p30 leaves high-speed mode
+  RecordPreset hd;
+  hd.width = 1920;
+  hd.height = 1080;
+  hd.fps = 30;
+  p = planRecording(hd, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(planHas(p, ParamId::HighSpeedMode, 0) && planHas(p, ParamId::Fps, 30));
+  // (7) Latency real time = change nothing; Latency slow motion = legacy knobs
+  RecordPreset lt;
+  lt.priority = RecordPriority::Latency;
+  p = planRecording(lt, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(p.sets.empty() && !p.forceCodec && p.status.summary.find("Latência") == 0);
+  lt.mode = RecordMode::SlowMotion;
+  p = planRecording(lt, caps, both, noHevc, VideoTransport::Tcp);
+  CHECK(!p.forceCodec && !planSets(p, ParamId::VideoCodec) && !planSets(p, ParamId::BitrateMode));
+  CHECK(planHas(p, ParamId::Bitrate, 40000000) && planHas(p, ParamId::KeyframeIntervalMs, 1000) &&
+        planHas(p, ParamId::MaxSendQueueFrames, 32) && planHas(p, ParamId::HighSpeedMode, 1));
+  // (8) unsupported params are skipped; bitrate clamped to the phone's max
+  Capabilities small = caps;
+  for (auto& d : small.params) {
+    if (d.id == ParamId::BitrateMode) d.flags = 0;
+    if (d.id == ParamId::Bitrate) d.max = 30000000;
+  }
+  p = planRecording(sm, small, both, noHevc, VideoTransport::Tcp);
+  CHECK(!planSets(p, ParamId::BitrateMode) && planHas(p, ParamId::Bitrate, 30000000));
+}
+
 void testQpcConversions() {
   for (int64_t us : {0LL, 1LL, 999999LL, 1000000LL, 123456789012LL}) {
     const int64_t q = usToQpc(us);
@@ -511,6 +630,7 @@ int main() {
   RUN(testDiscoveryHelpers);
   RUN(testCodecSelection);
   RUN(testLinkClassification);
+  RUN(testRecordSetupPlanner);
   std::printf("%s (%d failure(s))\n", owctest::failures() ? "FAILED" : "ALL PASSED", owctest::failures());
   return owctest::failures() ? 1 : 0;
 }

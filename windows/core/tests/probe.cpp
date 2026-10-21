@@ -7,6 +7,8 @@
 //                  [--no-patch] [--jitter MS]
 //                  [--record FILE.mp4|default [--slowmo OUT_FPS] [--record-seconds N]
 //                   [--prepare-slowmo FPS] [--no-present]]
+//       --quality [--size WxH] [--fps N]: Client::prepareRecording(Quality; SlowMotion
+//       when --slowmo is given) and record once the phone streams the planned format.
 //       --prepare-slowmo calls Client::prepareSlowMotion(FPS) and starts the
 //       recording once the phone streams at FPS; endSlowMotion() at exit.
 //       Runs an owc::Client session and prints logs + stats every second.
@@ -146,6 +148,9 @@ int connectMode(int argc, char** argv) {
   uint32_t slowmoFps = 0, prepareFps = 0;
   int recordSeconds = 0;
   bool noPresent = false;
+  bool quality = false;
+  uint32_t qW = 0, qH = 0, qFps = 0;
+  RecordSetupStatus setup;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -185,6 +190,15 @@ int connectMode(int argc, char** argv) {
       prepareFps = static_cast<uint32_t>(atoi(next()));
     } else if (a == "--record-seconds") {
       recordSeconds = atoi(next());
+    } else if (a == "--quality") {
+      quality = true;
+    } else if (a == "--size") {
+      const char* v = next();
+      qW = static_cast<uint32_t>(atoi(v));
+      const char* x = strchr(v, 'x');
+      qH = x ? static_cast<uint32_t>(atoi(x + 1)) : 0;
+    } else if (a == "--fps") {
+      qFps = static_cast<uint32_t>(atoi(next()));
     } else if (a == "--no-present") {
       noPresent = true;
     } else {
@@ -204,11 +218,33 @@ int connectMode(int argc, char** argv) {
     if (!sent && (client.state() == ClientState::Connected || client.state() == ClientState::Streaming)) {
       for (auto& kv : sets) client.setParam(kv.first, kv.second);
       if (prepareFps) client.prepareSlowMotion(prepareFps);
+      if (quality) {
+        // Wait for Capabilities (needed by the planner).
+        Capabilities caps;
+        for (int w = 0; w < 30 && !client.capabilities(caps); ++w)
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        RecordPreset rp;
+        rp.mode = slowmoFps ? RecordMode::SlowMotion : RecordMode::RealTime;
+        rp.priority = RecordPriority::Quality;
+        rp.width = qW;
+        rp.height = qH;
+        rp.fps = qFps;
+        if (slowmoFps) rp.slowmo_output_fps = slowmoFps;
+        std::string err;
+        if (!client.prepareRecording(rp, &err)) std::printf("prepareRecording failed: %s\n", err.c_str());
+        setup = client.recordSetupStatus();
+        std::printf("[setup] %s\n", setup.summary.c_str());
+      }
       sent = true;
     }
     if (!recordPath.empty() && !recStarted && client.state() == ClientState::Streaming) {
       VideoFormat vf;
-      if (client.videoFormat(vf) && (prepareFps == 0 || vf.fps == prepareFps)) {
+      const RecordSetupStatus cur = client.recordSetupStatus();
+      const bool haveVf = client.videoFormat(vf);
+      const bool formatReady = quality ? (vf.fps == cur.fps && vf.codec == cur.codec &&
+                                          vf.width == cur.width && vf.height == cur.height)
+                                       : (prepareFps == 0 || vf.fps == prepareFps);
+      if (haveVf && formatReady) {
         RecordOptions ro;
         ro.path = recordPath == "default" ? std::string() : recordPath;
         ro.mode = slowmoFps ? RecordMode::SlowMotion : RecordMode::RealTime;
@@ -261,6 +297,8 @@ int connectMode(int argc, char** argv) {
     }
   }
   if (recStarted && !recStopped) printRecord(client.stopRecording());
+  if (quality || prepareFps)
+    std::printf("[setup at end] %s\n", client.recordSetupStatus().summary.c_str());
   if (client.slowMotionActive()) {
     client.endSlowMotion();
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // let the phone apply + answer

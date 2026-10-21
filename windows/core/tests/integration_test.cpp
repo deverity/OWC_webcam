@@ -5,6 +5,7 @@
 #include "test_util.h"
 
 #include "decoder.h"
+#include "record_setup.h"
 #include "transform.h"
 #include "util.h"
 
@@ -823,6 +824,119 @@ void testRecording() {
   for (auto& f : {ro.path, so.path, np.path}) DeleteFileA(f.c_str());
 }
 
+// ---------------------------------------------------------------- recording setup
+struct SetupPhone {
+  fake::FakePhone phone;
+  Recorder rec;
+  std::unique_ptr<Client> c;
+  bool start(uint32_t codecMask, int hevcMode, float hevcFpsScale) {
+    fake::FakePhoneConfig pc;
+    pc.bind_address = "127.0.0.1";
+    pc.control_port = pc.udp_port = pc.discovery_port = 0;
+    pc.enable_discovery = false;
+    pc.width = 640;
+    pc.height = 480;
+    pc.codec_mask = codecMask;
+    pc.hevc_mode = hevcMode;
+    pc.hevc_stats_fps_scale = hevcFpsScale;
+    pc.logger = [](const std::string&) {};
+    std::string err;
+    if (!phone.start(pc, err)) return false;
+    ClientOptions o;
+    o.auto_reconnect = false;
+    o.publish_to_shm = false;
+    c.reset(new Client(&rec, o));
+    ConnectParams cp;
+    cp.port = phone.controlPort();
+    c->connect(cp);
+    for (int i = 0; i < 1000 && rec.frames < 15; ++i) sleepMs(5);
+    return rec.frames >= 15;
+  }
+  int64_t param(ParamId id) {
+    ParamValue v;
+    return c->paramValue(id, v) ? v.i : -999;
+  }
+};
+
+void testRecordSetupQuality() {
+  SetupPhone t;
+  CHECK(t.start(codecBit(Codec::H264), 0, 1.0f));
+  const ParamId knobs[] = {ParamId::Bitrate, ParamId::BitrateMode, ParamId::AdaptiveBitrate,
+                           ParamId::LatencyDropPolicy, ParamId::MaxSendQueueFrames,
+                           ParamId::KeyframeIntervalMs, ParamId::FecPercent};
+  std::vector<int64_t> before;
+  for (ParamId id : knobs) before.push_back(t.param(id));
+  RecordPreset p;  // Quality, RealTime, keep 640x480@30
+  std::string err;
+  CHECK(t.c->prepareRecording(p, &err));
+  sleepMs(800);
+  RecordSetupStatus st = t.c->recordSetupStatus();
+  std::printf("  [quality] %s\n", st.summary.c_str());
+  CHECK(st.active && st.codec == Codec::H264 && st.preview_available && st.width == 640 && st.fps == 30);
+  CHECK(t.param(ParamId::Bitrate) == static_cast<int64_t>(detail::qualityBitrate(640, 480, 30)));
+  CHECK(t.param(ParamId::BitrateMode) == 1 && t.param(ParamId::AdaptiveBitrate) == 0 &&
+        t.param(ParamId::LatencyDropPolicy) == 1 && t.param(ParamId::MaxSendQueueFrames) == 32 &&
+        t.param(ParamId::KeyframeIntervalMs) == 2000 && t.param(ParamId::FecPercent) == 0);
+  const int f0 = t.rec.frames;
+  sleepMs(500);
+  CHECK(t.rec.frames > f0 + 5);  // preview still running (H.264 decodable)
+  CHECK(t.c->endRecordingSetup());
+  sleepMs(800);
+  CHECK(!t.c->recordSetupStatus().active);
+  for (size_t i = 0; i < before.size(); ++i)
+    CHECK_MSG(t.param(knobs[i]) == before[i], "param %s: %lld after restore, %lld before",
+              owc::toString(knobs[i]), static_cast<long long>(t.param(knobs[i])),
+              static_cast<long long>(before[i]));
+  CHECK(!t.c->endRecordingSetup());  // nothing to restore
+  t.c->disconnect();
+}
+
+void testRecordSetupHevc(bool sustain) {
+  DecoderCapabilities noHevc;  // this PC: H.264 only
+  noHevc.h264.hardware = noHevc.h264.software = true;
+  Client::overrideDecoderCapabilitiesForTest(&noHevc);
+  SetupPhone t;
+  // hevc_mode 1: the phone "switches" to HEVC (H.264 bits labelled HEVC; fine:
+  // with no PC decoder the preview is off and nothing decodes them).
+  CHECK(t.start(codecBit(Codec::H264) | codecBit(Codec::Hevc), 1, sustain ? 1.0f : 0.5f));
+  RecordPreset p;
+  std::string err;
+  CHECK(t.c->prepareRecording(p, &err));
+  RecordSetupStatus st = t.c->recordSetupStatus();
+  std::printf("  [hevc %s] %s\n", sustain ? "ok" : "slow", st.summary.c_str());
+  CHECK(st.codec == Codec::Hevc && !st.preview_available);
+  CHECK(st.summary.find("sem preview (HEVC sem decoder)") != std::string::npos);
+  sleepMs(1000);
+  VideoFormat vf;
+  CHECK(t.c->videoFormat(vf) && vf.codec == Codec::Hevc);
+  const int f0 = t.rec.frames;
+  sleepMs(600);
+  CHECK_MSG(t.rec.frames <= f0 + 1, "preview should be off: %d -> %d", f0, t.rec.frames.load());
+  if (!sustain) {
+    // phone reports encode_fps = 50% of 30 -> fallback to H.264 within ~3 s
+    for (int i = 0; i < 100 && t.c->recordSetupStatus().codec != Codec::H264; ++i) sleepMs(50);
+    st = t.c->recordSetupStatus();
+    std::printf("  [hevc slow] after watch: %s\n", st.summary.c_str());
+    CHECK(st.codec == Codec::H264 && st.preview_available);
+    CHECK(st.summary.find("HEVC não sustentou 30 fps") != std::string::npos);
+    const int f1 = t.rec.frames;
+    for (int i = 0; i < 200 && t.rec.frames < f1 + 10; ++i) sleepMs(10);
+    CHECK(t.rec.frames >= f1 + 10);  // preview back on H.264
+    CHECK(t.c->videoFormat(vf) && vf.codec == Codec::H264);
+  } else {
+    sleepMs(2500);  // watch window passes without fallback
+    CHECK(t.c->recordSetupStatus().codec == Codec::Hevc);
+  }
+  CHECK(t.c->endRecordingSetup());
+  sleepMs(800);
+  CHECK(t.param(ParamId::VideoCodec) == 0);  // restored
+  const int f2 = t.rec.frames;
+  for (int i = 0; i < 300 && t.rec.frames < f2 + 10; ++i) sleepMs(10);
+  CHECK_MSG(t.rec.frames >= f2 + 10, "preview did not resume after endRecordingSetup");
+  t.c->disconnect();
+  Client::overrideDecoderCapabilitiesForTest(nullptr);
+}
+
 // Resolution change mid-recording: the file is closed and name_2.mp4 started.
 void testRecordingEpochSplit() {
   fake::FakePhoneConfig pc;
@@ -927,6 +1041,11 @@ int main() {
   RUN(testCodecNegotiation);
   RUN(testRecording);
   RUN(testRecordingEpochSplit);
+  RUN(testRecordSetupQuality);
+  std::printf("[ RUN  ] testRecordSetupHevc(sustained)\n");
+  testRecordSetupHevc(true);
+  std::printf("[ RUN  ] testRecordSetupHevc(fallback)\n");
+  testRecordSetupHevc(false);
 
   Scenario tcp;
   tcp.name = "TCP 720p30 sps-patch";
