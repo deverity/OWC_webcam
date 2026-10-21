@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -64,7 +65,7 @@ void forEachAdapter(F&& f) {
     buf.resize(size);
     rc = GetAdaptersAddresses(AF_INET,
                               GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                                  GAA_FLAG_SKIP_DNS_SERVER,
+                                  GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS,
                               nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &size);
   }
   if (rc != NO_ERROR) return;
@@ -141,6 +142,7 @@ struct Engine {
   std::string annErr;
   std::vector<uint8_t> request = encodeDiscoveryRequest();
   Discovery::Counters c;
+  std::vector<Discovery::LocalAdapter> adapters;  // refreshed with every request round
 
   bool open(std::string& err) {
     req = openRequestSocket(o, err);
@@ -183,6 +185,7 @@ struct Engine {
   }
 
   void sendRequests(const std::vector<std::string>& known) {
+    adapters = Discovery::localAdapters();
     std::vector<std::string> targets;
     if (o.broadcast) {
       targets.push_back("255.255.255.255");
@@ -258,6 +261,8 @@ struct Engine {
         d.model = rep.model;
         d.busy = rep.busy;
         d.via_announce = rep.announce;
+        if (adapters.empty()) adapters = Discovery::localAdapters();
+        d.link = Discovery::linkFor(d.ip, adapters, &d.local_adapter);
         d.last_seen_ms = d.first_seen_ms = steadyMs();
         if (rep.announce) ++c.announces;
         else ++c.replies;
@@ -299,6 +304,131 @@ bool Discovery::isVirtualAdapter(const std::string& friendlyName, const std::str
   return false;
 }
 
+const char* toString(LinkType l) {
+  switch (l) {
+    case LinkType::Unknown: return "Unknown";
+    case LinkType::Wifi: return "Wi-Fi";
+    case LinkType::UsbTether: return "USB tethering";
+    case LinkType::Ethernet: return "Ethernet";
+    case LinkType::Other: return "Other";
+  }
+  return "?";
+}
+
+namespace {
+// true if `tok` appears in `s` delimited by non-alphanumerics (or string ends)
+bool hasToken(const std::string& s, const char* tok) {
+  const size_t n = strlen(tok);
+  for (size_t pos = s.find(tok); pos != std::string::npos; pos = s.find(tok, pos + 1)) {
+    const bool l = pos == 0 || !isalnum(static_cast<unsigned char>(s[pos - 1]));
+    const bool r = pos + n >= s.size() || !isalnum(static_cast<unsigned char>(s[pos + n]));
+    if (l && r) return true;
+  }
+  return false;
+}
+}  // namespace
+
+LinkType Discovery::classifyAdapter(uint32_t ifType, const std::string& friendlyName,
+                                    const std::string& description) {
+  const std::string n = lower(friendlyName) + " | " + lower(description);
+  // Android "USB tethering": Windows binds the RNDIS driver ("Remote NDIS based
+  // Internet Sharing Device") or, on newer phones, the NCM class driver
+  // ("UsbNcm Host Device"). Checked before anything else.
+  if (n.find("remote ndis") != std::string::npos || hasToken(n, "rndis") ||
+      n.find("usbncm") != std::string::npos || hasToken(n, "ncm") ||
+      n.find("android usb ethernet") != std::string::npos)
+    return LinkType::UsbTether;
+  if (ifType == IF_TYPE_IEEE80211) return LinkType::Wifi;
+  if (ifType == IF_TYPE_ETHERNET_CSMACD && !isVirtualAdapter(friendlyName, description))
+    return LinkType::Ethernet;
+  return LinkType::Other;
+}
+
+std::vector<Discovery::LocalAdapter> Discovery::localAdapters() {
+  std::vector<LocalAdapter> out;
+  forEachAdapter([&](const IP_ADAPTER_ADDRESSES& a, uint32_t ip, uint8_t plen) {
+    LocalAdapter la;
+    la.name = a.FriendlyName ? wideToUtf8(a.FriendlyName) : std::string();
+    la.description = a.Description ? wideToUtf8(a.Description) : std::string();
+    la.if_type = a.IfType;
+    la.ipv4 = ipToString(ip);
+    la.prefix = plen;
+    for (auto* g = a.FirstGatewayAddress; g; g = g->Next)
+      if (g->Address.lpSockaddr && g->Address.lpSockaddr->sa_family == AF_INET) la.has_default_gateway = true;
+    la.ipv4_metric = a.Ipv4Metric;
+    la.link = classifyAdapter(a.IfType, la.name, la.description);
+    out.push_back(la);
+  });
+  return out;
+}
+
+LinkType Discovery::linkFor(const std::string& ip, const std::vector<LocalAdapter>& adapters,
+                            std::string* adapterName) {
+  uint32_t addr = 0;
+  if (!parseIPv4(ip, addr)) return LinkType::Unknown;
+  const LocalAdapter* best = nullptr;
+  for (const LocalAdapter& a : adapters) {
+    uint32_t local = 0;
+    if (a.prefix == 0 || a.prefix > 32 || !parseIPv4(a.ipv4, local)) continue;
+    const uint32_t mask = a.prefix >= 32 ? 0xFFFFFFFFu : ~((1u << (32 - a.prefix)) - 1u);
+    if ((addr & mask) != (local & mask)) continue;
+    if (!best || a.prefix > best->prefix) best = &a;  // most specific subnet
+  }
+  if (!best) return LinkType::Unknown;
+  if (adapterName) *adapterName = best->name;
+  return best->link;
+}
+
+std::vector<Discovery::UsbTetherAdapter> Discovery::usbTetherAdapters() {
+  return usbTetherAdapters(localAdapters());
+}
+
+std::vector<Discovery::UsbTetherAdapter> Discovery::usbTetherAdapters(
+    const std::vector<LocalAdapter>& adapters) {
+  std::vector<UsbTetherAdapter> out;
+  for (const LocalAdapter& a : adapters) {
+    if (a.link != LinkType::UsbTether) continue;
+    UsbTetherAdapter t;
+    t.name = a.name;
+    t.description = a.description;
+    t.ipv4 = a.ipv4;
+    t.prefix = a.prefix;
+    t.has_default_gateway = a.has_default_gateway;
+    t.ipv4_metric = a.ipv4_metric;
+    if (a.has_default_gateway) {
+      t.may_carry_internet = true;
+      for (const LocalAdapter& o : adapters)
+        if (o.link != LinkType::UsbTether && o.has_default_gateway && o.ipv4_metric < a.ipv4_metric)
+          t.may_carry_internet = false;
+    }
+    out.push_back(t);
+  }
+  return out;
+}
+
+std::vector<DiscoveredDevice> Discovery::preferBestLink(const std::vector<DiscoveredDevice>& devices) {
+  auto rank = [](LinkType l) {
+    switch (l) {
+      case LinkType::UsbTether: return 4;
+      case LinkType::Ethernet: return 3;
+      case LinkType::Wifi: return 2;
+      default: return 1;
+    }
+  };
+  std::vector<DiscoveredDevice> out;
+  for (const DiscoveredDevice& d : devices) {
+    bool merged = false;
+    for (DiscoveredDevice& o : out) {
+      if (o.name != d.name || o.model != d.model) continue;
+      if (rank(d.link) > rank(o.link)) o = d;
+      merged = true;
+      break;
+    }
+    if (!merged) out.push_back(d);
+  }
+  return out;
+}
+
 std::vector<Discovery::Subnet> Discovery::sweepSubnets(uint8_t minPrefix) {
   std::vector<Subnet> out;
   forEachAdapter([&](const IP_ADAPTER_ADDRESSES& a, uint32_t ip, uint8_t plen) {
@@ -306,7 +436,8 @@ std::vector<Discovery::Subnet> Discovery::sweepSubnets(uint8_t minPrefix) {
     if (plen < minPrefix || plen > 30 || !isPrivateIPv4(ip)) return;
     const std::string fn = a.FriendlyName ? wideToUtf8(a.FriendlyName) : std::string();
     const std::string de = a.Description ? wideToUtf8(a.Description) : std::string();
-    if (isVirtualAdapter(fn, de)) return;
+    // USB tethering (RNDIS/NCM) is a real link to the phone: always swept.
+    if (classifyAdapter(a.IfType, fn, de) != LinkType::UsbTether && isVirtualAdapter(fn, de)) return;
     const uint32_t mask = ~((1u << (32 - plen)) - 1u);
     Subnet s;
     s.adapter = fn;
@@ -443,6 +574,7 @@ struct Discovery::Impl {
           } else {
             d.first_seen_ms = it->second.first_seen_ms;
             changed |= it->second.name != d.name || it->second.busy != d.busy ||
+                     it->second.link != d.link ||
                        it->second.model != d.model || it->second.udp_port != d.udp_port;
             it->second = d;
           }

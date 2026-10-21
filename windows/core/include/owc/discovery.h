@@ -38,6 +38,12 @@
 
 namespace owc {
 
+// Kind of LOCAL network adapter a phone was seen on.
+//   UsbTether: the phone's "USB tethering" network (RNDIS / NCM adapter) - the
+//              no-adb USB path for normal users (typically 192.168.42.x/24).
+enum class LinkType : uint8_t { Unknown = 0, Wifi, UsbTether, Ethernet, Other };
+const char* toString(LinkType);
+
 struct DiscoveredDevice {
   std::string ip;                       // IPv4 of the phone (reply/announce source)
   uint16_t control_port = kDefaultControlPort;
@@ -45,6 +51,8 @@ struct DiscoveredDevice {
   std::string name, model;
   bool busy = false;                    // phone already has a PC connected
   bool via_announce = false;            // last seen through an announcement (kind=3)
+  LinkType link = LinkType::Unknown;    // local adapter the reply/announce arrived on
+  std::string local_adapter;            // its friendly name (e.g. "Ethernet 5", "Wi-Fi")
   int64_t first_seen_ms = 0;            // steady clock (GetTickCount64) ms
   int64_t last_seen_ms = 0;
   // Convenient unique key: "ip:control_port".
@@ -123,6 +131,48 @@ class Discovery {
                                                 Counters* counters = nullptr);
 
   // ---- helpers (exposed for the UI and tests)
+  // ---- link classification / USB tethering
+  // A local IPv4 address of this PC with its adapter.
+  struct LocalAdapter {
+    std::string name;            // friendly name
+    std::string description;     // driver description ("Remote NDIS based Internet Sharing Device")
+    uint32_t if_type = 0;        // IANA ifType (6 Ethernet, 71 Wi-Fi, ...)
+    std::string ipv4;            // this PC's address on it
+    uint8_t prefix = 0;          // on-link prefix length
+    bool has_default_gateway = false;
+    uint32_t ipv4_metric = 0;    // effective interface metric (lower = preferred route)
+    LinkType link = LinkType::Other;
+  };
+  // Up adapters with IPv4 (loopback excluded), with gateways and metrics.
+  static std::vector<LocalAdapter> localAdapters();
+  // Classifies an adapter: UsbTether when the name/description mentions Remote
+  // NDIS / RNDIS / NCM / "Android USB Ethernet" (checked first, whatever the
+  // ifType), Wifi for ifType 71, Ethernet for ifType 6 (non-virtual), else Other.
+  static LinkType classifyAdapter(uint32_t ifType, const std::string& friendlyName,
+                                  const std::string& description);
+  // Which local adapter's subnet contains `ip` (Unknown if none, e.g. loopback).
+  static LinkType linkFor(const std::string& ip, const std::vector<LocalAdapter>& adapters,
+                          std::string* adapterName = nullptr);
+
+  struct UsbTetherAdapter {
+    std::string name, description, ipv4;
+    uint8_t prefix = 0;
+    bool has_default_gateway = false;
+    uint32_t ipv4_metric = 0;
+    // True when this adapter has a default gateway and its metric is <= every
+    // other adapter's that also has one: Windows may route INTERNET traffic over
+    // the phone's mobile data. UI: warn, and suggest raising the adapter metric
+    // (or turning off the phone's mobile data).
+    bool may_carry_internet = false;
+  };
+  static std::vector<UsbTetherAdapter> usbTetherAdapters();
+  static std::vector<UsbTetherAdapter> usbTetherAdapters(const std::vector<LocalAdapter>& adapters);
+
+  // The same phone (same name + model) seen on several links: keep one entry,
+  // preferring UsbTether > Ethernet > Wifi > Other/Unknown (lower latency, no
+  // Wi-Fi contention). Order otherwise preserved.
+  static std::vector<DiscoveredDevice> preferBestLink(const std::vector<DiscoveredDevice>& devices);
+
   // IPv4 directed-broadcast addresses of all up, non-loopback interfaces.
   static std::vector<std::string> broadcastAddresses();
   struct Subnet {
@@ -130,7 +180,8 @@ class Discovery {
     std::string address;     // this PC's address on it
     std::string cidr;        // "192.168.0.0/24"
   };
-  // Subnets the sweep covers: up, physical, private, prefix >= minPrefix.
+  // Subnets the sweep covers: up, physical (USB tether included), private,
+  // prefix >= minPrefix.
   static std::vector<Subnet> sweepSubnets(uint8_t minPrefix = 22);
   // Host addresses of a CIDR (network/broadcast excluded; /31-/32 = itself).
   // Empty for malformed input or prefix < 22 (more than 1022 hosts).

@@ -302,6 +302,12 @@ int discoverMode(int argc, char** argv) {
   for (auto& s : Discovery::sweepSubnets(o.sweep_min_prefix))
     std::printf("  %s on '%s' (this PC %s)\n", s.cidr.c_str(), s.adapter.c_str(), s.address.c_str());
   std::printf("firewall rule '%s' present: %d\n", Firewall::ruleName(), Firewall::rulesPresent() ? 1 : 0);
+  const auto tethers = Discovery::usbTetherAdapters();
+  for (auto& t : tethers)
+    std::printf("USB tether adapter '%s' (%s) %s/%u gateway %d metric %u%s\n", t.name.c_str(),
+                t.description.c_str(), t.ipv4.c_str(), t.prefix, t.has_default_gateway ? 1 : 0,
+                t.ipv4_metric, t.may_carry_internet ? "  WARNING: may carry internet traffic" : "");
+  if (tethers.empty()) std::printf("no USB tether adapter\n");
   Discovery d;
   const int64_t t0 = detail::steadyMs();
   if (!d.start(o, [t0](const std::vector<DiscoveredDevice>& v) {
@@ -320,6 +326,8 @@ int discoverMode(int argc, char** argv) {
       std::printf("  %s:%u udp %u '%s' (%s)%s%s\n", dev.ip.c_str(), dev.control_port, dev.udp_port,
                   dev.name.c_str(), dev.model.c_str(), dev.busy ? " BUSY" : "",
                   dev.via_announce ? " [announce]" : "");
+    for (auto& dev : d.devices())
+      std::printf("    link of %s: %s via '%s'\n", dev.ip.c_str(), toString(dev.link), dev.local_adapter.c_str());
     printCounters(d.counters());
   }
   const size_t n = d.devices().size();

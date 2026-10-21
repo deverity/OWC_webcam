@@ -419,6 +419,70 @@ void testCodecSelection() {
   CHECK(real.h264.any());
 }
 
+void testLinkClassification() {
+  using L = LinkType;
+  const uint32_t eth = 6, wifi = 71, other = 1;
+  // Android USB tethering drivers (Windows 10/11)
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet 5", "Remote NDIS based Internet Sharing Device") == L::UsbTether);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet 3", "Remote NDIS Compatible Device #2") == L::UsbTether);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet 4", "UsbNcm Host Device") == L::UsbTether);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet 6", "USB NCM Device") == L::UsbTether);
+  CHECK(Discovery::classifyAdapter(other, "Ethernet 7", "Android USB Ethernet/RNDIS") == L::UsbTether);
+  CHECK(Discovery::classifyAdapter(eth, "RNDIS phone", "Generic adapter") == L::UsbTether);
+  // not tethering
+  CHECK(Discovery::classifyAdapter(wifi, "Wi-Fi", "Intel(R) Wi-Fi 6 AX201 160MHz") == L::Wifi);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet", "Realtek PCIe GbE Family Controller") == L::Ethernet);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet 2", "Realtek USB GbE Family Controller") == L::Ethernet);
+  CHECK(Discovery::classifyAdapter(eth, "vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter") == L::Other);
+  CHECK(Discovery::classifyAdapter(other, "Bluetooth Network Connection", "Bluetooth Device (PAN)") == L::Other);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet", "Broadcom NetXtreme Gigabit Ethernet") == L::Ethernet);
+  CHECK(Discovery::classifyAdapter(eth, "Ethernet", "Syncmaster dock ethernet") == L::Ethernet);  // no "ncm" token
+  // the USB tether adapter must survive the sweep's virtual-adapter filter
+  CHECK(!Discovery::isVirtualAdapter("Ethernet 5", "Remote NDIS based Internet Sharing Device"));
+  CHECK(Discovery::isPrivateIPv4((192u << 24) | (168u << 16) | (42u << 8) | 129u));
+  CHECK(Discovery::subnetHosts("192.168.42.129/24").size() == 254);
+
+  // linkFor + usbTetherAdapters with a synthetic adapter table
+  std::vector<Discovery::LocalAdapter> ad(3);
+  ad[0].name = "Wi-Fi";       ad[0].ipv4 = "192.168.0.108";  ad[0].prefix = 24; ad[0].link = L::Wifi;
+  ad[0].has_default_gateway = true; ad[0].ipv4_metric = 35;
+  ad[1].name = "Ethernet 5";  ad[1].ipv4 = "192.168.42.17";  ad[1].prefix = 24; ad[1].link = L::UsbTether;
+  ad[1].has_default_gateway = true; ad[1].ipv4_metric = 25;  // lower metric than Wi-Fi!
+  ad[2].name = "vEthernet";   ad[2].ipv4 = "172.20.32.1";    ad[2].prefix = 20; ad[2].link = L::Other;
+  std::string name;
+  CHECK(Discovery::linkFor("192.168.42.129", ad, &name) == L::UsbTether && name == "Ethernet 5");
+  CHECK(Discovery::linkFor("192.168.0.142", ad, &name) == L::Wifi && name == "Wi-Fi");
+  CHECK(Discovery::linkFor("172.20.40.2", ad) == L::Other);
+  CHECK(Discovery::linkFor("127.0.0.1", ad) == L::Unknown);
+  CHECK(Discovery::linkFor("garbage", ad) == L::Unknown);
+  auto t = Discovery::usbTetherAdapters(ad);
+  CHECK(t.size() == 1 && t[0].ipv4 == "192.168.42.17" && t[0].has_default_gateway && t[0].may_carry_internet);
+  ad[1].ipv4_metric = 50;  // Wi-Fi preferred now
+  t = Discovery::usbTetherAdapters(ad);
+  CHECK(t.size() == 1 && !t[0].may_carry_internet);
+  ad[1].has_default_gateway = false;
+  t = Discovery::usbTetherAdapters(ad);
+  CHECK(t.size() == 1 && !t[0].may_carry_internet);
+
+  // same phone on Wi-Fi and USB tether -> keep the tether entry
+  DiscoveredDevice w, u, other2;
+  w.name = u.name = "SM-N9600";
+  w.model = u.model = "SM-N9600";
+  w.ip = "192.168.0.142";  w.link = L::Wifi;
+  u.ip = "192.168.42.129"; u.link = L::UsbTether;
+  other2.name = "Pixel"; other2.model = "Pixel 7"; other2.ip = "192.168.0.50"; other2.link = L::Wifi;
+  auto best = Discovery::preferBestLink({w, other2, u});
+  CHECK(best.size() == 2 && best[0].ip == "192.168.42.129" && best[1].name == "Pixel");
+  best = Discovery::preferBestLink({u, w});
+  CHECK(best.size() == 1 && best[0].link == L::UsbTether);
+  CHECK(std::string(toString(L::UsbTether)) == "USB tethering");
+
+  for (const auto& a : Discovery::localAdapters())
+    std::printf("  local adapter '%s' (%s) %s/%u type %u gw %d metric %u -> %s\n", a.name.c_str(),
+                a.description.c_str(), a.ipv4.c_str(), a.prefix, a.if_type, a.has_default_gateway ? 1 : 0,
+                a.ipv4_metric, toString(a.link));
+}
+
 void testQpcConversions() {
   for (int64_t us : {0LL, 1LL, 999999LL, 1000000LL, 123456789012LL}) {
     const int64_t q = usToQpc(us);
@@ -446,6 +510,7 @@ int main() {
   RUN(testQpcConversions);
   RUN(testDiscoveryHelpers);
   RUN(testCodecSelection);
+  RUN(testLinkClassification);
   std::printf("%s (%d failure(s))\n", owctest::failures() ? "FAILED" : "ALL PASSED", owctest::failures());
   return owctest::failures() ? 1 : 0;
 }
