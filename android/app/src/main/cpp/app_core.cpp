@@ -4,13 +4,14 @@
 
 #include <cstdio>
 
+#include "pairing_store.h"
 #include "session.h"
 #include "util/json.h"
 #include "util/log.h"
 
 namespace owc {
 
-AppCore::AppCore() : info_(std::make_shared<SharedInfo>()) {}
+AppCore::AppCore() : info_(std::make_shared<SharedInfo>()), pairing_(std::make_shared<PairingStore>()) {}
 
 AppCore::~AppCore() {
   stop();
@@ -23,12 +24,16 @@ bool AppCore::start(const StartOptions& opts, EventSink* sink, std::string& err)
     err = "already running";
     return false;
   }
+  if (!pairing_->isOpen()) {
+    err = "pairing store not initialised (call nativeSetDataDir first)";
+    return false;
+  }
   {
     std::lock_guard<std::mutex> ilk(info_->infoMu);
     info_->deviceName = opts.deviceName;
     info_->model = opts.model;
   }
-  auto w = std::make_unique<Worker>(opts, sink, info_, pendingPreview_);
+  auto w = std::make_unique<Worker>(opts, sink, info_, pairing_, pendingPreview_);
   if (!w->start(err)) {
     // Worker destructor releases the preview reference it was given.
     pendingPreview_ = nullptr;
@@ -100,6 +105,27 @@ void AppCore::setDeviceName(const std::string& name) {
 void AppCore::screenModeChanged(int mode) {
   std::lock_guard<std::mutex> lk(lifeMu_);
   if (worker_) worker_->screenModeChanged(mode);
+}
+
+bool AppCore::setDataDir(const std::string& dir, std::string& err) { return pairing_->open(dir, err); }
+
+std::string AppCore::pairedClientsJson() { return pairing_->listJson(); }
+
+bool AppCore::unpairClient(const std::string& idHex) {
+  int removed = 0;
+  const bool ok = pairing_->remove(idHex, removed);
+  LOGI("unpair %s: %d PC(s) removed%s", idHex.empty() ? "all" : idHex.c_str(), removed, ok ? "" : " (store error)");
+  // Even if saving failed the entry is gone from memory: drop its session.
+  if (removed > 0) {
+    std::lock_guard<std::mutex> lk(lifeMu_);
+    if (worker_) worker_->pairingChanged();
+  }
+  return ok;
+}
+
+void AppCore::cancelPairing() {
+  std::lock_guard<std::mutex> lk(lifeMu_);
+  if (worker_) worker_->cancelPairing();
 }
 
 }  // namespace owc

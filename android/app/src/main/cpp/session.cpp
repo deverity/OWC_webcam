@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 
 #include "util/clock.h"
 #include "util/debug_props.h"
@@ -13,7 +15,11 @@
 namespace owc {
 namespace {
 constexpr int64_t kHelloTimeoutMs = 5000;
-constexpr int64_t kRxTimeoutMs = 10000;     // PC pings at 2 Hz
+constexpr int64_t kRxTimeoutMs = 10000;     // PC pings at 2 Hz (only after authentication)
+constexpr int64_t kAuthTimeoutMs = kAuthTimeoutS * 1000LL;
+// Wrong pairing codes are remembered across connections for this long (see
+// onPairBegin): reconnecting must not buy fresh attempts.
+constexpr int64_t kPairFailureMemoryMs = 10 * 60 * 1000;
 constexpr int64_t kPunchTimeoutMs = 3000;   // UDP requested but no punch -> TCP
 constexpr int64_t kCloseGraceMs = 2000;
 constexpr int64_t kReconfigDebounceMs = 150;  // coalesce width+height(+fps) changes
@@ -34,8 +40,8 @@ LogLevel toWire(log::Level l) {
 }  // namespace
 
 Worker::Worker(const StartOptions& opts, EventSink* sink, std::shared_ptr<SharedInfo> info,
-               ANativeWindow* preview)
-    : opts_(opts), sink_(sink), info_(std::move(info)), preview_(preview) {}
+               std::shared_ptr<PairingStore> pairing, ANativeWindow* preview)
+    : opts_(opts), sink_(sink), info_(std::move(info)), pairing_(std::move(pairing)), preview_(preview) {}
 
 Worker::~Worker() {
   stop();
@@ -80,6 +86,18 @@ void Worker::screenModeChanged(int mode) {
   Event e;
   e.kind = Event::Kind::ScreenMode;
   e.gen = static_cast<uint64_t>(mode);  // reused as payload; no connection involved
+  q_.push(std::move(e));
+}
+
+void Worker::pairingChanged() {
+  Event e;
+  e.kind = Event::Kind::PairingChanged;
+  q_.push(std::move(e));
+}
+
+void Worker::cancelPairing() {
+  Event e;
+  e.kind = Event::Kind::CancelPairing;
   q_.push(std::move(e));
 }
 
@@ -272,6 +290,29 @@ void Worker::handle(Event& ev) {
         sendParamState(ParamId::ScreenMode, ParamStatus::Ok, params_.current(ParamId::ScreenMode));
       break;
     }
+    case Event::Kind::PairingChanged:
+      // Re-checked here (not by id) so a removal racing with a new pairing of
+      // the same PC resolves to the store's final state.
+      if (conn_ && helloDone_ && !closing_ && !pairing_->contains(clientId_)) {
+        LOGI("PC '%s' was removed on the phone: ending its session", clientName_.c_str());
+        conn_->sessionId = 0;  // no more UDP punches
+        wantStream_ = false;
+        restartAtMs_ = 0;
+        sessionTeardown_ = true;
+        stopStream(true);
+        sessionTeardown_ = false;
+        sendControl(MsgType::Bye, {});
+        byeReceived_ = true;  // deliberate end (the app treats it like a Bye)
+        closeClient("PC unpaired");
+      }
+      break;
+    case Event::Kind::CancelPairing:
+      if (conn_ && codePending()) {
+        if (!closing_) sendAuthResult(AuthStatus::Rejected);
+        endPairing(kPairingRejected);
+        closeClient("pairing cancelled on the phone");
+      }
+      break;
     case Event::Kind::Shutdown:
       break;
   }
@@ -280,8 +321,21 @@ void Worker::handle(Event& ev) {
 void Worker::tick() {
   const int64_t now = monoMs();
   if (conn_) {
-    if (!helloDone_ && !closing_ && now > helloDeadlineMs_) closeClient("no Hello within 5 s");
-    if (now - conn_->lastRxMs.load() > kRxTimeoutMs && !closing_) {
+    if (!helloSeen_ && !closing_ && now > helloDeadlineMs_) closeClient("no Hello within 5 s");
+    // Before authentication there is no silence timeout (the user may take a
+    // while to type the code); the auth deadline / code lifetime bound it.
+    if (helloSeen_ && !helloDone_ && !closing_) {
+      if (codePending()) {
+        if (now >= codeExpiryMs_) {
+          sendAuthResult(AuthStatus::Expired);
+          endPairing(kPairingExpired);
+          closeClient("pairing code expired");
+        }
+      } else if (now > authDeadlineMs_) {
+        closeClient("not authenticated in time");
+      }
+    }
+    if (helloDone_ && now - conn_->lastRxMs.load() > kRxTimeoutMs && !closing_) {
       LOGW_LOCAL("client silent for %lld ms; dropping", static_cast<long long>(now - conn_->lastRxMs.load()));
       conn_->sock->shutdownBoth();
       closing_ = true;
@@ -329,9 +383,13 @@ void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
     return;
   }
   conn_ = std::move(c);
-  refreshCameras();
+  helloSeen_ = false;
   helloDone_ = false;
   closing_ = false;
+  clientId_ = Id16{};
+  clientName_.clear();
+  pendingSid_ = 0;
+  code_.clear();
   helloDeadlineMs_ = monoMs() + kHelloTimeoutMs;
   punchDeadlineMs_ = 0;
   wantStream_ = false;
@@ -342,16 +400,15 @@ void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
   lastSentFrames_ = 0;
   appliedFec_ = -1;
   applyQueuePolicy();
-  std::weak_ptr<net::Sender> ws = conn_->sender;
-  log::setPcSink(std::make_shared<log::Sink>([ws](log::Level l, const std::string& text) {
-    if (auto s = ws.lock()) s->pushLog(toWire(l), text);
-  }));
-  emit(kEvClientConnected, 0, conn_->peerStr);
+  // No PC log sink, Capabilities or app CLIENT_CONNECTED event until the
+  // connection authenticates (authenticated()).
   updateStatus();
 }
 
 void Worker::onDisconnected() {
+  if (codePending()) endPairing(kPairingDisconnected);
   log::setPcSink(nullptr);
+  const bool wasSession = helloDone_;
   sessionTeardown_ = true;  // kEvStreamingStopped arg 1 = stop caused by the session ending
   stopStream(true);
   sessionTeardown_ = false;
@@ -363,10 +420,14 @@ void Worker::onDisconnected() {
   conn_->sock->shutdownBoth();
   LOGI("session with %s ended", conn_->peerStr.c_str());
   conn_.reset();
+  helloSeen_ = false;
   helloDone_ = false;
   closing_ = false;
-  // arg: 1 = PC said Bye (explicit), 0 = connection lost/timeout (PC will auto-reconnect)
-  emit(kEvClientDisconnected, byeReceived_ ? 1 : 0, "");
+  pendingSid_ = 0;
+  nonce_ = Id16{};
+  // arg: 1 = PC said Bye (explicit), 0 = connection lost/timeout (PC will auto-reconnect).
+  // Only for sessions that were up (CLIENT_CONNECTED is sent after authentication).
+  if (wasSession) emit(kEvClientDisconnected, byeReceived_ ? 1 : 0, "");
   byeReceived_ = false;
   updateStatus();
 }
@@ -398,9 +459,13 @@ void Worker::sendCapabilities() {
 
 void Worker::onMessage(MsgType type, const std::vector<uint8_t>& payload) {
   if (closing_) return;
-  if (!helloDone_) {
+  if (!helloSeen_) {
     if (type == MsgType::Hello) onHello(payload);
-    else LOGW_LOCAL("message %s before Hello ignored", toString(type));
+    else LOGD("message %s before Hello ignored", toString(type));
+    return;
+  }
+  if (!helloDone_) {
+    onAuthMessage(type, payload);
     return;
   }
   switch (type) {
@@ -412,6 +477,9 @@ void Worker::onMessage(MsgType type, const std::vector<uint8_t>& payload) {
       closeClient("Bye from client");
       break;
     case MsgType::Hello: LOGW_LOCAL("duplicate Hello ignored"); break;
+    case MsgType::PairBegin:
+    case MsgType::PairCode:
+    case MsgType::AuthProof: LOGD("%s after authentication ignored", toString(type)); break;
     default: LOGD("ignoring message %s", toString(type)); break;
   }
 }
@@ -432,15 +500,183 @@ void Worker::onHello(const std::vector<uint8_t>& payload) {
     closeClient("protocol version mismatch");
     return;
   }
-  uint32_t sid = 0;
-  while (sid == 0) sid = arc4random();
-  HelloAck ack = makeAck(HelloStatus::Ok);
-  ack.session_id = sid;
-  conn_->sessionId = sid;
+  clientId_ = h.client_id;
+  clientName_ = sanitizePeerName(h.client_name);
+  arc4random_buf(nonce_.data(), nonce_.size());
+  phoneId_ = pairing_->phoneId();
+  pendingSid_ = 0;
+  while (pendingSid_ == 0) pendingSid_ = arc4random();
   requested_ = h.transport;
+  HelloAck ack = makeAck(HelloStatus::AuthRequired);
+  ack.session_id = pendingSid_;
+  ack.phone_id = phoneId_;
+  ack.nonce = nonce_;
+  ack.paired = pairing_->contains(clientId_);
+  sendControl(MsgType::HelloAck, encode(ack));
+  helloSeen_ = true;
+  authDeadlineMs_ = monoMs() + kAuthTimeoutMs;
+  LOGI("Hello from '%s' (%s): %s", clientName_.c_str(), conn_->peerStr.c_str(),
+       ack.paired ? "paired, waiting for AuthProof" : "not paired");
+  updateStatus();
+}
+
+// ------------------------------------------------------------------ authentication
+// Nothing in here may log the code or a key (LOGI/LOGW_LOCAL are logcat only,
+// and the PC log sink is not installed before authenticated() anyway).
+void Worker::onAuthMessage(MsgType type, const std::vector<uint8_t>& payload) {
+  switch (type) {
+    case MsgType::AuthProof: onAuthProof(payload); break;
+    case MsgType::PairBegin: onPairBegin(); break;
+    case MsgType::PairCode: onPairCode(payload); break;
+    case MsgType::Bye:
+      byeReceived_ = true;
+      if (codePending()) endPairing(kPairingDisconnected);
+      closeClient("Bye from client (not authenticated)");
+      break;
+    case MsgType::Hello: LOGD("duplicate Hello ignored"); break;
+    default: LOGD("message %s before authentication ignored", toString(type)); break;
+  }
+}
+
+void Worker::sendAuthResult(AuthStatus st, uint8_t attemptsLeft, uint16_t seconds, const Key32* key) {
+  AuthResult r;
+  r.status = st;
+  r.attempts_left = attemptsLeft;
+  r.seconds = seconds;
+  if (key) r.key = *key;
+  sendControl(MsgType::AuthResult, encode(r));
+  r.key.fill(0);
+}
+
+void Worker::onAuthProof(const std::vector<uint8_t>& payload) {
+  if (codePending()) {
+    LOGD("AuthProof while a pairing code is shown: ignored");
+    return;
+  }
+  AuthProof p;
+  Key32 key{};
+  bool ok = decode(payload.data(), payload.size(), p) && pairing_->keyFor(clientId_, key);
+  if (ok) {
+    Key32 mac = authMac(key, phoneId_, clientId_, nonce_);
+    ok = constantTimeEqual(mac.data(), p.mac.data(), kKeySize);
+  }
+  key.fill(0);
+  if (!ok) {
+    // The connection stays open: the PC drops its key and may PairBegin.
+    LOGI("AuthProof from '%s' (%s) rejected: unknown PC or wrong proof", clientName_.c_str(),
+         conn_->peerStr.c_str());
+    sendAuthResult(AuthStatus::NotPaired);
+    return;
+  }
+  authenticated(nullptr);
+}
+
+void Worker::onPairBegin() {
+  const int64_t now = monoMs();
+  if (clientId_ == Id16{}) {
+    LOGW_LOCAL("PairBegin from %s without a client_id: rejected", conn_->peerStr.c_str());
+    sendAuthResult(AuthStatus::Rejected);
+    closeClient("PairBegin without client_id");
+    return;
+  }
+  if (now < lockoutUntilMs_) {
+    const auto left = static_cast<uint16_t>((lockoutUntilMs_ - now + 999) / 1000);
+    LOGI("PairBegin from '%s' during the pairing lockout (%u s left)", clientName_.c_str(),
+         static_cast<unsigned>(left));
+    sendAuthResult(AuthStatus::Locked, 0, left);
+    closeClient("pairing locked out");
+    return;
+  }
+  if (codePending()) {  // repeated PairBegin: same code, no fresh attempts
+    const auto left = static_cast<uint16_t>(std::max<int64_t>(1, (codeExpiryMs_ - now + 999) / 1000));
+    sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), left);
+    return;
+  }
+  // Wrong codes count globally until a lockout or a success (forgotten after
+  // kPairFailureMemoryMs): with a strict per-code budget a client could get 2
+  // guesses per reconnect forever without ever being locked out. The fresh
+  // code's attempts_left tells the PC what is left (always >= 1 here).
+  if (pairFailures_ > 0 && now - lastPairFailureMs_ > kPairFailureMemoryMs) pairFailures_ = 0;
+  attemptsLeft_ = std::max(1, static_cast<int>(kPairCodeAttempts) - pairFailures_);
+  uint32_t mod = 1;
+  for (int i = 0; i < kPairCodeDigits; ++i) mod *= 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%0*u", static_cast<int>(kPairCodeDigits), arc4random_uniform(mod));
+  code_ = buf;
+  std::fill(std::begin(buf), std::end(buf), '\0');
+  codeExpiryMs_ = now + kPairCodeLifetimeS * 1000LL;
+  updateStatus();  // "pairing" is visible before the PC / app hear about the code
+  sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), kPairCodeLifetimeS);
+  emit(kEvPairingCode, kPairCodeLifetimeS, code_ + "\n" + clientName_);
+  LOGI("pairing requested by '%s' (%s): code shown on the phone (%d attempt(s))", clientName_.c_str(),
+       conn_->peerStr.c_str(), attemptsLeft_);
+}
+
+void Worker::onPairCode(const std::vector<uint8_t>& payload) {
+  if (!codePending()) {
+    LOGD("PairCode without a pending code: ignored");
+    return;
+  }
+  const int64_t now = monoMs();
+  if (now >= codeExpiryMs_) {
+    sendAuthResult(AuthStatus::Expired);
+    endPairing(kPairingExpired);
+    closeClient("pairing code expired");
+    return;
+  }
+  PairCode pc;
+  const bool match = decode(payload.data(), payload.size(), pc) && pc.code.size() == code_.size() &&
+                     constantTimeEqual(reinterpret_cast<const uint8_t*>(pc.code.data()),
+                                       reinterpret_cast<const uint8_t*>(code_.data()), code_.size());
+  std::fill(pc.code.begin(), pc.code.end(), '\0');
+  if (match) {
+    Key32 key;
+    arc4random_buf(key.data(), key.size());
+    if (!pairing_->add(clientId_, clientName_, key, static_cast<int64_t>(time(nullptr))))
+      LOGW_LOCAL("pairing with '%s' could not be saved: it lasts until the app restarts", clientName_.c_str());
+    pairFailures_ = 0;
+    LOGI("PC '%s' (%s) paired", clientName_.c_str(), conn_->peerStr.c_str());
+    endPairing(kPairingPaired);
+    authenticated(&key);
+    key.fill(0);
+    return;
+  }
+  ++pairFailures_;
+  lastPairFailureMs_ = now;
+  --attemptsLeft_;
+  if (attemptsLeft_ > 0) {
+    LOGI("wrong pairing code from '%s' (%d attempt(s) left)", clientName_.c_str(), attemptsLeft_);
+    sendAuthResult(AuthStatus::WrongCode, static_cast<uint8_t>(attemptsLeft_));
+    return;
+  }
+  lockoutUntilMs_ = now + kPairLockoutS * 1000LL;
+  pairFailures_ = 0;
+  LOGW_LOCAL("too many wrong pairing codes from '%s' (%s): pairing locked for %u s", clientName_.c_str(),
+             conn_->peerStr.c_str(), static_cast<unsigned>(kPairLockoutS));
+  sendAuthResult(AuthStatus::Locked, 0, kPairLockoutS);
+  endPairing(kPairingFailed);
+  closeClient("too many wrong pairing codes");
+}
+
+void Worker::endPairing(int outcome) {
+  if (!codePending()) return;
+  std::fill(code_.begin(), code_.end(), '0');
+  code_.clear();
+  codeExpiryMs_ = 0;
+  attemptsLeft_ = 0;
+  updateStatus();
+  emit(kEvPairingEnded, outcome, clientName_);
+}
+
+void Worker::authenticated(const Key32* newKey) {
+  // Published before the Ok goes out: the PC may punch the instant it reads it.
+  conn_->sessionId = pendingSid_;  // from now on UDP punches (and Pings) are accepted
+  sendAuthResult(AuthStatus::Ok, 0, 0, newKey);
+  helloDone_ = true;
+  refreshCameras();
   // USB (adb forward => 127.0.0.1) cannot carry UDP.
   if (requested_ == VideoTransport::Udp && conn_->peerStr.rfind("127.", 0) == 0) {
-    LOGW("UDP requested over a loopback (adb) connection: using TCP");
+    LOGW_LOCAL("UDP requested over a loopback (adb) connection: using TCP");
     requested_ = VideoTransport::Tcp;
   }
   if (requested_ == VideoTransport::Udp) {
@@ -449,12 +685,15 @@ void Worker::onHello(const std::vector<uint8_t>& payload) {
   } else {
     conn_->sender->setVideoMode(net::VideoMode::Tcp);
   }
-  sendControl(MsgType::HelloAck, encode(ack));
+  std::weak_ptr<net::Sender> ws = conn_->sender;
+  log::setPcSink(std::make_shared<log::Sink>([ws](log::Level l, const std::string& text) {
+    if (auto s = ws.lock()) s->pushLog(toWire(l), text);
+  }));
   sendCapabilities();
-  helloDone_ = true;
   lastStatsMs_ = monoMs();
-  LOGI_PC("session %08x with '%s' (%s), transport %s", sid, h.client_name.c_str(),
-          conn_->peerStr.c_str(), requested_ == VideoTransport::Udp ? "udp" : "tcp");
+  emit(kEvClientConnected, 0, conn_->peerStr);
+  LOGI_PC("session %08x with '%s' (%s), transport %s", pendingSid_, clientName_.c_str(), conn_->peerStr.c_str(),
+          requested_ == VideoTransport::Udp ? "udp" : "tcp");
   updateStatus();
 }
 
@@ -540,7 +779,7 @@ void Worker::onCommand(const std::vector<uint8_t>& payload) {
       sendCapabilities();
       break;
     case CommandId::SetDeviceName: {
-      std::string name = c.text.substr(0, 64);
+      std::string name = sanitizePeerName(c.text);  // valid modified-UTF-8 for NewStringUTF
       if (!name.empty()) {
         {
           std::lock_guard<std::mutex> lk(info_->infoMu);
@@ -846,11 +1085,14 @@ void Worker::refreshCameras() {
 
 void Worker::updateStatus() {
   SharedInfo::Status st;
-  if (conn_) {
+  if (conn_ && helloDone_) {
     st.state = streaming_ ? "streaming" : "connected";
     st.peer = conn_->peerStr;
     st.transport = conn_->sender->videoMode() == net::VideoMode::Udp ? "udp" : "tcp";
     st.dropped = conn_->sender->stats().dropped;
+  } else if (conn_ && codePending()) {
+    st.state = "pairing";
+    st.peer = conn_->peerStr;
   } else {
     st.state = "listening";
   }

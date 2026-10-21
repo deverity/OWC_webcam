@@ -1,5 +1,6 @@
 package com.owc.webcam
 
+import android.content.Context
 import android.util.Log
 import android.view.Surface
 
@@ -18,6 +19,16 @@ object NativeBridge {
     const val EVT_STREAMING_STOPPED = 5
     const val EVT_ERROR = 6
     const val EVT_DEVICE_NAME = 7
+    /** Um PC pediu pareamento: int = validade do código (s), str = "código" + '\n' + "nome do PC". */
+    const val EVT_PAIRING_CODE = 8
+    /** O código deixou de valer: int = PAIR_* (resultado), str = nome do PC. */
+    const val EVT_PAIRING_ENDED = 9
+
+    const val PAIR_OK = 0
+    const val PAIR_FAILED = 1
+    const val PAIR_EXPIRED = 2
+    const val PAIR_REJECTED = 3
+    const val PAIR_DISCONNECTED = 4
 
     @JvmField
     @Volatile
@@ -70,6 +81,22 @@ object NativeBridge {
     @JvmStatic
     external fun nativeScreenModeChanged(mode: Int)
 
+    /** Diretório dos pareamentos; obrigatório antes de nativeStart. Funciona com o núcleo parado. */
+    @JvmStatic
+    external fun nativeSetDataDir(path: String): Boolean
+
+    /** JSON: [{"id":"hex","name":"...","pairedAt":segundos_unix}]. Funciona com o núcleo parado. */
+    @JvmStatic
+    external fun nativeGetPairedClients(): String
+
+    /** Remove o PC (id hex) ou todos (""); derruba a sessão se ele estiver conectado. */
+    @JvmStatic
+    external fun nativeUnpairClient(idHex: String): Boolean
+
+    /** O usuário cancelou o código no celular: o PC recebe Rejected e a conexão é fechada. */
+    @JvmStatic
+    external fun nativeCancelPairing()
+
     /** Chamado pelo código nativo, em qualquer thread. */
     @JvmStatic
     fun onNativeEvent(type: Int, intArg: Int, strArg: String?) {
@@ -115,5 +142,36 @@ object NativeBridge {
     fun safeScreenModeChanged(mode: Int) {
         if (!available) return
         try { nativeScreenModeChanged(mode) } catch (t: Throwable) { Log.e(TAG, "nativeScreenModeChanged", t) }
+    }
+
+    @Volatile
+    private var dataDirSet = false
+
+    /** Idempotente; chame antes de qualquer outro uso nativo (serviço e activity). */
+    fun ensureDataDir(ctx: Context): Boolean {
+        if (dataDirSet) return true
+        if (!available) return false
+        val ok = try {
+            nativeSetDataDir(ctx.applicationContext.filesDir.absolutePath)
+        } catch (t: Throwable) {
+            Log.e(TAG, "nativeSetDataDir", t); false
+        }
+        dataDirSet = ok
+        return ok
+    }
+
+    fun safeGetPairedClients(): String? {
+        if (!available) return null
+        return try { nativeGetPairedClients() } catch (t: Throwable) { Log.e(TAG, "nativeGetPairedClients", t); null }
+    }
+
+    fun safeUnpairClient(idHex: String): Boolean {
+        if (!available) return false
+        return try { nativeUnpairClient(idHex) } catch (t: Throwable) { Log.e(TAG, "nativeUnpairClient", t); false }
+    }
+
+    fun safeCancelPairing() {
+        if (!available) return
+        try { nativeCancelPairing() } catch (t: Throwable) { Log.e(TAG, "nativeCancelPairing", t) }
     }
 }

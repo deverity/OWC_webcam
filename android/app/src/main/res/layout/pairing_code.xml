@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Código de pareamento: diálogo da MainActivity e PairingActivity (tela bloqueada). -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@color/card"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        style="@style/SectionTitle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="0dp"
+        android:text="@string/pair_title" />
+
+    <TextView
+        android:id="@+id/txtPairPc"
+        style="@style/BodyText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/txtPairCode"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="12dp"
+        android:fontFamily="monospace"
+        android:letterSpacing="0.08"
+        android:textColor="@color/accent"
+        android:textIsSelectable="false"
+        android:textSize="48sp"
+        android:textStyle="bold" />
+
+    <TextView
+        style="@style/BodyText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="@string/pair_hint" />
+
+    <TextView
+        android:id="@+id/txtPairTimer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textColor="@color/muted"
+        android:textSize="13sp" />
+</LinearLayout>

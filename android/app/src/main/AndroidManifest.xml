@@ -45,6 +45,19 @@
             android:theme="@style/BlackTheme"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout" />
 
+        <!-- Código de pareamento: sobre a tela de bloqueio, aberta pela notificação
+             (full-screen intent). Task própria para não trazer a MainActivity junto. -->
+        <activity
+            android:name=".PairingActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/PairingTheme"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout" />
+
         <service
             android:name=".WebcamService"
             android:exported="false"

@@ -17,6 +17,7 @@
 #include "app_core.h"
 #include "camera/camera_info.h"
 #include "net/net_server.h"
+#include "pairing_store.h"
 #include "params.h"
 #include "pipeline.h"
 #include "util/thread.h"
@@ -24,7 +25,10 @@
 namespace owc {
 
 struct Event {
-  enum class Kind { Connected, Message, Disconnected, Punch, CameraLost, EncoderError, Preview, ScreenMode, Shutdown };
+  enum class Kind {
+    Connected, Message, Disconnected, Punch, CameraLost, EncoderError, Preview, ScreenMode,
+    PairingChanged, CancelPairing, Shutdown
+  };
   Kind kind = Kind::Shutdown;
   uint64_t gen = 0;
   std::shared_ptr<net::ClientConn> conn;
@@ -38,7 +42,7 @@ struct Event {
 class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
  public:
   Worker(const StartOptions& opts, EventSink* sink, std::shared_ptr<SharedInfo> info,
-         ANativeWindow* preview);
+         std::shared_ptr<PairingStore> pairing, ANativeWindow* preview);
   ~Worker() override;
 
   bool start(std::string& err);  // binds sockets, starts threads
@@ -46,6 +50,11 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   void setPreview(ANativeWindow* w);
   // Phone side left black-screen mode (any thread): resets the param and tells the PC.
   void screenModeChanged(int mode);
+  // Any thread. A PC was removed from the store: drop the session if its PC
+  // is no longer paired.
+  void pairingChanged();
+  // Any thread. The user cancelled the code on the phone.
+  void cancelPairing();
 
   // NetServer::Callbacks (net thread)
   void onClientConnected(std::shared_ptr<net::ClientConn> c) override;
@@ -73,6 +82,15 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   void onDisconnected();
   void onMessage(MsgType type, const std::vector<uint8_t>& payload);
   void onHello(const std::vector<uint8_t>& payload);
+  // authentication (protocol.h "PAIRING"); only between Hello and AuthResult{Ok}
+  void onAuthMessage(MsgType type, const std::vector<uint8_t>& payload);
+  void onAuthProof(const std::vector<uint8_t>& payload);
+  void onPairBegin();
+  void onPairCode(const std::vector<uint8_t>& payload);
+  void sendAuthResult(AuthStatus st, uint8_t attemptsLeft = 0, uint16_t seconds = 0, const Key32* key = nullptr);
+  void authenticated(const Key32* newKey);  // session starts
+  void endPairing(int outcome);             // clears the pending code, tells the app
+  bool codePending() const { return !code_.empty(); }
   void onSetParam(const std::vector<uint8_t>& payload);
   void onCommand(const std::vector<uint8_t>& payload);
   void onReceiverReport(const std::vector<uint8_t>& payload);
@@ -103,6 +121,7 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   StartOptions opts_;
   EventSink* sink_;
   std::shared_ptr<SharedInfo> info_;
+  std::shared_ptr<PairingStore> pairing_;
   EventQueue<Event> q_;
   std::thread thread_;
   net::NetServer net_;
@@ -118,7 +137,22 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   ANativeWindow* preview_ = nullptr;
 
   std::shared_ptr<net::ClientConn> conn_;
-  bool helloDone_ = false;
+  bool helloSeen_ = false;  // valid Hello answered with HelloAck{AuthRequired}
+  bool helloDone_ = false;  // authenticated: the session is up (Capabilities sent)
+  // ---- authentication of the current connection
+  Id16 clientId_{};
+  std::string clientName_;  // sanitized Hello::client_name
+  Id16 nonce_{};
+  Id16 phoneId_{};           // as sent in HelloAck (AuthProof is checked against it)
+  uint32_t pendingSid_ = 0;  // published in conn_->sessionId only after AuthResult{Ok}
+  int64_t authDeadlineMs_ = 0;
+  std::string code_;         // pending 6-digit code ("" = none). Never logged.
+  int64_t codeExpiryMs_ = 0;
+  int attemptsLeft_ = 0;
+  // ---- pairing rate limiting (global, survives connections)
+  int64_t lockoutUntilMs_ = 0;
+  int pairFailures_ = 0;      // wrong codes since the last lockout/success (see onPairBegin)
+  int64_t lastPairFailureMs_ = 0;
   bool closing_ = false;
   bool sessionTeardown_ = false;  // inside onDisconnected(): stop is not a PC decision
   bool byeReceived_ = false;  // PC sent Bye: the disconnect event is "graceful", not "lost"

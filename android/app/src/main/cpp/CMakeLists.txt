@@ -28,6 +28,7 @@ set(OWC_WARN -Wall -Wextra)
 set(OWC_CORE_SOURCES
   app_core.cpp
   session.cpp
+  pairing_store.cpp
   params.cpp
   pipeline.cpp
   abr.cpp

@@ -57,4 +57,25 @@
     <string name="help_body">1. Wi-Fi: o celular e o PC na mesma rede Wi-Fi. O OWC no Windows encontra o celular sozinho.\n\n2. Cabo USB (ancoragem) — recomendado, sem modo desenvolvedor: ligue o cabo, ative \"Ancoragem via USB\" nas configurações do celular e o celular aparece no Windows como \"USB (ancoragem)\".\n\n3. Cabo USB avançado (ADB): para quem já usa o modo desenvolvedor e a depuração USB; o OWC no Windows configura tudo com um clique.</string>
     <string name="close">Fechar</string>
     <string name="usb_toast_fail">Não foi possível abrir as configurações de ancoragem</string>
+    <string name="state_pairing">Pareando</string>
+    <string name="cancel">Cancelar</string>
+    <string name="pair_title">PAREAR COM O PC</string>
+    <string name="pair_pc">PC: %1$s</string>
+    <string name="pair_hint">Digite este código no OWC do Windows para autorizar este PC a usar a câmera.</string>
+    <string name="pair_expires">Expira em %1$d:%2$02d</string>
+    <string name="pair_notif_channel">Pareamento com PC</string>
+    <string name="pair_notif_title">Código de pareamento: %1$s</string>
+    <string name="pair_notif_text">Digite no OWC do PC \"%1$s\". Se não foi você, toque em Cancelar.</string>
+    <string name="paired_toast">PC pareado: %1$s</string>
+    <string name="pair_failed_toast">Código digitado errado várias vezes: novos pareamentos bloqueados por alguns segundos</string>
+    <string name="paired_title">PCS PAREADOS</string>
+    <string name="paired_empty">Nenhum PC pareado. Na primeira conexão o celular mostra um código de 6 dígitos para digitar no PC.</string>
+    <string name="paired_at">Pareado em %1$s</string>
+    <string name="unpair">Remover</string>
+    <string name="unpair_all">Remover todos</string>
+    <string name="unpair_confirm_title">Remover PC pareado?</string>
+    <string name="unpair_confirm_one">\"%1$s\" precisará ser pareado de novo (com um novo código) para usar a câmera. Se estiver conectado, a conexão será encerrada.</string>
+    <string name="unpair_all_confirm_title">Remover todos os PCs?</string>
+    <string name="unpair_confirm_all">Todos os PCs precisarão ser pareados de novo. Uma conexão ativa será encerrada.</string>
+    <string name="unpair_failed">Não foi possível salvar a remoção</string>
 </resources>

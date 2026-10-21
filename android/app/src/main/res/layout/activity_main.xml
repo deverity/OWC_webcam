@@ -109,6 +109,43 @@
             style="@style/SectionTitle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="@string/paired_title" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <!-- linhas (nome + data + Remover) criadas em MainActivity.refreshPaired() -->
+            <LinearLayout
+                android:id="@+id/pairedList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <TextView
+                android:id="@+id/txtPairedEmpty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/paired_empty"
+                android:textColor="@color/muted"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnUnpairAll"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/unpair_all"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <TextView
+            style="@style/SectionTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:text="@string/device_title" />
 
         <LinearLayout

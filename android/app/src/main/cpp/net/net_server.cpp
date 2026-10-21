@@ -192,8 +192,11 @@ void NetServer::readClient() {
     TcpFrameParser::Message m;
     while (parser_.next(m)) {
       if (m.type == MsgType::Ping) {
+        // Not answered before authentication (sessionId is published by the
+        // worker only after AuthResult{Ok}).
         Ping p;
-        if (decode(m.payload.data(), m.payload.size(), p)) client_->sender->pushPong(p.t0_us, rxUs);
+        if (client_->sessionId.load() != 0 && decode(m.payload.data(), m.payload.size(), p))
+          client_->sender->pushPong(p.t0_us, rxUs);
         continue;
       }
       cb_->onClientMessage(client_->gen, m.type, std::move(m.payload));

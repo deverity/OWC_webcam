@@ -3,8 +3,11 @@
 //     client immediately gets HelloAck{Busy} and is closed. USB = adb forward,
 //     i.e. a TCP client from 127.0.0.1.
 //   - the active client's TCP socket (read side; TcpFrameParser). Ping is
-//     answered right here (Pong stamped by the sender); everything else is
-//     forwarded to the worker via Callbacks.
+//     answered right here once the client is authenticated (Pong stamped by
+//     the sender); everything else is forwarded to the worker via Callbacks.
+//     A connection that has not authenticated yet still occupies the single
+//     client slot (others get Busy); the worker closes it after
+//     kAuthTimeoutS / when its pairing code expires.
 //   - UDP video socket (udpPort): Punch -> validate session_id, remember the
 //     source address, reply PunchAck. The same fd is used by the Sender for video.
 //   - UDP discovery socket (discoveryPort): DiscoveryRequest -> DiscoveryReply.
@@ -37,7 +40,9 @@ struct ClientConn {
   sockaddr_in peer{};
   std::string peerStr;
   std::shared_ptr<Sender> sender;
-  std::atomic<uint32_t> sessionId{0};  // set by the worker after HelloAck{Ok}
+  // Set by the worker only after AuthResult{Ok}; 0 = not authenticated: UDP
+  // punches are ignored and Pings are not answered.
+  std::atomic<uint32_t> sessionId{0};
   std::atomic<int64_t> lastRxMs{0};
 };
 

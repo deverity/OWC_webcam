@@ -75,19 +75,53 @@ object NativeBridge {
     @JvmStatic external fun nativeUpdateDeviceStatus(batteryPct: Int, batteryTempC: Float,
                                                      charging: Boolean, thermalStatus: Int)
     @JvmStatic external fun nativeSetDeviceName(name: String)
+    @JvmStatic external fun nativeScreenModeChanged(mode: Int)          // celular saiu da tela preta
+
+    // Pareamento (protocol.h "PAIRING"). Funcionam com o núcleo parado.
+    @JvmStatic external fun nativeSetDataDir(path: String): Boolean     // filesDir; OBRIGATÓRIO antes de nativeStart
+    @JvmStatic external fun nativeGetPairedClients(): String            // JSON (abaixo)
+    @JvmStatic external fun nativeUnpairClient(idHex: String): Boolean  // "" = todos; false = falha ao salvar
+    @JvmStatic external fun nativeCancelPairing()                       // usuário tocou "Cancelar"
 
     // chamado pelo nativo (qualquer thread; o nativo faz AttachCurrentThread)
     @JvmStatic fun onNativeEvent(type: Int, intArg: Int, strArg: String?)
 }
 ```
 
-Eventos (`type`): `1` CLIENT_CONNECTED (str = peer), `2` CLIENT_DISCONNECTED,
-`3` SCREEN_MODE (int = 0 normal / 1 preta), `4` STREAMING_STARTED, `5` STREAMING_STOPPED,
-`6` ERROR (str = mensagem), `7` DEVICE_NAME (str = novo nome definido pelo PC; o app persiste).
+Eventos (`type`): `1` CLIENT_CONNECTED (str = peer; só depois da autenticação),
+`2` CLIENT_DISCONNECTED (int = 1 encerramento explícito — Bye do PC ou PC removido —, 0 perda;
+só para sessões autenticadas), `3` SCREEN_MODE (int = 0 normal / 1 preta), `4` STREAMING_STARTED,
+`5` STREAMING_STOPPED, `6` ERROR (str = mensagem), `7` DEVICE_NAME (str = novo nome definido pelo PC;
+o app persiste), `8` PAIRING_CODE (int = validade do código em s, str = `"<código de 6 dígitos>\n<nome do PC>"`),
+`9` PAIRING_ENDED (int = resultado: `0` pareado, `1` falhou — códigos errados demais, bloqueio iniciado —,
+`2` expirou, `3` recusado no celular, `4` PC desconectou/núcleo parou; str = nome do PC).
 
-`nativeGetStatus()`:
+Pareamento (lado do celular):
+- `nativeStart` falha se `nativeSetDataDir` não foi chamado. O app chama `NativeBridge.ensureDataDir(ctx)`
+  (idempotente) no `MainActivity.onCreate` e no `WebcamService`.
+- Arquivo `filesDir/owc_pairing.txt` (texto, gravado de forma atômica: temp + fsync + rename, modo 0600):
+  `OWC-PAIRING 1`, `phone_id <hex32>`, uma linha `client <id hex32> <chave hex64> <pareado_em unix s> <nome>`
+  por PC (máx. 32; o mais antigo sai). `allowBackup=false` mantém as chaves fora de backups.
+- Antes de `AuthResult{Ok}` o celular só aceita PairBegin/PairCode/AuthProof/Bye; não responde Ping nem
+  Punch UDP (o `session_id` só vale após Ok), não envia Capabilities/Log/Stats e não emite CLIENT_CONNECTED.
+  Uma conexão não autenticada ocupa a vaga única (outras recebem Busy) e é fechada após `kAuthTimeoutS`
+  (ou quando o código expira, `kPairCodeLifetimeS`).
+- Tentativas: os códigos errados contam globalmente até um bloqueio ou um sucesso (esquecidos após 10 min),
+  então reconectar não dá tentativas novas; `attempts_left` do CodeShown informa o saldo. Bloqueio
+  (`kPairLockoutS`) é global. PairBegin repetido na mesma conexão devolve o mesmo código.
+- Código e chaves nunca vão para log (nem logcat nem PC).
+- UI: notificação heads-up (canal `owc_pairing`, importância alta, `VISIBILITY_PUBLIC`, full-screen intent
+  para `PairingActivity` quando permitido) com "Cancelar"; diálogo na `MainActivity` se visível; se a tela
+  preta estiver ativa ela é fechada e a `PairingActivity` aberta. Card "PCs pareados" na `MainActivity`.
+
+`nativeGetPairedClients()` (nunca inclui chaves):
 ```json
-{"state":"idle|listening|connected|streaming","peer":"192.168.0.10:51234",
+[{"id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","name":"PC-SALA","pairedAt":1761000000}]
+```
+
+`nativeGetStatus()` (`pairing` = conexão não autenticada exibindo um código):
+```json
+{"state":"idle|listening|pairing|connected|streaming","peer":"192.168.0.10:51234",
  "transport":"tcp|udp","cameraId":"0","width":1920,"height":1080,"fps":30.0,
  "codec":"h264","bitrateKbps":8000,"dropped":0,"encodeLatencyMs":12.5}
 ```

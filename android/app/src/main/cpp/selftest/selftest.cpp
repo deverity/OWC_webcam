@@ -3,21 +3,28 @@
 //   owc_selftest probe          encoder probe: which configure stage/keys work
 //   owc_selftest full [secs]    starts the real server (ports 47810-47812) and
 //                               drives it with an in-process protocol client:
-//                               discovery, handshake, busy reject, params,
-//                               TCP streaming, ping/pong, keyframe request,
-//                               reconfigure, UDP punch + fragments + FEC.
+//                               discovery, handshake, pairing/authentication
+//                               (the code is read from the app event sink),
+//                               busy reject, params, TCP streaming, ping/pong,
+//                               keyframe request, reconfigure, UDP punch +
+//                               fragments + FEC, unpair, cancel, lockout.
+//                               Pairing data: /data/local/tmp/owc_selftest_data.
 // Logs go to stderr and logcat (tag OWC).
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -196,14 +203,48 @@ void runAbrSim() {
 
 // ------------------------------------------------------------------ client helpers
 struct PrintSink : EventSink {
+  struct Ev {
+    int type = 0, i = 0;
+    std::string s;
+  };
   void onEvent(int type, int i, const std::string& s) override {
-    printf("  [event] type=%d int=%d str='%s'\n", type, i, s.c_str());
+    std::string shown = s;  // PAIRING_CODE = "code\nname"
+    for (auto& ch : shown)
+      if (ch == '\n') ch = '|';
+    printf("  [event] type=%d int=%d str='%s'\n", type, i, shown.c_str());
     fflush(stdout);
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      events.push_back({type, i, s});
+    }
+    cv.notify_all();
+  }
+  size_t count() {
     std::lock_guard<std::mutex> lk(mu);
-    events.push_back(type);
+    return events.size();
+  }
+  bool has(int type, size_t from = 0) {
+    std::lock_guard<std::mutex> lk(mu);
+    for (size_t k = from; k < events.size(); ++k)
+      if (events[k].type == type) return true;
+    return false;
+  }
+  // Waits for the first event `type` at index >= from.
+  bool wait(int type, size_t from, int timeoutMs, Ev* out = nullptr) {
+    std::unique_lock<std::mutex> lk(mu);
+    auto pred = [&] {
+      for (size_t k = from; k < events.size(); ++k)
+        if (events[k].type == type) {
+          if (out) *out = events[k];
+          return true;
+        }
+      return false;
+    };
+    return cv.wait_for(lk, std::chrono::milliseconds(timeoutMs), pred);
   }
   std::mutex mu;
-  std::vector<int> events;
+  std::condition_variable cv;
+  std::vector<Ev> events;
 };
 
 int tcpConnect(const char* ip, uint16_t port) {
@@ -234,21 +275,34 @@ void sendMsg(int fd, MsgType t, const std::vector<uint8_t>& p) {
 
 struct Client {
   int fd = -1;
+  bool eof = false;
   TcpFrameParser parser;
+  std::vector<std::string> logs;  // every LogMsg text seen by waitFor()
   // Reads until a message arrives or timeout; false on timeout/EOF.
   bool next(TcpFrameParser::Message& m, int timeoutMs) {
     int64_t end = monoMs() + timeoutMs;
     for (;;) {
       if (parser.next(m)) return true;
+      if (eof) return false;
       int left = static_cast<int>(end - monoMs());
       if (left <= 0) return false;
       pollfd p{fd, POLLIN, 0};
       if (poll(&p, 1, left) <= 0) return false;
       uint8_t buf[65536];
       ssize_t n = recv(fd, buf, sizeof(buf), 0);
-      if (n <= 0) return false;
+      if (n <= 0) {
+        eof = true;
+        return false;
+      }
       parser.feed(buf, static_cast<size_t>(n));
     }
+  }
+  // Discards messages until the server closes (true) or timeout (false).
+  bool waitClosed(int timeoutMs) {
+    TcpFrameParser::Message m;
+    int64_t end = monoMs() + timeoutMs;
+    while (!eof && monoMs() < end) next(m, static_cast<int>(std::max<int64_t>(1, end - monoMs())));
+    return eof;
   }
   bool waitFor(MsgType t, TcpFrameParser::Message& m, int timeoutMs,
                std::map<MsgType, int>* seen = nullptr) {
@@ -258,8 +312,10 @@ struct Client {
       if (seen) (*seen)[m.type]++;
       if (m.type == MsgType::Log) {
         LogMsg lm;
-        if (decode(m.payload.data(), m.payload.size(), lm))
+        if (decode(m.payload.data(), m.payload.size(), lm)) {
           printf("  [PC log %d] %s\n", static_cast<int>(lm.level), lm.text.c_str());
+          logs.push_back(lm.text);
+        }
       }
       if (m.type == t) return true;
     }
@@ -306,6 +362,99 @@ void command(Client& c, CommandId id, float x = 0, float y = 0) {
   sendMsg(c.fd, MsgType::Command, encode(cmd));
 }
 
+// ------------------------------------------------------------------ pairing helpers
+// The test plays a PC: identity persisted "on the PC" = client id + key per phone.
+struct PcIdentity {
+  Id16 id{};
+  Key32 key{};
+  Id16 phoneId{};
+};
+
+template <size_t N>
+bool isZero(const std::array<uint8_t, N>& a) {
+  return std::all_of(a.begin(), a.end(), [](uint8_t b) { return b == 0; });
+}
+
+// Connect + Hello; true when HelloAck{AuthRequired} arrives.
+bool helloAuth(Client& c, const std::string& ip, uint16_t port, const PcIdentity& pc, VideoTransport tr,
+               const char* name, HelloAck& ack) {
+  c.fd = tcpConnect(ip.c_str(), port);
+  if (c.fd < 0) return false;
+  Hello h;
+  h.client_name = name;
+  h.transport = tr;
+  h.client_id = pc.id;
+  sendMsg(c.fd, MsgType::Hello, encode(h));
+  TcpFrameParser::Message m;
+  return c.waitFor(MsgType::HelloAck, m, 8000) && decode(m.payload.data(), m.payload.size(), ack) &&
+         ack.status == HelloStatus::AuthRequired;
+}
+
+bool readAuth(Client& c, AuthResult& r, int timeoutMs = 3000) {
+  TcpFrameParser::Message m;
+  return c.waitFor(MsgType::AuthResult, m, timeoutMs) && decode(m.payload.data(), m.payload.size(), r);
+}
+
+void sendProof(Client& c, const PcIdentity& pc, const HelloAck& ack, bool corrupt = false) {
+  AuthProof p;
+  p.mac = authMac(pc.key, ack.phone_id, pc.id, ack.nonce);
+  if (corrupt) p.mac[0] ^= 1;
+  sendMsg(c.fd, MsgType::AuthProof, encode(p));
+}
+
+void sendCode(Client& c, const std::string& code) {
+  PairCode pc;
+  pc.code = code;
+  sendMsg(c.fd, MsgType::PairCode, encode(pc));
+}
+
+std::string wrongCode(std::string code) {
+  if (code.empty()) return "000000";
+  code[0] = static_cast<char>('0' + (code[0] - '0' + 1) % 10);
+  return code;
+}
+
+std::string codeFrom(const PrintSink::Ev& ev) { return ev.s.substr(0, ev.s.find('\n')); }
+
+// UDP Punch with `sid`; true if a matching PunchAck arrives within timeoutMs.
+bool punch(const std::string& ip, uint16_t port, uint32_t sid, int timeoutMs) {
+  int us = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in pa{};
+  pa.sin_family = AF_INET;
+  pa.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &pa.sin_addr);
+  UdpHeader ph;
+  ph.type = UdpType::Punch;
+  ph.session_id = sid;
+  uint8_t pd[kUdpHeaderSize];
+  writeUdpHeader(ph, pd);
+  sendto(us, pd, sizeof(pd), 0, reinterpret_cast<sockaddr*>(&pa), sizeof(pa));
+  bool ok = false;
+  const int64_t end = monoMs() + timeoutMs;
+  while (!ok && monoMs() < end) {
+    pollfd pp{us, POLLIN, 0};
+    if (poll(&pp, 1, static_cast<int>(std::max<int64_t>(1, end - monoMs()))) <= 0) break;
+    uint8_t b[64];
+    ssize_t n = recv(us, b, sizeof(b), 0);
+    UdpHeader rh;
+    ok = n > 0 && readUdpHeader(b, static_cast<size_t>(n), rh) && rh.type == UdpType::PunchAck &&
+         rh.session_id == sid;
+  }
+  close(us);
+  return ok;
+}
+
+// True if `code` appears in `text` as a standalone digit run.
+bool containsCode(const std::string& text, const std::string& code) {
+  for (size_t pos = text.find(code); pos != std::string::npos; pos = text.find(code, pos + 1)) {
+    const bool before = pos > 0 && isdigit(static_cast<unsigned char>(text[pos - 1]));
+    const size_t e = pos + code.size();
+    const bool after = e < text.size() && isdigit(static_cast<unsigned char>(text[e]));
+    if (!before && !after) return true;
+  }
+  return false;
+}
+
 // ------------------------------------------------------------------ full
 void runFull(int secs) {
   const uint16_t kCtl = 47810, kUdp = 47811, kDisc = 47812;
@@ -324,6 +473,13 @@ void runFull(int secs) {
   o.testSyntheticSource = true;
   std::string err;
   printf("== full test\n");
+  const std::string dataDir = "/data/local/tmp/owc_selftest_data";
+  mkdir(dataDir.c_str(), 0700);
+  unlink((dataDir + "/owc_pairing.txt").c_str());  // every run starts unpaired
+  CHECK(!core.start(o, &sink, err), "start refused before setDataDir (%s)", err.c_str());
+  err.clear();
+  CHECK(core.setDataDir(dataDir, err), "setDataDir %s %s", dataDir.c_str(), err.c_str());
+  CHECK(core.pairedClientsJson() == "[]", "no paired PCs initially");
   CHECK(core.start(o, &sink, err), "core start %s", err.c_str());
   CHECK(!core.start(o, &sink, err), "second start rejected");
   printf("  status: %s\n", core.statusJson().c_str());
@@ -374,19 +530,80 @@ void runFull(int secs) {
     close(u);
   }
 
-  // --- TCP session
+  // --- TCP session: Hello -> AuthRequired; nothing works before authentication
+  PcIdentity pc;
+  arc4random_buf(pc.id.data(), pc.id.size());
   Client c;
-  c.fd = tcpConnect("127.0.0.1", kCtl);
-  CHECK(c.fd >= 0, "tcp connect");
-  Hello h;
-  h.client_name = "selftest";
-  h.transport = VideoTransport::Tcp;
-  sendMsg(c.fd, MsgType::Hello, encode(h));
-  TcpFrameParser::Message m;
   HelloAck ack;
-  bool gotAck = c.waitFor(MsgType::HelloAck, m, 8000) && decode(m.payload.data(), m.payload.size(), ack);
-  CHECK(gotAck && ack.status == HelloStatus::Ok && ack.session_id != 0,
-        "HelloAck ok session=%08x codec_mask=0x%x api=%u", ack.session_id, ack.codec_mask, ack.android_api);
+  TcpFrameParser::Message m;
+  const size_t ev0 = sink.count();
+  bool gotAck = helloAuth(c, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", ack);
+  CHECK(gotAck && ack.session_id != 0 && !isZero(ack.phone_id) && !isZero(ack.nonce) && !ack.paired,
+        "HelloAck{AuthRequired} session=%08x paired=%d codec_mask=0x%x api=%u", ack.session_id, ack.paired,
+        ack.codec_mask, ack.android_api);
+  {
+    SetParam sp;
+    sp.id = ParamId::Bitrate;
+    sp.value = ParamValue::Int(6000000);
+    sendMsg(c.fd, MsgType::SetParam, encode(sp));
+    command(c, CommandId::StartStream);
+    Ping p;
+    p.t0_us = static_cast<uint64_t>(monoUs());
+    sendMsg(c.fd, MsgType::Ping, encode(p));
+    Hello dup;
+    dup.client_id = pc.id;
+    sendMsg(c.fd, MsgType::Hello, encode(dup));
+    const bool punched = punch("127.0.0.1", kUdp, ack.session_id, 500);
+    int replies = 0;
+    while (c.next(m, 700)) ++replies;
+    CHECK(replies == 0 && !punched && !c.eof && !sink.has(kEvClientConnected, ev0),
+          "before authentication: SetParam/Command/Ping/Hello ignored (%d replies), punch unanswered (%d), "
+          "no CLIENT_CONNECTED", replies, punched);
+  }
+  {  // busy while the first client is still unauthenticated
+    Client b;
+    b.fd = tcpConnect("127.0.0.1", kCtl);
+    HelloAck ba;
+    bool ok = b.waitFor(MsgType::HelloAck, m, 2000) && decode(m.payload.data(), m.payload.size(), ba);
+    CHECK(ok && ba.status == HelloStatus::Busy, "second client gets Busy while the first authenticates");
+    close(b.fd);
+  }
+  std::string code;
+  {  // pairing: wrong code, then the right one
+    const size_t mark = sink.count();
+    sendMsg(c.fd, MsgType::PairBegin, {});
+    AuthResult r;
+    bool ok = readAuth(c, r);
+    CHECK(ok && r.status == AuthStatus::CodeShown && r.attempts_left == kPairCodeAttempts &&
+              r.seconds == kPairCodeLifetimeS,
+          "PairBegin -> CodeShown (%u attempts, %u s)", r.attempts_left, r.seconds);
+    PrintSink::Ev ev;
+    ok = sink.wait(kEvPairingCode, mark, 2000, &ev);
+    code = ok ? codeFrom(ev) : "";
+    const size_t nl = ev.s.find('\n');
+    const std::string name = nl == std::string::npos ? "" : ev.s.substr(nl + 1);
+    CHECK(ok && code.size() == kPairCodeDigits && name == "selftest" && ev.i == kPairCodeLifetimeS,
+          "PAIRING_CODE event: %zu digits, PC '%s', %d s", code.size(), name.c_str(), ev.i);
+    CHECK(core.statusJson().find("\"state\":\"pairing\"") != std::string::npos, "status state = pairing");
+    sendCode(c, wrongCode(code));
+    ok = readAuth(c, r);
+    CHECK(ok && r.status == AuthStatus::WrongCode && r.attempts_left == kPairCodeAttempts - 1,
+          "wrong code -> WrongCode (%u left)", r.attempts_left);
+    sendCode(c, code);
+    ok = readAuth(c, r);
+    CHECK(ok && r.status == AuthStatus::Ok && !isZero(r.key), "right code -> AuthResult{Ok} with a key");
+    pc.key = r.key;
+    pc.phoneId = ack.phone_id;
+    PrintSink::Ev end;
+    CHECK(sink.wait(kEvPairingEnded, mark, 2000, &end) && end.i == kPairingPaired && end.s == "selftest",
+          "PAIRING_ENDED paired '%s'", end.s.c_str());
+    CHECK(sink.wait(kEvClientConnected, mark, 2000), "CLIENT_CONNECTED only after authentication");
+    const std::string list = core.pairedClientsJson();
+    CHECK(list.find(toHex(pc.id.data(), kIdSize)) != std::string::npos &&
+              list.find("\"selftest\"") != std::string::npos &&
+              list.find(toHex(pc.key.data(), kKeySize)) == std::string::npos,
+          "paired list (no key): %s", list.c_str());
+  }
   Capabilities caps;
   bool gotCaps = c.waitFor(MsgType::Capabilities, m, 3000) && decode(m.payload.data(), m.payload.size(), caps);
   CHECK(gotCaps && !caps.cameras.empty(), "Capabilities: %zu cameras, %zu params, active %u", caps.cameras.size(),
@@ -558,16 +775,46 @@ void runFull(int secs) {
     cmd.text = "renamed-by-pc";
     sendMsg(c.fd, MsgType::Command, encode(cmd));
     usleep(300000);
-    std::lock_guard<std::mutex> lk(sink.mu);
-    bool seen = std::find(sink.events.begin(), sink.events.end(), 7) != sink.events.end();
-    CHECK(seen, "Command SetDeviceName -> app event 7 (DEVICE_NAME)");
+    CHECK(sink.has(kEvDeviceName), "Command SetDeviceName -> app event 7 (DEVICE_NAME)");
   }
   sendMsg(c.fd, MsgType::Bye, {});
   // Expect EOF
   bool eof = !c.waitFor(MsgType::Hello, m, 3000);
   CHECK(eof, "server closes after Bye");
   close(c.fd);
+  {
+    bool leaked = false;
+    for (const auto& l : c.logs) leaked = leaked || containsCode(l, code);
+    CHECK(!code.empty() && !leaked, "pairing code never appears in PC log lines (%zu lines)", c.logs.size());
+  }
   usleep(300000);
+
+  // --- reconnect: AuthProof with the stored key (a bad one first, same connection)
+  {
+    Client r;
+    HelloAck a2;
+    const size_t mark = sink.count();
+    bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a2);
+    CHECK(ok && a2.paired && a2.phone_id == pc.phoneId && a2.nonce != ack.nonce,
+          "reconnect: HelloAck paired=%d, same phone_id, fresh nonce", a2.paired);
+    sendProof(r, pc, a2, true);
+    AuthResult ar;
+    ok = readAuth(r, ar);
+    CHECK(ok && ar.status == AuthStatus::NotPaired && !r.eof, "bad mac -> NotPaired, connection kept open");
+    CHECK(!punch("127.0.0.1", kUdp, a2.session_id, 400), "punch before authentication not answered");
+    sendProof(r, pc, a2);
+    ok = readAuth(r, ar);
+    CHECK(ok && ar.status == AuthStatus::Ok && isZero(ar.key), "good AuthProof -> Ok (key all zeros)");
+    Capabilities c2;
+    CHECK(r.waitFor(MsgType::Capabilities, m, 3000) && decode(m.payload.data(), m.payload.size(), c2),
+          "Capabilities after AuthProof");
+    CHECK(punch("127.0.0.1", kUdp, a2.session_id, 1000), "punch after authentication answered");
+    CHECK(!sink.has(kEvPairingCode, mark), "no pairing code shown for a paired PC");
+    sendMsg(r.fd, MsgType::Bye, {});
+    CHECK(r.waitClosed(3000), "closed after Bye");
+    close(r.fd);
+    usleep(300000);
+  }
 
   // --- UDP session (needs a non-loopback address)
   std::string ip = wlanIp();
@@ -575,15 +822,13 @@ void runFull(int secs) {
     printf("  (no non-loopback IPv4: UDP test skipped)\n");
   } else {
     Client u;
-    u.fd = tcpConnect(ip.c_str(), kCtl);
-    CHECK(u.fd >= 0, "tcp connect via %s", ip.c_str());
-    Hello hu;
-    hu.transport = VideoTransport::Udp;
-    hu.client_name = "selftest-udp";
-    sendMsg(u.fd, MsgType::Hello, encode(hu));
     HelloAck ua;
-    bool ok = u.waitFor(MsgType::HelloAck, m, 3000) && decode(m.payload.data(), m.payload.size(), ua);
-    CHECK(ok && ua.status == HelloStatus::Ok, "UDP session HelloAck");
+    bool ok = helloAuth(u, ip, kCtl, pc, VideoTransport::Udp, "selftest-udp", ua);
+    CHECK(ok && ua.paired, "UDP session: Hello via %s -> AuthRequired (paired)", ip.c_str());
+    sendProof(u, pc, ua);
+    AuthResult uar;
+    ok = readAuth(u, uar) && uar.status == AuthStatus::Ok;
+    CHECK(ok, "UDP session authenticated with AuthProof");
     int us = socket(AF_INET, SOCK_DGRAM, 0);
     int rcv = 4 << 20;
     setsockopt(us, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
@@ -674,6 +919,99 @@ void runFull(int secs) {
     printf("  status after abrupt close: %s\n", core.statusJson().c_str());
   }
 
+  // --- unpairing a connected PC drops its session
+  {
+    Client r;
+    HelloAck a;
+    bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
+    sendProof(r, pc, a);
+    AuthResult ar;
+    ok = ok && readAuth(r, ar) && ar.status == AuthStatus::Ok;
+    CHECK(ok, "authenticated again for the unpair test");
+    const size_t mark = sink.count();
+    CHECK(core.unpairClient(toHex(pc.id.data(), kIdSize)), "unpairClient(id)");
+    const bool bye = r.waitFor(MsgType::Bye, m, 3000);
+    CHECK(bye && r.waitClosed(3000), "unpaired PC: session dropped (Bye + close)");
+    CHECK(sink.wait(kEvClientDisconnected, mark, 2000), "CLIENT_DISCONNECTED after unpair");
+    CHECK(core.pairedClientsJson() == "[]", "paired list empty after unpair");
+    close(r.fd);
+    usleep(300000);
+  }
+  // --- the old key is refused; PairBegin on the same connection; cancel on the phone
+  {
+    Client r;
+    HelloAck a;
+    bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
+    CHECK(ok && !a.paired, "after unpair: HelloAck paired=0");
+    sendProof(r, pc, a);
+    AuthResult ar;
+    ok = readAuth(r, ar);
+    CHECK(ok && ar.status == AuthStatus::NotPaired, "old key -> NotPaired");
+    const size_t mark = sink.count();
+    sendMsg(r.fd, MsgType::PairBegin, {});
+    ok = readAuth(r, ar) && ar.status == AuthStatus::CodeShown;
+    CHECK(ok && sink.wait(kEvPairingCode, mark, 2000), "PairBegin on the same connection -> CodeShown");
+    core.cancelPairing();
+    ok = readAuth(r, ar);
+    CHECK(ok && ar.status == AuthStatus::Rejected && r.waitClosed(3000), "cancel on the phone -> Rejected + close");
+    PrintSink::Ev end;
+    CHECK(sink.wait(kEvPairingEnded, mark, 2000, &end) && end.i == kPairingRejected, "PAIRING_ENDED rejected (%d)",
+          end.i);
+    close(r.fd);
+    usleep(300000);
+  }
+  // --- too many wrong codes: Locked, then PairBegin refused during the lockout
+  {
+    Client r;
+    HelloAck a;
+    const size_t mark = sink.count();
+    bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
+    sendMsg(r.fd, MsgType::PairBegin, {});
+    AuthResult ar;
+    ok = ok && readAuth(r, ar) && ar.status == AuthStatus::CodeShown && ar.attempts_left == kPairCodeAttempts;
+    PrintSink::Ev ev;
+    ok = ok && sink.wait(kEvPairingCode, mark, 2000, &ev);
+    const std::string bad = wrongCode(ok ? codeFrom(ev) : "");
+    int wrong = 0;
+    for (int i = 0; i < kPairCodeAttempts - 1; ++i) {
+      sendCode(r, bad);
+      if (readAuth(r, ar) && ar.status == AuthStatus::WrongCode && ar.attempts_left == kPairCodeAttempts - 1 - i)
+        ++wrong;
+    }
+    sendCode(r, bad);
+    const bool locked = readAuth(r, ar) && ar.status == AuthStatus::Locked && ar.seconds == kPairLockoutS;
+    CHECK(ok && wrong == kPairCodeAttempts - 1 && locked && r.waitClosed(3000),
+          "%d wrong codes -> WrongCode x%d, then Locked (%u s) + close", kPairCodeAttempts, wrong, ar.seconds);
+    PrintSink::Ev end;
+    CHECK(sink.wait(kEvPairingEnded, mark, 2000, &end) && end.i == kPairingFailed, "PAIRING_ENDED failed (%d)", end.i);
+    close(r.fd);
+    usleep(300000);
+    Client r2;
+    HelloAck a2;
+    const size_t mark2 = sink.count();
+    ok = helloAuth(r2, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a2);
+    sendMsg(r2.fd, MsgType::PairBegin, {});
+    ok = ok && readAuth(r2, ar);
+    CHECK(ok && ar.status == AuthStatus::Locked && ar.seconds > 0 && ar.seconds <= kPairLockoutS &&
+              r2.waitClosed(3000) && !sink.has(kEvPairingCode, mark2),
+          "PairBegin during the lockout -> Locked (%u s left) + close, no code shown", ar.seconds);
+    close(r2.fd);
+    usleep(300000);
+  }
+  // --- an unauthenticated connection is closed after kAuthTimeoutS
+  {
+    Client r;
+    HelloAck a;
+    bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
+    const int64_t ta = monoMs();
+    const bool closed = r.waitClosed(kAuthTimeoutS * 1000 + 4000);
+    const int64_t dt = monoMs() - ta;
+    CHECK(ok && closed && dt >= kAuthTimeoutS * 1000 - 500, "unauthenticated connection closed after %lld ms (%u s)",
+          static_cast<long long>(dt), static_cast<unsigned>(kAuthTimeoutS));
+    close(r.fd);
+    usleep(300000);
+  }
+
   int64_t t0 = monoMs();
   core.stop();
   CHECK(monoMs() - t0 < 3000, "core.stop() joined in %lld ms", static_cast<long long>(monoMs() - t0));
@@ -681,7 +1019,7 @@ void runFull(int secs) {
   {
     std::lock_guard<std::mutex> lk(sink.mu);
     printf("  app events:");
-    for (int e : sink.events) printf(" %d", e);
+    for (const auto& e : sink.events) printf(" %d", e.type);
     printf("\n");
   }
 }

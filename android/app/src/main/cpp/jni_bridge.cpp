@@ -2,7 +2,10 @@
 //   class com.owc.webcam.NativeBridge (Kotlin object, @JvmStatic) — static natives:
 //     nativeStart(String,String,int,int,int,int)Z, nativeStop()V,
 //     nativeSetPreviewSurface(Surface)V, nativeGetStatus()String,
-//     nativeUpdateDeviceStatus(int,float,boolean,int)V, nativeSetDeviceName(String)V, nativeScreenModeChanged(int)V
+//     nativeUpdateDeviceStatus(int,float,boolean,int)V, nativeSetDeviceName(String)V, nativeScreenModeChanged(int)V,
+//     nativeSetDataDir(String)Z (before nativeStart), nativeGetPairedClients()String,
+//     nativeUnpairClient(String)Z, nativeCancelPairing()V — the pairing calls work
+//     whether or not the core is running.
 //   callback: static onNativeEvent(int,int,String)V, invoked from a dedicated
 //   native thread ("owc-jni-ev", attached once) so no camera/encoder/network
 //   thread ever runs Java code or waits for it.
@@ -575,4 +578,27 @@ extern "C" JNIEXPORT void JNICALL Java_com_owc_webcam_NativeBridge_nativeSetDevi
 extern "C" JNIEXPORT void JNICALL Java_com_owc_webcam_NativeBridge_nativeScreenModeChanged(JNIEnv*, jclass,
                                                                                            jint mode) {
   core().screenModeChanged(mode);
+}
+
+// ------------------------------------------------------------------ pairing
+extern "C" JNIEXPORT jboolean JNICALL Java_com_owc_webcam_NativeBridge_nativeSetDataDir(JNIEnv* env, jclass,
+                                                                                       jstring dir) {
+  std::string err;
+  if (core().setDataDir(toStd(env, dir), err)) return JNI_TRUE;
+  LOGE_LOCAL("nativeSetDataDir failed: %s", err.c_str());
+  return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_com_owc_webcam_NativeBridge_nativeGetPairedClients(JNIEnv* env,
+                                                                                             jclass) {
+  return env->NewStringUTF(core().pairedClientsJson().c_str());  // names are sanitized (modified-UTF-8 safe)
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_owc_webcam_NativeBridge_nativeUnpairClient(JNIEnv* env, jclass,
+                                                                                         jstring idHex) {
+  return core().unpairClient(toStd(env, idHex)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_owc_webcam_NativeBridge_nativeCancelPairing(JNIEnv*, jclass) {
+  core().cancelPairing();
 }

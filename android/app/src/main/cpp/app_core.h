@@ -15,6 +15,9 @@
 //   - statusMu_ guards the status snapshot read by nativeGetStatus().
 //   - infoMu_ guards device name/model (read by the net thread for discovery).
 //   - Device status (battery/thermal) are atomics.
+//   - PairingStore (pairing_store.h) has its own mutex; it is owned by AppCore
+//     and shared with the worker, so the UI can list/remove PCs while the core
+//     is stopped. Unpair/cancel requests reach the worker as queued Events.
 //   - The encoder output thread uses frameSender_ (raw pointer) which is only
 //     changed by the worker while no encoder is running (start/join order gives
 //     the happens-before), so it needs no lock.
@@ -44,6 +47,19 @@ enum AppEvent : int {
   kEvStreamingStopped = 5,  // arg: 1 = emitted because the session ended
   kEvError = 6,
   kEvDeviceName = 7,  // str = new name set by the PC (the app persists it)
+  // A PC asked to pair: show the code. int = code lifetime (s),
+  // str = "<6-digit code>\n<PC name>" (newline-separated).
+  kEvPairingCode = 8,
+  // The pairing code is no longer valid. int = PairingOutcome, str = PC name.
+  kEvPairingEnded = 9,
+};
+
+enum PairingOutcome : int {
+  kPairingPaired = 0,        // code typed correctly: PC stored
+  kPairingFailed = 1,        // too many wrong codes (lockout started)
+  kPairingExpired = 2,       // code lifetime elapsed
+  kPairingRejected = 3,      // user cancelled on the phone
+  kPairingDisconnected = 4,  // PC went away / core stopped
 };
 
 class EventSink {
@@ -67,6 +83,7 @@ struct StartOptions {
 };
 
 class Worker;
+class PairingStore;
 
 // State shared between the JNI-facing API and the worker.
 struct SharedInfo {
@@ -107,11 +124,20 @@ class AppCore {
   void setDeviceName(const std::string& name);
   void screenModeChanged(int mode);  // posts to the worker thread
 
+  // Pairing (any thread; work whether or not the core is running).
+  // setDataDir must succeed before start() (start fails otherwise).
+  bool setDataDir(const std::string& dir, std::string& err);
+  std::string pairedClientsJson();
+  // idHex = "" removes every PC; a removed PC that is connected is dropped.
+  bool unpairClient(const std::string& idHex);
+  void cancelPairing();  // user tapped "Cancelar": AuthResult{Rejected} + close
+
  private:
   std::mutex lifeMu_;  // serializes start/stop/setPreviewSurface
   std::atomic<bool> running_{false};
   std::unique_ptr<Worker> worker_;
   std::shared_ptr<SharedInfo> info_;
+  std::shared_ptr<PairingStore> pairing_;
   ANativeWindow* pendingPreview_ = nullptr;  // guarded by lifeMu_ (used before start)
 };
 

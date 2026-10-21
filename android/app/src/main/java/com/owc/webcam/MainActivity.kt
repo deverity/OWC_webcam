@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -13,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -20,12 +22,15 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.text.DateFormat
+import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -45,6 +50,12 @@ class MainActivity : Activity() {
     private lateinit var swKeepOn: Switch
     private lateinit var surface: SurfaceView
 
+    private lateinit var pairedList: LinearLayout
+    private lateinit var txtPairedEmpty: TextView
+    private lateinit var btnUnpairAll: Button
+    private var pairDialog: AlertDialog? = null
+    private var pairDialogView: View? = null
+
     private var visible = false
     private var pendingStart = false
     private var pendingAutostart = false
@@ -53,12 +64,27 @@ class MainActivity : Activity() {
         override fun run() {
             refreshStatus()
             if (tick++ % 4 == 0) refreshNetwork()
+            val p = Pairing.pending
+            val v = pairDialogView
+            if (p != null && v != null) Pairing.updateTimer(v, p)
             handler.postDelayed(this, 500)
+        }
+    }
+
+    private val pairingListener = object : Pairing.Listener {
+        override fun onPairingCode(p: Pairing.Pending) {
+            showPairDialog(p)
+        }
+
+        override fun onPairingEnded(outcome: Int, pcName: String) {
+            dismissPairDialog()
+            refreshPaired()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        NativeBridge.ensureDataDir(this)  // antes de qualquer chamada nativa (lista de PCs pareados)
         setContentView(R.layout.activity_main)
         prefs = Prefs(this)
 
@@ -96,6 +122,11 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             } catch (_: Throwable) {}
         }
+
+        pairedList = findViewById(R.id.pairedList)
+        txtPairedEmpty = findViewById(R.id.txtPairedEmpty)
+        btnUnpairAll = findViewById(R.id.btnUnpairAll)
+        btnUnpairAll.setOnClickListener { confirmUnpair(null) }
 
         swKeepOn.isChecked = prefs.keepScreenOn
         applyKeepOn(prefs.keepScreenOn)
@@ -153,13 +184,95 @@ class MainActivity : Activity() {
         visible = true
         refreshNetwork()
         refreshStatus()
+        refreshPaired()
+        Pairing.addListener(pairingListener)
+        Pairing.pending?.let { showPairDialog(it) }
         handler.post(poll)
     }
 
     override fun onStop() {
         visible = false
         handler.removeCallbacks(poll)
+        Pairing.removeListener(pairingListener)
+        dismissPairDialog()
         super.onStop()
+    }
+
+    // ------------------------------------------------------------ pareamento
+
+    /** Código em letras grandes enquanto a activity estiver visível (some no PAIRING_ENDED). */
+    private fun showPairDialog(p: Pairing.Pending) {
+        if (Pairing.activityVisible) return  // a PairingActivity já mostra o código
+        val current = pairDialogView
+        if (pairDialog?.isShowing == true && current != null) {
+            Pairing.bindCodeView(current, p)
+            return
+        }
+        val v = Pairing.inflateCodeView(this)
+        Pairing.bindCodeView(v, p)
+        pairDialogView = v
+        pairDialog = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setView(v)
+            .setCancelable(false)
+            .setNegativeButton(R.string.cancel) { _, _ -> NativeBridge.safeCancelPairing() }
+            .show()
+    }
+
+    private fun dismissPairDialog() {
+        try { pairDialog?.dismiss() } catch (_: Throwable) {}
+        pairDialog = null
+        pairDialogView = null
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun refreshPaired() {
+        val list = Pairing.parseList(NativeBridge.safeGetPairedClients())
+        pairedList.removeAllViews()
+        txtPairedEmpty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+        btnUnpairAll.visibility = if (list.isEmpty()) View.GONE else View.VISIBLE
+        val fmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+        for (pc in list) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(0, dp(4), 0, dp(4))
+            val texts = LinearLayout(this)
+            texts.orientation = LinearLayout.VERTICAL
+            val name = TextView(this)
+            name.text = pc.name
+            name.setTextColor(getColor(R.color.text))
+            name.textSize = 15f
+            name.setTypeface(name.typeface, Typeface.BOLD)
+            val date = TextView(this)
+            date.text = getString(R.string.paired_at, if (pc.pairedAt > 0) fmt.format(Date(pc.pairedAt * 1000)) else "?")
+            date.setTextColor(getColor(R.color.muted))
+            date.textSize = 13f
+            texts.addView(name)
+            texts.addView(date)
+            row.addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            val btn = Button(this, null, 0, android.R.style.Widget_Material_Button_Borderless_Colored)
+            btn.setText(R.string.unpair)
+            btn.setOnClickListener { confirmUnpair(pc) }
+            row.addView(btn)
+            pairedList.addView(row)
+        }
+    }
+
+    /** pc = null: remover todos. */
+    private fun confirmUnpair(pc: Pairing.PairedPc?) {
+        if (pc != null && pc.id.isEmpty()) return  // "" significa "todos" para o nativo
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle(if (pc == null) R.string.unpair_all_confirm_title else R.string.unpair_confirm_title)
+            .setMessage(if (pc == null) getString(R.string.unpair_confirm_all) else getString(R.string.unpair_confirm_one, pc.name))
+            .setPositiveButton(if (pc == null) R.string.unpair_all else R.string.unpair) { _, _ ->
+                if (!NativeBridge.safeUnpairClient(pc?.id ?: "")) {
+                    Toast.makeText(this, R.string.unpair_failed, Toast.LENGTH_LONG).show()
+                }
+                refreshPaired()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
     // ------------------------------------------------------------- serviço
@@ -340,6 +453,7 @@ class MainActivity : Activity() {
             val state = when (j.optString("state")) {
                 "listening" -> getString(R.string.state_listening)
                 "connected" -> getString(R.string.state_connected)
+                "pairing" -> getString(R.string.state_pairing)
                 "streaming" -> getString(R.string.state_streaming)
                 else -> getString(R.string.state_idle)
             }

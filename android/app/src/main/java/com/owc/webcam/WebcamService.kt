@@ -13,7 +13,13 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.provider.Settings
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
+import android.widget.Toast
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -40,10 +46,13 @@ class WebcamService : Service() {
         const val ACTION_START = "com.owc.webcam.action.START"
         const val ACTION_STOP = "com.owc.webcam.action.STOP"
         const val ACTION_CLOSE_BLACK = "com.owc.webcam.action.CLOSE_BLACK"
+        const val ACTION_CANCEL_PAIRING = "com.owc.webcam.action.CANCEL_PAIRING"
         private const val CH_MAIN = "owc_stream"
         private const val CH_SCREEN = "owc_screen"
+        private const val CH_PAIR = "owc_pairing"
         private const val NOTIF_ID = 1
         private const val NOTIF_SCREEN_ID = 2
+        private const val NOTIF_PAIR_ID = 3
 
         @Volatile
         var running: Boolean = false
@@ -103,12 +112,24 @@ class WebcamService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        NativeBridge.ensureDataDir(this)
         createChannels()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_PAIRING) {
+            // Ação "Cancelar" da notificação do código. Sem núcleo rodando a notificação é
+            // resto de uma sessão anterior: só limpa.
+            if (nativeStarted) {
+                NativeBridge.safeCancelPairing()
+                return START_STICKY
+            }
+            cancelPairNotification()
+            if (!running) stopSelf()
             return START_NOT_STICKY
         }
         if (!goForeground()) {
@@ -150,6 +171,7 @@ class WebcamService : Service() {
             return
         }
         val p = Prefs(this)
+        NativeBridge.ensureDataDir(this)  // pareamentos: obrigatório antes do nativeStart
         val ok = NativeBridge.safeStart(
             p.deviceName, Build.MODEL, Build.VERSION.SDK_INT,
             p.controlPort, p.udpPort, p.discoveryPort
@@ -186,6 +208,9 @@ class WebcamService : Service() {
         releaseLocks()
         sendBroadcast(Intent(ACTION_CLOSE_BLACK).setPackage(packageName))
         getSystemService(NotificationManager::class.java).cancel(NOTIF_SCREEN_ID)
+        // O listener já foi removido: o PAIRING_ENDED do stop nativo não chega aqui.
+        cancelPairNotification()
+        Pairing.onEnded(NativeBridge.PAIR_DISCONNECTED, null)
         super.onDestroy()
     }
 
@@ -293,6 +318,31 @@ class WebcamService : Service() {
             NativeBridge.EVT_ERROR -> {
                 Log.e(TAG, "erro nativo: $str")
                 updateNotification(getString(R.string.notif_error, str ?: "?"))
+            }
+            NativeBridge.EVT_PAIRING_CODE -> {
+                val p = Pairing.onCodeEvent(str, arg) ?: return
+                // O código precisa ficar visível: sai da tela preta (se ativa) e, nesse caso, abre a
+                // PairingActivity (permitido: a BlackScreenActivity ainda está em primeiro plano ou o
+                // app tem a permissão de sobreposição usada pelo overlay). Fora disso: notificação
+                // heads-up + diálogo da MainActivity se ela estiver visível.
+                val wasBlack = lastBlackRequested || overlay != null
+                exitBlackScreen(syncNative = true)
+                showPairNotification(p, arg)
+                if (wasBlack) {
+                    try { startActivity(pairingIntent()) } catch (t: Throwable) { Log.w(TAG, "PairingActivity: $t") }
+                }
+                updateNotification(buildStatusText())
+            }
+            NativeBridge.EVT_PAIRING_ENDED -> {
+                cancelPairNotification()
+                Pairing.onEnded(arg, str)
+                when (arg) {
+                    NativeBridge.PAIR_OK ->
+                        Toast.makeText(this, getString(R.string.paired_toast, str ?: "PC"), Toast.LENGTH_LONG).show()
+                    NativeBridge.PAIR_FAILED ->
+                        Toast.makeText(this, R.string.pair_failed_toast, Toast.LENGTH_LONG).show()
+                }
+                updateNotification(buildStatusText())
             }
             else -> {
                 // Tela preta nao fica presa quando o PC encerra de proposito:
@@ -467,6 +517,64 @@ class WebcamService : Service() {
             NotificationChannel(CH_SCREEN, getString(R.string.notif_channel_screen), NotificationManager.IMPORTANCE_HIGH)
                 .apply { setShowBadge(false); setSound(null, null) }
         )
+        // Alta importância = heads-up; público = código visível na tela de bloqueio.
+        nm.createNotificationChannel(
+            NotificationChannel(CH_PAIR, getString(R.string.pair_notif_channel), NotificationManager.IMPORTANCE_HIGH)
+                .apply {
+                    setShowBadge(false)
+                    enableVibration(true)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                }
+        )
+    }
+
+    // ------------------------------------------------------------- pareamento
+
+    private fun pairingIntent(): Intent =
+        Intent(this, PairingActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+
+    private fun canUseFullScreenIntent(): Boolean =
+        Build.VERSION.SDK_INT < 34 || getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
+
+    /**
+     * Código em notificação heads-up (canal de alta importância, visível na tela de bloqueio) com
+     * "Cancelar". O full-screen intent abre a PairingActivity sobre a tela de bloqueio / acende a
+     * tela quando o sistema permite (Android 14+: só com a permissão de full-screen concedida).
+     */
+    private fun showPairNotification(p: Pairing.Pending, seconds: Int) {
+        try {
+            val open = PendingIntent.getActivity(
+                this, 3, pairingIntent(), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val cancel = PendingIntent.getService(
+                this, 4, Intent(this, WebcamService::class.java).setAction(ACTION_CANCEL_PAIRING),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val code = Pairing.formatCode(p.code)
+            val big = SpannableString(code + "\n" + getString(R.string.pair_notif_text, p.pcName)).apply {
+                setSpan(RelativeSizeSpan(2.0f), 0, code.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(StyleSpan(Typeface.BOLD), 0, code.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            val b = Notification.Builder(this, CH_PAIR)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setContentTitle(getString(R.string.pair_notif_title, code))
+                .setContentText(getString(R.string.pair_notif_text, p.pcName))
+                .setStyle(Notification.BigTextStyle().bigText(big))
+                .setCategory(Notification.CATEGORY_CALL)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setOnlyAlertOnce(true)
+                .setTimeoutAfter(seconds.coerceAtLeast(1) * 1000L)
+                .setContentIntent(open)
+                .addAction(Notification.Action.Builder(null, getString(R.string.cancel), cancel).build())
+            if (canUseFullScreenIntent()) b.setFullScreenIntent(open, true)
+            getSystemService(NotificationManager::class.java).notify(NOTIF_PAIR_ID, b.build())
+        } catch (t: Throwable) { Log.w(TAG, "notificação de pareamento", t) }
+    }
+
+    private fun cancelPairNotification() {
+        try { getSystemService(NotificationManager::class.java).cancel(NOTIF_PAIR_ID) } catch (_: Throwable) {}
     }
 
     private fun buildNotification(text: String): Notification {
@@ -510,6 +618,7 @@ class WebcamService : Service() {
                     peer, j.optInt("width"), j.optInt("height"), j.optDouble("fps", 0.0), j.optString("codec", "")
                 )
                 "connected" -> getString(R.string.state_connected) + " - " + peer
+                "pairing" -> getString(R.string.state_pairing) + " - " + peer
                 else -> getString(R.string.notif_waiting)
             }
         } catch (t: Throwable) {
