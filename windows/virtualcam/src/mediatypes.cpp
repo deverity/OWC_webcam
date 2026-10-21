@@ -39,7 +39,8 @@ size_t imageBytesFor(PixFmt f, int stride, int rows) {
   return outputBytes(d);
 }
 
-const int kSizes[][2] = {{1920, 1080}, {1280, 720}, {960, 540}, {640, 480}, {640, 360}};
+const int kSizes[][2] = {{3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720},
+                         {960, 540},   {640, 480},   {640, 360}};
 const PixFmt kFmtOrder[] = {PixFmt::NV12, PixFmt::YUY2, PixFmt::I420, PixFmt::RGB32, PixFmt::RGB24};
 
 }  // namespace
