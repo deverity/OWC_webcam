@@ -136,11 +136,14 @@ static void testMessages() {
     Hello o; CHECK(decode(e.data(), e.size(), o));
     CHECK(o.magic == kMagic && o.version == kProtocolVersion && o.transport == VideoTransport::Udp);
     CHECK(o.client_name == kUnicode);
-    checkTruncations<Hello>(e);
-    // exact bytes: "OWC1" magic LE, version 1, transport, empty string
+    // v2: the client_id trailer is optional on decode, so only the v1 part must be complete
+    for (size_t n = 0; n < e.size() - kIdSize; ++n) { Hello t; CHECK(!decode(e.data(), n, t)); }
+    // exact bytes: "OWC1" magic LE, version 2, transport, "ab", 16-byte client_id
     Hello h2; h2.client_name = "ab";
+    for (size_t i = 0; i < kIdSize; ++i) h2.client_id[i] = static_cast<uint8_t>(0xA0 + i);
     auto e2 = encode(h2);
-    const uint8_t exp[] = {0x4F, 0x57, 0x43, 0x31, 1, 0, 0, 2, 0, 'a', 'b'};
+    uint8_t exp[11 + kIdSize] = {0x4F, 0x57, 0x43, 0x31, 2, 0, 0, 2, 0, 'a', 'b'};
+    for (size_t i = 0; i < kIdSize; ++i) exp[11 + i] = static_cast<uint8_t>(0xA0 + i);
     CHECK(e2.size() == sizeof(exp) && std::memcmp(e2.data(), exp, sizeof(exp)) == 0);
     // wrong magic/version still parses
     Hello bad; bad.magic = 0x12345678; bad.version = 99;
@@ -167,7 +170,13 @@ static void testMessages() {
     CHECK(o.device_name == kUnicode && o.model.size() == 65535 && o.android_api == 34);
     CHECK(o.codec_mask == 3 && o.magic == kMagic && o.version == kProtocolVersion);
     a.model = "M";
-    checkTruncations<HelloAck>(encode(a));
+    {  // v2 trailer is optional on decode: only the v1 part must be complete
+      auto ea = encode(a);
+      for (size_t n = 0; n < ea.size() - (2 * kIdSize + 1); ++n) {
+        HelloAck t; CHECK(!decode(ea.data(), n, t));
+      }
+      HelloAck t; CHECK(decode(ea.data(), ea.size(), t));
+    }
   }
   {  // Capabilities
     Capabilities empty;
@@ -359,13 +368,208 @@ static void testMessages() {
     bad = e; bad[1] ^= 0xFF; CHECK(!decode(bad.data(), bad.size(), o));
   }
   {  // toString
-    const MsgType ts[] = {MsgType::Hello, MsgType::HelloAck, MsgType::Capabilities, MsgType::SetParam,
+    const MsgType ts[] = {MsgType::Hello, MsgType::HelloAck, MsgType::Capabilities,
+        MsgType::PairBegin, MsgType::PairCode, MsgType::AuthProof, MsgType::AuthResult, MsgType::SetParam,
         MsgType::ParamState, MsgType::Command, MsgType::VideoFormat, MsgType::VideoFrame, MsgType::Ping,
         MsgType::Pong, MsgType::Stats, MsgType::ReceiverReport, MsgType::Log, MsgType::Bye};
     for (MsgType t : ts) CHECK(std::strcmp(toString(t), "Unknown") != 0);
     CHECK(std::strcmp(toString(MsgType::Bye), "Bye") == 0);
+    CHECK(std::strcmp(toString(MsgType::PairBegin), "PairBegin") == 0);
+    CHECK(std::strcmp(toString(MsgType::PairCode), "PairCode") == 0);
+    CHECK(std::strcmp(toString(MsgType::AuthProof), "AuthProof") == 0);
+    CHECK(std::strcmp(toString(MsgType::AuthResult), "AuthResult") == 0);
     CHECK(std::strcmp(toString(static_cast<MsgType>(777)), "Unknown") == 0);
     CHECK(std::strcmp(toString(ParamId::BFrames), "BFrames") == 0);
+  }
+}
+
+// ---------------------------------------------------------- pairing / auth
+static std::string hex32(const Key32& k) { return toHex(k.data(), k.size()); }
+static std::string hexOf(const std::string& s) {
+  return hex32(sha256(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
+}
+static std::vector<uint8_t> bytesOf(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+static std::string hmacHex(const std::vector<uint8_t>& key, const std::vector<uint8_t>& msg) {
+  return hex32(hmacSha256(key.data(), key.size(), msg.data(), msg.size()));
+}
+static Id16 makeId(uint8_t seed) {
+  Id16 id;
+  for (size_t i = 0; i < id.size(); ++i) id[i] = static_cast<uint8_t>(seed + 7 * i);
+  return id;
+}
+
+static void testSha256() {
+  CHECK(hexOf("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  CHECK(hexOf("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  CHECK(hexOf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+  std::string million(1000000, 'a');
+  CHECK(hexOf(million) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+  // null pointer with length 0 is the empty message
+  CHECK(hex32(sha256(nullptr, 0)) == hexOf(""));
+}
+
+static void testHmac() {
+  // RFC 4231 test cases 1, 2, 3, 4, 6, 7
+  CHECK(hmacHex(std::vector<uint8_t>(20, 0x0b), bytesOf("Hi There")) ==
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+  CHECK(hmacHex(bytesOf("Jefe"), bytesOf("what do ya want for nothing?")) ==
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+  CHECK(hmacHex(std::vector<uint8_t>(20, 0xaa), std::vector<uint8_t>(50, 0xdd)) ==
+        "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+  std::vector<uint8_t> k4(25);
+  for (size_t i = 0; i < k4.size(); ++i) k4[i] = static_cast<uint8_t>(i + 1);
+  CHECK(hmacHex(k4, std::vector<uint8_t>(50, 0xcd)) ==
+        "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b");
+  CHECK(hmacHex(std::vector<uint8_t>(131, 0xaa),
+                bytesOf("Test Using Larger Than Block-Size Key - Hash Key First")) ==
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+  CHECK(hmacHex(std::vector<uint8_t>(131, 0xaa),
+                bytesOf("This is a test using a larger than block-size key and a larger than "
+                        "block-size data. The key needs to be hashed before being used by the "
+                        "HMAC algorithm.")) ==
+        "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+}
+
+static void testAuthMac() {
+  Key32 key; for (size_t i = 0; i < key.size(); ++i) key[i] = static_cast<uint8_t>(0x40 + i);
+  Id16 ph = makeId(1), cl = makeId(50), no = makeId(99);
+  Key32 m = authMac(key, ph, cl, no);
+  CHECK(m == authMac(key, ph, cl, no));
+  // matches the documented construction
+  std::vector<uint8_t> msg = bytesOf("OWC-AUTH-2");
+  CHECK(msg.size() == 10);
+  msg.insert(msg.end(), ph.begin(), ph.end());
+  msg.insert(msg.end(), cl.begin(), cl.end());
+  msg.insert(msg.end(), no.begin(), no.end());
+  CHECK(m == hmacSha256(key.data(), key.size(), msg.data(), msg.size()));
+  // every input byte matters
+  for (size_t i = 0; i < kKeySize; ++i) { Key32 k = key; k[i] ^= 1; CHECK(authMac(k, ph, cl, no) != m); }
+  for (size_t i = 0; i < kIdSize; ++i) {
+    Id16 x = ph; x[i] ^= 1; CHECK(authMac(key, x, cl, no) != m);
+    x = cl; x[i] ^= 1; CHECK(authMac(key, ph, x, no) != m);
+    x = no; x[i] ^= 1; CHECK(authMac(key, ph, cl, x) != m);
+  }
+  // roles are not interchangeable
+  CHECK(authMac(key, cl, ph, no) != m);
+}
+
+static void testCtEqualHex() {
+  const uint8_t a[4] = {1, 2, 3, 4};
+  uint8_t b[4] = {1, 2, 3, 4};
+  CHECK(constantTimeEqual(a, b, 4));
+  CHECK(constantTimeEqual(a, b, 0));
+  for (size_t i = 0; i < 4; ++i) {
+    uint8_t c[4] = {1, 2, 3, 4};
+    c[i] ^= 0x80;
+    CHECK(!constantTimeEqual(a, c, 4));
+  }
+  CHECK(constantTimeEqual(a, b, 3));
+  // hex
+  const uint8_t d[5] = {0x00, 0x0f, 0xa5, 0xff, 0x10};
+  std::string h = toHex(d, 5);
+  CHECK(h == "000fa5ff10");
+  CHECK(toHex(d, 0).empty());
+  uint8_t o[5] = {};
+  CHECK(fromHex(h, o, 5) && std::memcmp(o, d, 5) == 0);
+  uint8_t o2[5] = {};
+  CHECK(fromHex("000FA5Ff10", o2, 5) && std::memcmp(o2, d, 5) == 0);
+  uint8_t e0[1] = {0x77};
+  CHECK(fromHex("", e0, 0) && e0[0] == 0x77);
+  // bad input: wrong length, odd length, bad characters; `out` untouched
+  uint8_t z[5]; std::memset(z, 0x5A, 5);
+  const char* bad[] = {"000fa5ff1", "000fa5ff100", "000fa5ff1g", "00 fa5ff10", "0x0fa5ff10", "", "000fa5ff1\0"};
+  for (const char* s : bad) {
+    CHECK(!fromHex(s, z, 5));
+    bool same = true;
+    for (int i = 0; i < 5; ++i) same = same && z[i] == 0x5A;
+    CHECK(same);
+  }
+  // bad character in the LAST position must not leave a partial write either
+  CHECK(!fromHex(std::string("0102030405").replace(9, 1, "z"), z, 5) && z[0] == 0x5A);
+  // full-size key roundtrip
+  Key32 k = sha256(d, 5), k2{};
+  CHECK(fromHex(hex32(k), k2.data(), k2.size()) && k == k2);
+}
+
+static void testPairMessages() {
+  {  // PairCode
+    PairCode m; m.code = "042917";
+    auto e = encode(m);
+    CHECK(e.size() == 2 + 6 && e[0] == 6 && e[1] == 0);
+    PairCode o; CHECK(decode(e.data(), e.size(), o) && o.code == "042917");
+    checkTruncations<PairCode>(e);
+    PairCode empty; auto ee = encode(empty);
+    PairCode oe; oe.code = "x";
+    CHECK(decode(ee.data(), ee.size(), oe) && oe.code.empty());
+    // a failed decode does not clobber the destination
+    PairCode keep; keep.code = "keep";
+    CHECK(!decode(e.data(), e.size() - 1, keep) && keep.code == "keep");
+  }
+  {  // AuthProof
+    AuthProof m; for (size_t i = 0; i < 32; ++i) m.mac[i] = static_cast<uint8_t>(i * 3 + 1);
+    auto e = encode(m);
+    CHECK(e.size() == 32);
+    AuthProof o; CHECK(decode(e.data(), e.size(), o) && o.mac == m.mac);
+    checkTruncations<AuthProof>(e);
+  }
+  {  // AuthResult
+    AuthResult m; m.status = AuthStatus::CodeShown; m.attempts_left = 3; m.seconds = 0x0102;
+    for (size_t i = 0; i < 32; ++i) m.key[i] = static_cast<uint8_t>(0xF0 - i);
+    auto e = encode(m);
+    CHECK(e.size() == 36 && e[0] == 1 && e[1] == 3 && e[2] == 0x02 && e[3] == 0x01 && e[4] == 0xF0);
+    AuthResult o; CHECK(decode(e.data(), e.size(), o));
+    CHECK(o.status == AuthStatus::CodeShown && o.attempts_left == 3 && o.seconds == 0x0102 &&
+          o.key == m.key);
+    checkTruncations<AuthResult>(e);
+    AuthResult z; z.status = AuthStatus::Locked; z.seconds = 30;
+    auto ez = encode(z);
+    AuthResult oz; oz.key[0] = 9;
+    CHECK(decode(ez.data(), ez.size(), oz) && oz.status == AuthStatus::Locked && oz.seconds == 30 &&
+          oz.key == Key32{});
+  }
+}
+
+static void testHelloV2() {
+  Hello h; h.client_name = "pc"; h.transport = VideoTransport::Tcp; h.client_id = makeId(0x11);
+  auto e = encode(h);
+  CHECK(e.size() == 4 + 2 + 1 + 2 + 2 + kIdSize);
+  Hello o; CHECK(decode(e.data(), e.size(), o));
+  CHECK(o.version == 2 && o.client_name == "pc" && o.client_id == h.client_id);
+  // v1-style payload (no trailer) decodes with zero id, even into a dirty destination
+  std::vector<uint8_t> v1(e.begin(), e.end() - kIdSize);
+  Hello o1; o1.client_id = makeId(5);
+  CHECK(decode(v1.data(), v1.size(), o1) && o1.client_id == Id16{} && o1.client_name == "pc");
+  // partial trailer (1..15 bytes) behaves like absent
+  for (size_t extra = 1; extra < kIdSize; ++extra) {
+    Hello op; op.client_id = makeId(5);
+    CHECK(decode(e.data(), v1.size() + extra, op) && op.client_id == Id16{} && op.client_name == "pc");
+  }
+}
+
+static void testHelloAckV2() {
+  HelloAck a; a.status = HelloStatus::AuthRequired; a.session_id = 77; a.device_name = "Pixel";
+  a.model = "P7"; a.android_api = 34; a.codec_mask = 3;
+  a.phone_id = makeId(0x21); a.nonce = makeId(0x31); a.paired = true;
+  auto e = encode(a);
+  HelloAck o; CHECK(decode(e.data(), e.size(), o));
+  CHECK(o.status == HelloStatus::AuthRequired && o.session_id == 77 && o.device_name == "Pixel" &&
+        o.model == "P7" && o.android_api == 34 && o.codec_mask == 3);
+  CHECK(o.phone_id == a.phone_id && o.nonce == a.nonce && o.paired);
+  a.paired = false;
+  auto en = encode(a);
+  HelloAck on; on.paired = true; CHECK(decode(en.data(), en.size(), on) && !on.paired);
+  // v1-style payload: zeros/false (dirty destination is reset)
+  const size_t trailer = 2 * kIdSize + 1;
+  std::vector<uint8_t> v1(e.begin(), e.end() - trailer);
+  HelloAck o1; o1.phone_id = makeId(1); o1.nonce = makeId(2); o1.paired = true;
+  CHECK(decode(v1.data(), v1.size(), o1) && o1.phone_id == Id16{} && o1.nonce == Id16{} && !o1.paired);
+  CHECK(o1.codec_mask == 3 && o1.device_name == "Pixel");
+  // any partial trailer behaves like absent
+  for (size_t extra = 1; extra < trailer; ++extra) {
+    HelloAck op; op.paired = true; op.phone_id = makeId(1);
+    CHECK(decode(e.data(), v1.size() + extra, op) && op.phone_id == Id16{} && op.nonce == Id16{} &&
+          !op.paired);
   }
 }
 
@@ -1706,6 +1910,13 @@ static void run(const char* name, void (*fn)()) {
 
 int main() {
   run("messages", testMessages);
+  run("sha256", testSha256);
+  run("hmac-sha256", testHmac);
+  run("auth mac", testAuthMac);
+  run("ct-equal + hex", testCtEqualHex);
+  run("pairing messages", testPairMessages);
+  run("hello v2", testHelloV2);
+  run("hello-ack v2", testHelloAckV2);
   run("tcp framing", testTcp);
   run("udp header + packetize", testUdp);
   run("frame assembler", testAssembler);

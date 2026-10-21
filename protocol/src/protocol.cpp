@@ -1,6 +1,7 @@
 #include "owc/protocol.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 namespace owc {
@@ -27,6 +28,8 @@ struct Writer {
     u16(static_cast<uint32_t>(n));
     b.insert(b.end(), s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n));
   }
+  template <size_t N>
+  void raw(const std::array<uint8_t, N>& a) { b.insert(b.end(), a.begin(), a.end()); }
 };
 
 // ------------------------------------------------------------------ reader
@@ -72,6 +75,14 @@ struct Reader {
     if (!need(len)) return false;
     s.assign(reinterpret_cast<const char*>(p + pos), len);
     pos += len;
+    return true;
+  }
+  // Fixed-size raw byte array; on truncation `a` is left untouched and ok = false.
+  template <size_t N>
+  bool raw(std::array<uint8_t, N>& a) {
+    if (!need(N)) return false;
+    std::memcpy(a.data(), p + pos, N);
+    pos += N;
     return true;
   }
 };
@@ -178,6 +189,7 @@ bool getDesc(Reader& r, ParamDesc& d) {
 std::vector<uint8_t> encode(const Hello& m) {
   std::vector<uint8_t> b; Writer w{b};
   w.u32(m.magic); w.u16(m.version); w.u8(static_cast<uint8_t>(m.transport)); w.str(m.client_name);
+  w.raw(m.client_id);
   return b;
 }
 bool decode(const uint8_t* p, size_t n, Hello& m) {
@@ -185,6 +197,9 @@ bool decode(const uint8_t* p, size_t n, Hello& m) {
   m.magic = r.u32(); m.version = r.u16();
   m.transport = static_cast<VideoTransport>(r.u8());
   r.str(m.client_name);
+  // v2 trailer: absent (v1 peer) or partial -> all zeros, never a partial read.
+  m.client_id = Id16{};
+  if (r.ok && r.left() >= kIdSize) r.raw(m.client_id);
   return r.ok;
 }
 
@@ -193,6 +208,7 @@ std::vector<uint8_t> encode(const HelloAck& m) {
   w.u32(m.magic); w.u16(m.version); w.u8(static_cast<uint8_t>(m.status));
   w.u32(m.session_id); w.u16(m.udp_port); w.str(m.device_name); w.str(m.model);
   w.u16(m.android_api); w.u32(m.codec_mask);
+  w.raw(m.phone_id); w.raw(m.nonce); w.u8(m.paired ? 1 : 0);
   return b;
 }
 bool decode(const uint8_t* p, size_t n, HelloAck& m) {
@@ -202,7 +218,51 @@ bool decode(const uint8_t* p, size_t n, HelloAck& m) {
   m.session_id = r.u32(); m.udp_port = r.u16();
   r.str(m.device_name); r.str(m.model);
   m.android_api = r.u16(); m.codec_mask = r.u32();
+  // v2 trailer (phone_id, nonce, paired): all-or-nothing, else zeros/false.
+  m.phone_id = Id16{}; m.nonce = Id16{}; m.paired = false;
+  if (r.ok && r.left() >= 2 * kIdSize + 1) {
+    r.raw(m.phone_id); r.raw(m.nonce); m.paired = r.u8() != 0;
+  }
   return r.ok;
+}
+
+std::vector<uint8_t> encode(const PairCode& m) {
+  std::vector<uint8_t> b; Writer w{b}; w.str(m.code); return b;
+}
+bool decode(const uint8_t* p, size_t n, PairCode& m) {
+  Reader r(p, n);
+  std::string s;
+  if (!r.str(s)) return false;
+  m.code = std::move(s);
+  return true;
+}
+
+std::vector<uint8_t> encode(const AuthProof& m) {
+  std::vector<uint8_t> b; Writer w{b}; w.raw(m.mac); return b;
+}
+bool decode(const uint8_t* p, size_t n, AuthProof& m) {
+  Reader r(p, n);
+  Key32 mac;
+  if (!r.raw(mac)) return false;
+  m.mac = mac;
+  return true;
+}
+
+std::vector<uint8_t> encode(const AuthResult& m) {
+  std::vector<uint8_t> b; Writer w{b};
+  w.u8(static_cast<uint8_t>(m.status)); w.u8(m.attempts_left); w.u16(m.seconds); w.raw(m.key);
+  return b;
+}
+bool decode(const uint8_t* p, size_t n, AuthResult& m) {
+  Reader r(p, n);
+  uint8_t status = r.u8();
+  uint8_t attempts = r.u8();
+  uint16_t seconds = r.u16();
+  Key32 key;
+  if (!r.raw(key)) return false;  // the key is mandatory: no zero-fill on truncation
+  m.status = static_cast<AuthStatus>(status);
+  m.attempts_left = attempts; m.seconds = seconds; m.key = key;
+  return true;
 }
 
 std::vector<uint8_t> encode(const Capabilities& m) {
@@ -485,6 +545,156 @@ bool readUdpHeader(const uint8_t* p, size_t n, UdpHeader& h) {
   h.frame_size = r.u32(); h.capture_ts_us = r.u64(); h.epoch = r.u16(); h.flags = r.u8();
   h.fec_total = r.u8();
   return r.ok;
+}
+
+// ------------------------------------------------------------------ crypto
+// SHA-256 (FIPS 180-4) and HMAC-SHA256 (RFC 2104). Straightforward, not tuned:
+// only handshake-sized inputs go through it.
+namespace {
+constexpr uint32_t kSha256K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+inline uint32_t rotr32(uint32_t x, unsigned k) { return (x >> k) | (x << (32 - k)); }
+
+struct Sha256 {
+  uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  uint8_t buf[64] = {0};
+  size_t buffered = 0;
+  uint64_t total = 0;  // bytes hashed so far
+
+  void block(const uint8_t* p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i)
+      w[i] = (static_cast<uint32_t>(p[4 * i]) << 24) | (static_cast<uint32_t>(p[4 * i + 1]) << 16) |
+             (static_cast<uint32_t>(p[4 * i + 2]) << 8) | static_cast<uint32_t>(p[4 * i + 3]);
+    for (int i = 16; i < 64; ++i) {
+      uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+      uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+      uint32_t ch = (e & f) ^ (~e & g);
+      uint32_t t1 = hh + S1 + ch + kSha256K[i] + w[i];
+      uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t t2 = S0 + maj;
+      hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+
+  void update(const uint8_t* p, size_t n) {
+    if (!p || n == 0) return;
+    total += n;
+    if (buffered) {
+      size_t take = std::min(n, sizeof(buf) - buffered);
+      std::memcpy(buf + buffered, p, take);
+      buffered += take; p += take; n -= take;
+      if (buffered < sizeof(buf)) return;
+      block(buf);
+      buffered = 0;
+    }
+    while (n >= 64) { block(p); p += 64; n -= 64; }
+    if (n) { std::memcpy(buf, p, n); buffered = n; }
+  }
+
+  Key32 finish() {
+    const uint64_t bits = total * 8;
+    uint8_t pad[72] = {0x80};
+    size_t padlen = (buffered < 56 ? 56 : 120) - buffered;
+    for (size_t i = 0; i < 8; ++i)
+      pad[padlen + i] = static_cast<uint8_t>(bits >> (56 - 8 * i));
+    update(pad, padlen + 8);
+    Key32 out;
+    for (size_t i = 0; i < 8; ++i)
+      for (size_t j = 0; j < 4; ++j) out[4 * i + j] = static_cast<uint8_t>(h[i] >> (24 - 8 * j));
+    return out;
+  }
+};
+}  // namespace
+
+Key32 sha256(const uint8_t* p, size_t n) {
+  Sha256 s;
+  s.update(p, n);
+  return s.finish();
+}
+
+Key32 hmacSha256(const uint8_t* key, size_t key_len, const uint8_t* msg, size_t n) {
+  uint8_t k[64] = {0};
+  if (key_len > sizeof(k)) {  // RFC 2104: long keys are hashed first
+    Key32 hk = sha256(key, key_len);
+    std::memcpy(k, hk.data(), hk.size());
+  } else if (key_len && key) {
+    std::memcpy(k, key, key_len);
+  }
+  uint8_t ipad[64], opad[64];
+  for (size_t i = 0; i < 64; ++i) {
+    ipad[i] = static_cast<uint8_t>(k[i] ^ 0x36);
+    opad[i] = static_cast<uint8_t>(k[i] ^ 0x5c);
+  }
+  Sha256 in;
+  in.update(ipad, sizeof(ipad));
+  in.update(msg, n);
+  Key32 inner = in.finish();
+  Sha256 out;
+  out.update(opad, sizeof(opad));
+  out.update(inner.data(), inner.size());
+  return out.finish();
+}
+
+Key32 authMac(const Key32& key, const Id16& phone_id, const Id16& client_id, const Id16& nonce) {
+  // Domain-separation tag: 10 ASCII bytes, no terminator.
+  static const char kTag[] = "OWC-AUTH-2";
+  constexpr size_t kTagLen = sizeof(kTag) - 1;
+  uint8_t msg[kTagLen + 3 * kIdSize];
+  std::memcpy(msg, kTag, kTagLen);
+  std::memcpy(msg + kTagLen, phone_id.data(), kIdSize);
+  std::memcpy(msg + kTagLen + kIdSize, client_id.data(), kIdSize);
+  std::memcpy(msg + kTagLen + 2 * kIdSize, nonce.data(), kIdSize);
+  return hmacSha256(key.data(), key.size(), msg, sizeof(msg));
+}
+
+bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
+  // No early exit: accumulate every difference. volatile keeps the loop honest.
+  volatile uint8_t diff = 0;
+  for (size_t i = 0; i < n; ++i) diff = static_cast<uint8_t>(diff | (a[i] ^ b[i]));
+  return diff == 0;
+}
+
+std::string toHex(const uint8_t* p, size_t n) {
+  static const char kDigits[] = "0123456789abcdef";
+  std::string s;
+  s.reserve(n * 2);
+  for (size_t i = 0; i < n; ++i) {
+    s.push_back(kDigits[p[i] >> 4]);
+    s.push_back(kDigits[p[i] & 0xF]);
+  }
+  return s;
+}
+
+bool fromHex(const std::string& hex, uint8_t* out, size_t n) {
+  if (hex.size() != n * 2) return false;
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (size_t i = 0; i < hex.size(); ++i)
+    if (nib(hex[i]) < 0) return false;  // validate fully before touching `out`
+  for (size_t i = 0; i < n; ++i)
+    out[i] = static_cast<uint8_t>((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1]));
+  return true;
 }
 
 #include "fec.inc.h"
@@ -786,6 +996,10 @@ const char* toString(MsgType t) {
     case MsgType::Hello: return "Hello";
     case MsgType::HelloAck: return "HelloAck";
     case MsgType::Capabilities: return "Capabilities";
+    case MsgType::PairBegin: return "PairBegin";
+    case MsgType::PairCode: return "PairCode";
+    case MsgType::AuthProof: return "AuthProof";
+    case MsgType::AuthResult: return "AuthResult";
     case MsgType::SetParam: return "SetParam";
     case MsgType::ParamState: return "ParamState";
     case MsgType::Command: return "Command";

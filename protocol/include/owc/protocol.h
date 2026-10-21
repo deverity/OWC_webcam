@@ -1,5 +1,6 @@
-// OWC wire protocol v1 — single source of truth shared by the Android NDK core
+// OWC wire protocol v2 — single source of truth shared by the Android NDK core
 // and the Windows client. Portable C++17, no platform headers.
+// v2 = v1 + mandatory pairing/authentication before the session starts.
 //
 // All multi-byte integers are LITTLE-ENDIAN on the wire. Floats are IEEE-754
 // binary32 LE. Strings are u16 byte-length + UTF-8 bytes (no terminator).
@@ -14,8 +15,14 @@
 //         (UDP is not possible over adb; USB always uses Tcp transport).
 //
 // Session flow:
-//   PC  -> Hello            (magic, version, desired transport)
-//   PH  -> HelloAck         (status, session_id, device info, codec mask)
+//   PC  -> Hello            (magic, version, desired transport, client_id)
+//   PH  -> HelloAck         (status=AuthRequired, session_id, device info, codec
+//                            mask, phone_id, nonce, paired)
+//   ---- authentication (see PAIRING below); nothing else is accepted before it
+//   PC  -> AuthProof        (paired: HMAC over the nonce with the stored key)
+//      or PairBegin -> PH AuthResult{CodeShown} -> user types the code shown on
+//         the phone -> PC PairCode -> PH AuthResult{Ok, key} (PC stores the key)
+//   PH  -> AuthResult{Ok}   session is up from here on
 //   PH  -> Capabilities     (cameras + param descriptors of active camera)
 //   PH  -> ParamState*      (optional, current values)
 //   [Udp only] PC sends UdpType::Punch {session_id} every 1 s to phone UDP port;
@@ -32,6 +39,7 @@
 // PC side: decode immediately, present newest frame, never buffer for smoothness.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -44,7 +52,7 @@ namespace owc {
 
 // ---------------------------------------------------------------- constants
 constexpr uint32_t kMagic = 0x3143574Fu;            // "OWC1" read as LE u32
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 constexpr uint16_t kDefaultControlPort = 47800;
 constexpr uint16_t kDefaultVideoUdpPort = 47801;
 constexpr uint16_t kDefaultDiscoveryPort = 47802;
@@ -63,6 +71,10 @@ enum class MsgType : uint16_t {
   Hello = 1,         // PC -> phone
   HelloAck = 2,      // phone -> PC
   Capabilities = 3,  // phone -> PC (resent after camera change)
+  PairBegin = 4,     // PC -> phone (empty payload): show a pairing code
+  PairCode = 5,      // PC -> phone: the code the user typed
+  AuthProof = 6,     // PC -> phone: HMAC proof of a stored pairing key
+  AuthResult = 7,    // phone -> PC
   SetParam = 10,     // PC -> phone
   ParamState = 11,   // phone -> PC (reply to SetParam, or unsolicited change)
   Command = 12,      // PC -> phone
@@ -88,29 +100,123 @@ constexpr uint32_t codecBit(Codec c) { return 1u << static_cast<uint8_t>(c); }
 // and return false on truncation. Hello/HelloAck decode do NOT validate
 // magic/version (the receiver decides).
 //
-// Hello:    u32 magic, u16 version, u8 transport, str client_name
+// Pairing identities and keys (raw bytes; hex in logs/storage).
+constexpr size_t kIdSize = 16;      // client_id / phone_id / nonce
+constexpr size_t kKeySize = 32;     // pairing key / HMAC-SHA256 output
+using Id16 = std::array<uint8_t, kIdSize>;
+using Key32 = std::array<uint8_t, kKeySize>;
+
+// Hello:    u32 magic, u16 version, u8 transport, str client_name,
+//           [v2] u8[16] client_id
+// client_id: random, generated once per PC installation and persisted; it is
+// the identity the phone pairs with. Decode: missing trailer (v1 peer) ->
+// all zeros (the phone then answers VersionMismatch from `version`).
 struct Hello {
   uint32_t magic = kMagic;
   uint16_t version = kProtocolVersion;
   VideoTransport transport = VideoTransport::Tcp;
   std::string client_name;
+  Id16 client_id{};
 };
 
-enum class HelloStatus : uint8_t { Ok = 0, Busy = 1, VersionMismatch = 2, BadMagic = 3 };
+// AuthRequired: v2 answer to every valid Hello; the session only starts after
+// AuthResult{Ok}. A v2 phone never sends Ok in HelloAck.
+enum class HelloStatus : uint8_t {
+  Ok = 0, Busy = 1, VersionMismatch = 2, BadMagic = 3, AuthRequired = 4
+};
 
 // HelloAck: u32 magic, u16 version, u8 status, u32 session_id, u16 udp_port,
-//           str device_name, str model, u16 android_api, u32 codec_mask
+//           str device_name, str model, u16 android_api, u32 codec_mask,
+//           [v2] u8[16] phone_id, u8[16] nonce, u8 paired
+// Decode: missing v2 trailer -> zeros/false.
 struct HelloAck {
   uint32_t magic = kMagic;
   uint16_t version = kProtocolVersion;
   HelloStatus status = HelloStatus::Ok;
-  uint32_t session_id = 0;     // random, nonzero; used in UDP headers
+  uint32_t session_id = 0;     // random, nonzero; used in UDP headers (valid after auth)
   uint16_t udp_port = kDefaultVideoUdpPort;
   std::string device_name;     // user-editable name on phone
   std::string model;           // Build.MODEL
   uint16_t android_api = 0;
   uint32_t codec_mask = 0;     // codecBit(...) of supported HW encoders
+  Id16 phone_id{};             // random, generated once per phone install (persisted)
+  Id16 nonce{};                // random per connection; AuthProof challenge
+  bool paired = false;         // the phone has a key for Hello::client_id
 };
+
+// ---------------------------------------------------------------- PAIRING
+// Every connection (TCP, UDP and USB alike: on the phone any local app could
+// reach 127.0.0.1:47800) must authenticate before the phone accepts anything
+// but PairBegin / PairCode / AuthProof / Bye. Other messages are ignored, UDP
+// punches are not answered and no video is produced until AuthResult{Ok}.
+//
+// Paired PC (has a key for HelloAck::phone_id AND HelloAck::paired):
+//   PC -> AuthProof{ mac = authMac(key, phone_id, client_id, nonce) }
+//   PH -> AuthResult{Ok}                 (key field all zeros)
+//      or AuthResult{NotPaired}          unknown client or wrong mac; the PC
+//         deletes its key for this phone and may send PairBegin on the SAME
+//         connection.
+// Not paired:
+//   PC -> PairBegin
+//   PH -> AuthResult{CodeShown, attempts_left, seconds = code lifetime}
+//         The phone shows a random 6-digit code (notification + in-app).
+//      or AuthResult{Locked, seconds = retry after} and closes (cooldown).
+//   PC -> PairCode{code}                 user typed it on the PC
+//   PH -> AuthResult{Ok, key}            phone stored {client_id, client_name,
+//         key}; PC stores {phone_id, key}. Session is up.
+//      or AuthResult{WrongCode, attempts_left}   (send PairCode again)
+//      or AuthResult{Locked} + close     attempts exhausted
+//      or AuthResult{Expired} + close    code lifetime elapsed
+//      or AuthResult{Rejected} + close   user tapped "cancel" on the phone
+// The pairing stays until the user removes the PC on the phone (the PC then
+// gets NotPaired and must pair again). Removing a PC that is connected drops
+// its session.
+//
+// Phone limits (constants below): kPairCodeAttempts wrong codes per code,
+// code valid kPairCodeLifetimeS, after a Locked no PairBegin is accepted for
+// kPairLockoutS (answered Locked). Unauthenticated connections are closed
+// after kAuthTimeoutS (or when the pending code expires). The phone does not
+// apply its silence timeout before authentication; the PC does not Ping
+// before AuthResult{Ok}.
+constexpr uint8_t kPairCodeDigits = 6;
+constexpr uint8_t kPairCodeAttempts = 3;
+constexpr uint16_t kPairCodeLifetimeS = 120;
+constexpr uint16_t kPairLockoutS = 30;
+constexpr uint16_t kAuthTimeoutS = 10;
+
+enum class AuthStatus : uint8_t {
+  Ok = 0,         // authenticated; key != 0 only right after a pairing
+  CodeShown = 1,  // reply to PairBegin
+  WrongCode = 2,  // attempts_left > 0
+  NotPaired = 3,  // reply to AuthProof: unknown client / bad mac
+  Locked = 4,     // too many wrong codes or PairBegin during lockout; closes
+  Expired = 5,    // code expired; closes
+  Rejected = 6,   // pairing cancelled on the phone; closes
+};
+
+// PairCode:   str code (ASCII digits)
+// AuthProof:  u8[32] mac
+// AuthResult: u8 status, u8 attempts_left, u16 seconds, u8[32] key
+//   seconds: CodeShown = code lifetime, Locked = retry after, else 0.
+struct PairCode { std::string code; };
+struct AuthProof { Key32 mac{}; };
+struct AuthResult {
+  AuthStatus status = AuthStatus::Ok;
+  uint8_t attempts_left = 0;
+  uint16_t seconds = 0;
+  Key32 key{};
+};
+
+// mac = HMAC-SHA256(key, "OWC-AUTH-2" || phone_id || client_id || nonce)
+Key32 authMac(const Key32& key, const Id16& phone_id, const Id16& client_id, const Id16& nonce);
+// Constant-time comparison (use for macs and codes).
+bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n);
+// Lower-case hex of `n` bytes, and back (false on bad length/characters).
+std::string toHex(const uint8_t* p, size_t n);
+bool fromHex(const std::string& hex, uint8_t* out, size_t n);
+// Primitives (exposed for tests): SHA-256 (FIPS 180-4) and HMAC (RFC 2104).
+Key32 sha256(const uint8_t* p, size_t n);
+Key32 hmacSha256(const uint8_t* key, size_t key_len, const uint8_t* msg, size_t n);
 
 enum class Facing : uint8_t { Back = 0, Front = 1, External = 2 };
 
@@ -382,7 +488,13 @@ std::vector<uint8_t> encode(const Pong&);
 std::vector<uint8_t> encode(const Stats&);
 std::vector<uint8_t> encode(const LogMsg&);
 std::vector<uint8_t> encode(const ReceiverReport&);
+std::vector<uint8_t> encode(const PairCode&);
+std::vector<uint8_t> encode(const AuthProof&);
+std::vector<uint8_t> encode(const AuthResult&);
 
+bool decode(const uint8_t* p, size_t n, PairCode&);
+bool decode(const uint8_t* p, size_t n, AuthProof&);
+bool decode(const uint8_t* p, size_t n, AuthResult&);
 bool decode(const uint8_t* p, size_t n, Hello&);
 bool decode(const uint8_t* p, size_t n, HelloAck&);
 bool decode(const uint8_t* p, size_t n, Capabilities&);
