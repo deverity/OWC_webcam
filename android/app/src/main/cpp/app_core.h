@@ -21,6 +21,12 @@
 //   - The encoder output thread uses frameSender_ (raw pointer) which is only
 //     changed by the worker while no encoder is running (start/join order gives
 //     the happens-before), so it needs no lock.
+//   - Session crypto (protocol v3, owc/crypto.h): the worker runs the
+//     Handshake and, on authentication, hands each AEAD direction to exactly
+//     one owner thread: c2p TCP/UDP openers -> owc-net (ClientConn::rx,
+//     published by the rxSealed release store), p2c TCP/UDP sealers -> owc-send
+//     (Sender::setSessionKeys, adopted under the sender mutex). No crypto runs
+//     on owc-enc-out; no extra thread or queue on the video path.
 #pragma once
 
 #include <atomic>
@@ -102,6 +108,8 @@ struct SharedInfo {
     int bitrateKbps = 0;
     uint32_t dropped = 0;
     float encodeLatencyMs = 0;
+    std::string cipher = "none";  // none|aes-128-gcm|chacha20-poly1305 (authenticated session)
+    float sealUsAvg = 0, sealUsMax = 0;  // AEAD time per video frame on the sender thread
   };
   std::mutex statusMu;
   Status status;

@@ -2,12 +2,18 @@
 //
 //   owc_selftest probe          encoder probe: which configure stage/keys work
 //   owc_selftest full [secs]    starts the real server (ports 47810-47812) and
-//                               drives it with an in-process protocol client:
-//                               discovery, handshake, pairing/authentication
-//                               (the code is read from the app event sink),
-//                               busy reject, params, TCP streaming, ping/pong,
-//                               keyframe request, reconfigure, UDP punch +
-//                               fragments + FEC, unpair, cancel, lockout.
+//                               drives it with an in-process protocol v3 client
+//                               (it runs the PC side of owc::Handshake and
+//                               seals/opens every record and datagram):
+//                               discovery, handshake, CPace pairing (the code
+//                               is read from the app event sink), AuthProof,
+//                               cipher negotiation (None / ChaCha20-Poly1305 /
+//                               AES-128-GCM if the CPU has it), busy reject,
+//                               params, TCP streaming, ping/pong, keyframe
+//                               request, reconfigure, tampered/plain records,
+//                               sealed UDP punch + fragments + FEC + replay,
+//                               latency and seal-time comparison per cipher,
+//                               unpair, cancel, lockout.
 //                               Pairing data: /data/local/tmp/owc_selftest_data.
 // Logs go to stderr and logcat (tag OWC).
 #include <arpa/inet.h>
@@ -29,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,6 +43,7 @@
 #include "app_core.h"
 #include "encoder/encoder_options.h"
 #include "encoder/video_encoder.h"
+#include "owc/crypto.h"
 #include "owc/protocol.h"
 #include "util/clock.h"
 #include "util/log.h"
@@ -202,6 +210,8 @@ void runAbrSim() {
 }
 
 // ------------------------------------------------------------------ client helpers
+constexpr uint16_t kCtl = 47810, kUdp = 47811, kDisc = 47812;
+
 struct PrintSink : EventSink {
   struct Ev {
     int type = 0, i = 0;
@@ -262,9 +272,7 @@ int tcpConnect(const char* ip, uint16_t port) {
   return fd;
 }
 
-void sendMsg(int fd, MsgType t, const std::vector<uint8_t>& p) {
-  std::vector<uint8_t> out;
-  appendTcpMessage(out, t, p);
+void sendRaw(int fd, const std::vector<uint8_t>& out) {
   size_t off = 0;
   while (off < out.size()) {
     ssize_t n = send(fd, out.data() + off, out.size() - off, MSG_NOSIGNAL);
@@ -273,17 +281,81 @@ void sendMsg(int fd, MsgType t, const std::vector<uint8_t>& p) {
   }
 }
 
+// What a v3 PC offers by default: everything it can run except None.
+uint32_t defaultMask() { return localCipherMask() & ~cipherBit(Cipher::None); }
+Cipher expectedDefault() { return hardwareAesAvailable() ? Cipher::Aes128Gcm : Cipher::ChaCha20Poly1305; }
+
+// The test plays a PC: one TCP connection plus its v3 handshake state.
 struct Client {
   int fd = -1;
   bool eof = false;
+  bool protoError = false;  // a phone record failed to open / plain after Ok
   TcpFrameParser parser;
   std::vector<std::string> logs;  // every LogMsg text seen by waitFor()
+  // handshake inputs (PC side)
+  Key32 eph{};
+  std::vector<uint8_t> helloBytes, ackBytes;
+  Key32 phoneEph{};
+  Cipher cipher = Cipher::None;
+  std::unique_ptr<Handshake> hs;
+  Key32 yb{};              // the phone's current CPace share
+  bool confirmOk = false;  // phoneConfirm verified on the last AuthResult{Ok}
+  // session crypto after AuthResult{Ok} (cipher != None)
+  bool sealed = false;
+  std::unique_ptr<TcpSealer> tx;
+  std::unique_ptr<TcpOpener> rx;
+  std::unique_ptr<UdpSealer> utx;
+  std::unique_ptr<UdpOpener> urx;
+  TcpFrameParser::Message raw;
+
+  ~Client() { secureWipe(eph.data(), eph.size()); }
+
+  // A Handshake bound to this connection (one per authentication attempt).
+  std::unique_ptr<Handshake> freshHs() {
+    auto h = std::make_unique<Handshake>(Handshake::Role::Pc, eph);
+    if (!h->begin(helloBytes.data(), helloBytes.size(), ackBytes.data(), ackBytes.size(), phoneEph, cipher))
+      return nullptr;
+    return h;
+  }
+  // Switches to sealed records after a verified AuthResult{Ok}.
+  void installKeys() {
+    if (cipher == Cipher::None) return;
+    SessionKeys k = hs->keys();
+    tx = std::make_unique<TcpSealer>();
+    rx = std::make_unique<TcpOpener>();
+    utx = std::make_unique<UdpSealer>();
+    urx = std::make_unique<UdpOpener>();
+    sealed = tx->init(k.c2p_tcp) && rx->init(k.p2c_tcp) && utx->init(k.c2p_udp) && urx->init(k.p2c_udp);
+    secureWipe(&k, sizeof(k));
+  }
+  void send(MsgType t, const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> out;
+    if (sealed) tx->seal(t, p.data(), p.size(), out);
+    else appendTcpMessage(out, t, p);
+    sendRaw(fd, out);
+  }
+  // Pops one parsed message, opening it in a sealed session.
+  bool pop(TcpFrameParser::Message& m) {
+    if (protoError) return false;
+    if (!sealed) return parser.next(m);
+    if (!parser.next(raw)) return false;
+    if (raw.type != MsgType::Sealed || !rx->open(raw, m)) {
+      printf("  [PC] phone record %s failed to open\n", toString(raw.type));
+      protoError = true;
+      return false;
+    }
+    return true;
+  }
+  void drain() {
+    TcpFrameParser::Message m;
+    while (pop(m)) {}
+  }
   // Reads until a message arrives or timeout; false on timeout/EOF.
   bool next(TcpFrameParser::Message& m, int timeoutMs) {
     int64_t end = monoMs() + timeoutMs;
     for (;;) {
-      if (parser.next(m)) return true;
-      if (eof) return false;
+      if (pop(m)) return true;
+      if (eof || protoError) return false;
       int left = static_cast<int>(end - monoMs());
       if (left <= 0) return false;
       pollfd p{fd, POLLIN, 0};
@@ -301,11 +373,17 @@ struct Client {
   bool waitClosed(int timeoutMs) {
     TcpFrameParser::Message m;
     int64_t end = monoMs() + timeoutMs;
-    while (!eof && monoMs() < end) next(m, static_cast<int>(std::max<int64_t>(1, end - monoMs())));
+    while (!eof && monoMs() < end) {
+      if (protoError) {  // keep reading raw bytes until EOF
+        parser = TcpFrameParser();
+        sealed = false;
+        protoError = false;
+      }
+      next(m, static_cast<int>(std::max<int64_t>(1, end - monoMs())));
+    }
     return eof;
   }
-  bool waitFor(MsgType t, TcpFrameParser::Message& m, int timeoutMs,
-               std::map<MsgType, int>* seen = nullptr) {
+  bool waitFor(MsgType t, TcpFrameParser::Message& m, int timeoutMs, std::map<MsgType, int>* seen = nullptr) {
     int64_t end = monoMs() + timeoutMs;
     while (monoMs() < end) {
       if (!next(m, static_cast<int>(end - monoMs()))) return false;
@@ -322,6 +400,8 @@ struct Client {
     return false;
   }
 };
+
+void sendMsg(Client& c, MsgType t, const std::vector<uint8_t>& p) { c.send(t, p); }
 
 std::string wlanIp() {
   ifaddrs* ifs = nullptr;
@@ -342,7 +422,7 @@ void setParam(Client& c, ParamId id, ParamValue v, ParamState* out = nullptr) {
   SetParam sp;
   sp.id = id;
   sp.value = v;
-  sendMsg(c.fd, MsgType::SetParam, encode(sp));
+  sendMsg(c, MsgType::SetParam, encode(sp));
   TcpFrameParser::Message m;
   int64_t end = monoMs() + 2000;
   while (monoMs() < end && c.waitFor(MsgType::ParamState, m, 2000)) {
@@ -359,11 +439,11 @@ void command(Client& c, CommandId id, float x = 0, float y = 0) {
   cmd.cmd = id;
   cmd.x = x;
   cmd.y = y;
-  sendMsg(c.fd, MsgType::Command, encode(cmd));
+  sendMsg(c, MsgType::Command, encode(cmd));
 }
 
 // ------------------------------------------------------------------ pairing helpers
-// The test plays a PC: identity persisted "on the PC" = client id + key per phone.
+// Identity persisted "on the PC" = client id + key per phone.
 struct PcIdentity {
   Id16 id{};
   Key32 key{};
@@ -375,37 +455,71 @@ bool isZero(const std::array<uint8_t, N>& a) {
   return std::all_of(a.begin(), a.end(), [](uint8_t b) { return b == 0; });
 }
 
-// Connect + Hello; true when HelloAck{AuthRequired} arrives.
+// Connect + v3 Hello (fresh ephemeral key, `mask` offered); true when
+// HelloAck{AuthRequired} arrives (its exact bytes feed the handshake).
 bool helloAuth(Client& c, const std::string& ip, uint16_t port, const PcIdentity& pc, VideoTransport tr,
-               const char* name, HelloAck& ack) {
+               const char* name, HelloAck& ack, uint32_t mask = defaultMask()) {
   c.fd = tcpConnect(ip.c_str(), port);
   if (c.fd < 0) return false;
+  arc4random_buf(c.eph.data(), c.eph.size());
   Hello h;
   h.client_name = name;
   h.transport = tr;
   h.client_id = pc.id;
-  sendMsg(c.fd, MsgType::Hello, encode(h));
+  h.eph_pub = Handshake(Handshake::Role::Pc, c.eph).ephPublic();
+  h.cipher_mask = mask;
+  c.helloBytes = encode(h);
+  sendMsg(c, MsgType::Hello, c.helloBytes);
   TcpFrameParser::Message m;
-  return c.waitFor(MsgType::HelloAck, m, 8000) && decode(m.payload.data(), m.payload.size(), ack) &&
-         ack.status == HelloStatus::AuthRequired;
+  if (!c.waitFor(MsgType::HelloAck, m, 8000) || !decode(m.payload.data(), m.payload.size(), ack)) return false;
+  if (ack.status != HelloStatus::AuthRequired) return false;
+  c.ackBytes = m.payload;
+  c.phoneEph = ack.eph_pub;
+  c.cipher = static_cast<Cipher>(ack.cipher);
+  c.hs = c.freshHs();
+  return c.hs != nullptr;
 }
 
+// Reads the next AuthResult. CodeShown/WrongCode: remembers Yb. Ok: verifies
+// the phone's confirmation (as a real PC must) and switches to sealed records.
 bool readAuth(Client& c, AuthResult& r, int timeoutMs = 3000) {
   TcpFrameParser::Message m;
-  return c.waitFor(MsgType::AuthResult, m, timeoutMs) && decode(m.payload.data(), m.payload.size(), r);
+  if (!c.waitFor(MsgType::AuthResult, m, timeoutMs) || !decode(m.payload.data(), m.payload.size(), r)) return false;
+  if (r.status == AuthStatus::CodeShown || r.status == AuthStatus::WrongCode) c.yb = r.cpace_pub;
+  if (r.status == AuthStatus::Ok) {
+    c.confirmOk = false;
+    if (c.hs && c.hs->ready()) {
+      const Key32 expect = c.hs->phoneConfirm();
+      c.confirmOk = constantTimeEqual(expect.data(), r.confirm.data(), kKeySize);
+    }
+    if (c.confirmOk) c.installKeys();
+  }
+  return true;
 }
 
-void sendProof(Client& c, const PcIdentity& pc, const HelloAck& ack, bool corrupt = false) {
+void sendProof(Client& c, const PcIdentity& pc, bool corrupt = false) {
+  c.hs = c.freshHs();
   AuthProof p;
-  p.mac = authMac(pc.key, ack.phone_id, pc.id, ack.nonce);
-  if (corrupt) p.mac[0] ^= 1;
-  sendMsg(c.fd, MsgType::AuthProof, encode(p));
+  if (c.hs) {
+    c.hs->usePairingKey(pc.key);
+    p.confirm = c.hs->pcConfirm();
+  }
+  if (corrupt) p.confirm[0] ^= 1;
+  sendMsg(c, MsgType::AuthProof, encode(p));
 }
 
+// The user typed `code`: CPace with the phone's current Yb, prove the result.
 void sendCode(Client& c, const std::string& code) {
+  c.hs = c.freshHs();
   PairCode pc;
-  pc.code = code;
-  sendMsg(c.fd, MsgType::PairCode, encode(pc));
+  if (c.hs) {
+    Key32 rnd;
+    arc4random_buf(rnd.data(), rnd.size());
+    pc.cpace_pub = c.hs->cpaceStart(code, rnd);
+    c.hs->cpaceFinish(c.yb);
+    pc.confirm = c.hs->pcConfirm();
+  }
+  sendMsg(c, MsgType::PairCode, encode(pc));
 }
 
 std::string wrongCode(std::string code) {
@@ -416,9 +530,12 @@ std::string wrongCode(std::string code) {
 
 std::string codeFrom(const PrintSink::Ev& ev) { return ev.s.substr(0, ev.s.find('\n')); }
 
-// UDP Punch with `sid`; true if a matching PunchAck arrives within timeoutMs.
-bool punch(const std::string& ip, uint16_t port, uint32_t sid, int timeoutMs) {
-  int us = socket(AF_INET, SOCK_DGRAM, 0);
+// UDP punches. Auto = sealed with the session key when the session is sealed;
+// Plain = v1 header only; WrongKey = sealed with a random key.
+enum class PunchKind { Auto, Plain, WrongKey };
+
+void sendPunch(int sock, const std::string& ip, uint16_t port, uint32_t sid, Client* sess,
+               PunchKind kind = PunchKind::Auto) {
   sockaddr_in pa{};
   pa.sin_family = AF_INET;
   pa.sin_port = htons(port);
@@ -426,20 +543,46 @@ bool punch(const std::string& ip, uint16_t port, uint32_t sid, int timeoutMs) {
   UdpHeader ph;
   ph.type = UdpType::Punch;
   ph.session_id = sid;
-  uint8_t pd[kUdpHeaderSize];
+  uint8_t pd[kUdpHeaderSize + kUdpSealOverhead];
   writeUdpHeader(ph, pd);
-  sendto(us, pd, sizeof(pd), 0, reinterpret_cast<sockaddr*>(&pa), sizeof(pa));
-  bool ok = false;
-  const int64_t end = monoMs() + timeoutMs;
-  while (!ok && monoMs() < end) {
-    pollfd pp{us, POLLIN, 0};
-    if (poll(&pp, 1, static_cast<int>(std::max<int64_t>(1, end - monoMs()))) <= 0) break;
-    uint8_t b[64];
-    ssize_t n = recv(us, b, sizeof(b), 0);
-    UdpHeader rh;
-    ok = n > 0 && readUdpHeader(b, static_cast<size_t>(n), rh) && rh.type == UdpType::PunchAck &&
-         rh.session_id == sid;
+  size_t n = kUdpHeaderSize;
+  if (kind == PunchKind::Auto && sess && sess->sealed) {
+    n = sess->utx->seal(pd, n, sizeof(pd));
+  } else if (kind == PunchKind::WrongKey) {
+    TrafficKey k;
+    k.cipher = sess && sess->cipher != Cipher::None ? sess->cipher : Cipher::ChaCha20Poly1305;
+    arc4random_buf(k.key.data(), k.key.size());
+    arc4random_buf(k.iv.data(), k.iv.size());
+    UdpSealer bad;
+    if (bad.init(k)) n = bad.seal(pd, n, sizeof(pd));
+    secureWipe(&k, sizeof(k));
   }
+  sendto(sock, pd, n, 0, reinterpret_cast<sockaddr*>(&pa), sizeof(pa));
+}
+
+// A PunchAck for `sid` that (in a sealed session) opens with the phone's key.
+bool waitPunchAck(int sock, uint32_t sid, Client* sess, int timeoutMs) {
+  const int64_t end = monoMs() + timeoutMs;
+  while (monoMs() < end) {
+    pollfd pp{sock, POLLIN, 0};
+    if (poll(&pp, 1, static_cast<int>(std::max<int64_t>(1, end - monoMs()))) <= 0) break;
+    uint8_t b[kUdpMaxDatagram];
+    ssize_t n = recv(sock, b, sizeof(b), 0);
+    if (n <= 0) continue;
+    size_t len = static_cast<size_t>(n);
+    if (sess && sess->sealed && !sess->urx->open(b, len, len)) continue;
+    UdpHeader rh;
+    if (readUdpHeader(b, len, rh) && rh.type == UdpType::PunchAck && rh.session_id == sid) return true;
+  }
+  return false;
+}
+
+// One punch from a throwaway socket; true if a valid PunchAck arrives.
+bool punch(const std::string& ip, uint16_t port, uint32_t sid, int timeoutMs, Client* sess = nullptr,
+           PunchKind kind = PunchKind::Auto) {
+  int us = socket(AF_INET, SOCK_DGRAM, 0);
+  sendPunch(us, ip, port, sid, sess, kind);
+  const bool ok = waitPunchAck(us, sid, sess, timeoutMs);
   close(us);
   return ok;
 }
@@ -455,9 +598,121 @@ bool containsCode(const std::string& text, const std::string& code) {
   return false;
 }
 
+double jsonNum(const std::string& s, const char* key) {
+  const std::string k = std::string("\"") + key + "\":";
+  const size_t p = s.find(k);
+  return p == std::string::npos ? 0.0 : atof(s.c_str() + p + k.size());
+}
+
+std::string jsonStr(const std::string& s, const char* key) {
+  const std::string k = std::string("\"") + key + "\":\"";
+  const size_t p = s.find(k);
+  if (p == std::string::npos) return "";
+  const size_t e = s.find('"', p + k.size());
+  return s.substr(p + k.size(), e == std::string::npos ? std::string::npos : e - p - k.size());
+}
+
+// ------------------------------------------------------------------ cipher comparison
+struct StreamRun {
+  bool ok = false;
+  int frames = 0;
+  double latSum = 0, latMax = 0;
+  double sealAvgUs = 0, sealMaxUs = 0;  // phone sender thread, per frame (status JSON)
+  std::string cipher;                   // as reported by the phone's status
+  double latAvg() const { return frames ? latSum / frames : 0.0; }
+};
+
+const char* cipherLabel(Cipher c) {
+  switch (c) {
+    case Cipher::Aes128Gcm: return "aes-128-gcm";
+    case Cipher::ChaCha20Poly1305: return "chacha20-poly1305";
+    case Cipher::None: break;
+  }
+  return "none";
+}
+
+// Authenticates (AuthProof) offering only `want`, streams `ms` and measures
+// capture -> client latency (records/datagrams opened by the PC side).
+StreamRun runStream(AppCore& core, const PcIdentity& pc, Cipher want, VideoTransport tr, const std::string& ip,
+                    int ms) {
+  StreamRun run;
+  Client c;
+  HelloAck a;
+  bool ok = helloAuth(c, ip, kCtl, pc, tr, "selftest-cipher", a, cipherBit(want)) && a.cipher == static_cast<uint8_t>(want);
+  sendProof(c, pc);
+  AuthResult ar;
+  ok = ok && readAuth(c, ar) && ar.status == AuthStatus::Ok && c.confirmOk && c.sealed == (want != Cipher::None);
+  int us = -1;
+  if (ok) {
+    setParam(c, ParamId::Bitrate, ParamValue::Int(8000000));
+    if (tr == VideoTransport::Udp) {
+      us = socket(AF_INET, SOCK_DGRAM, 0);
+      int rcv = 4 << 20;
+      setsockopt(us, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
+      setParam(c, ParamId::FecPercent, ParamValue::Int(20));
+      sendPunch(us, ip, kUdp, a.session_id, &c);
+      ok = waitPunchAck(us, a.session_id, &c, 1000);
+    }
+  }
+  if (ok) {
+    command(c, CommandId::StartStream);
+    TcpFrameParser::Message m;
+    FrameAssembler fa;
+    const int64_t start = monoMs();
+    while (monoMs() - start < ms && !c.eof && !c.protoError) {
+      if (tr == VideoTransport::Tcp) {
+        if (!c.next(m, 200)) continue;
+        VideoFrameHeader vh;
+        const uint8_t* au;
+        size_t n;
+        if (m.type != MsgType::VideoFrame || !decodeVideoFrame(m.payload.data(), m.payload.size(), vh, au, n)) continue;
+        const double lat = (monoUs() - static_cast<int64_t>(vh.capture_ts_us)) / 1000.0;
+        ++run.frames;
+        run.latSum += lat;
+        run.latMax = std::max(run.latMax, lat);
+        continue;
+      }
+      c.drain();
+      pollfd fds[2] = {{us, POLLIN, 0}, {c.fd, POLLIN, 0}};
+      if (poll(fds, 2, 100) <= 0) continue;
+      if (fds[1].revents) {
+        uint8_t b[65536];
+        ssize_t n = recv(c.fd, b, sizeof(b), MSG_DONTWAIT);
+        if (n > 0) c.parser.feed(b, static_cast<size_t>(n));
+        else if (n == 0) c.eof = true;
+      }
+      if (fds[0].revents) {
+        uint8_t b[kUdpMaxDatagram];
+        ssize_t n = recv(us, b, sizeof(b), MSG_DONTWAIT);
+        if (n <= 0) continue;
+        size_t len = static_cast<size_t>(n);
+        if (c.sealed && !c.urx->open(b, len, len)) continue;
+        UdpHeader vh;
+        FrameAssembler::Frame fr;
+        if (!readUdpHeader(b, len, vh) || !fa.push(vh, b + kUdpHeaderSize, len - kUdpHeaderSize, fr)) continue;
+        const double lat = (monoUs() - static_cast<int64_t>(fr.capture_ts_us)) / 1000.0;
+        ++run.frames;
+        run.latSum += lat;
+        run.latMax = std::max(run.latMax, lat);
+      }
+    }
+    const std::string st = core.statusJson();
+    run.sealAvgUs = jsonNum(st, "sealUsAvg");
+    run.sealMaxUs = jsonNum(st, "sealUsMax");
+    run.cipher = jsonStr(st, "cipher");
+    command(c, CommandId::StopStream);
+    sendMsg(c, MsgType::Bye, {});
+    c.waitClosed(3000);
+  }
+  if (us >= 0) close(us);
+  close(c.fd);
+  usleep(300000);
+  run.ok = ok && !c.protoError && run.cipher == cipherLabel(want);
+  return run;
+}
+
 // ------------------------------------------------------------------ full
 void runFull(int secs) {
-  const uint16_t kCtl = 47810, kUdp = 47811, kDisc = 47812;
   const int api = apiLevel();
   PrintSink sink;
   AppCore core;
@@ -472,7 +727,8 @@ void runFull(int secs) {
   o.javaCaps.apiLevel = api;
   o.testSyntheticSource = true;
   std::string err;
-  printf("== full test\n");
+  printf("== full test (protocol v%u, ciphers 0x%x, hardware AES %d)\n", kProtocolVersion, localCipherMask(),
+         hardwareAesAvailable());
   const std::string dataDir = "/data/local/tmp/owc_selftest_data";
   mkdir(dataDir.c_str(), 0700);
   unlink((dataDir + "/owc_pairing.txt").c_str());  // every run starts unpaired
@@ -530,6 +786,19 @@ void runFull(int secs) {
     close(u);
   }
 
+  // --- no common cipher -> VersionMismatch + close
+  {
+    PcIdentity tmp;
+    arc4random_buf(tmp.id.data(), tmp.id.size());
+    Client v;
+    HelloAck va;
+    helloAuth(v, "127.0.0.1", kCtl, tmp, VideoTransport::Tcp, "selftest", va, 1u << 7);
+    CHECK(va.status == HelloStatus::VersionMismatch && v.waitClosed(3000),
+          "Hello without a common cipher -> HelloAck{VersionMismatch} (%d) + close", static_cast<int>(va.status));
+    close(v.fd);
+    usleep(300000);
+  }
+
   // --- TCP session: Hello -> AuthRequired; nothing works before authentication
   PcIdentity pc;
   arc4random_buf(pc.id.data(), pc.id.size());
@@ -538,21 +807,22 @@ void runFull(int secs) {
   TcpFrameParser::Message m;
   const size_t ev0 = sink.count();
   bool gotAck = helloAuth(c, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", ack);
-  CHECK(gotAck && ack.session_id != 0 && !isZero(ack.phone_id) && !isZero(ack.nonce) && !ack.paired,
-        "HelloAck{AuthRequired} session=%08x paired=%d codec_mask=0x%x api=%u", ack.session_id, ack.paired,
-        ack.codec_mask, ack.android_api);
+  CHECK(gotAck && ack.session_id != 0 && !isZero(ack.phone_id) && !isZero(ack.eph_pub) && !ack.paired &&
+            ack.cipher == static_cast<uint8_t>(expectedDefault()),
+        "HelloAck{AuthRequired} session=%08x paired=%d cipher=%s codec_mask=0x%x api=%u", ack.session_id, ack.paired,
+        cipherLabel(static_cast<Cipher>(ack.cipher)), ack.codec_mask, ack.android_api);
   {
     SetParam sp;
     sp.id = ParamId::Bitrate;
     sp.value = ParamValue::Int(6000000);
-    sendMsg(c.fd, MsgType::SetParam, encode(sp));
+    sendMsg(c, MsgType::SetParam, encode(sp));
     command(c, CommandId::StartStream);
     Ping p;
     p.t0_us = static_cast<uint64_t>(monoUs());
-    sendMsg(c.fd, MsgType::Ping, encode(p));
+    sendMsg(c, MsgType::Ping, encode(p));
     Hello dup;
     dup.client_id = pc.id;
-    sendMsg(c.fd, MsgType::Hello, encode(dup));
+    sendMsg(c, MsgType::Hello, encode(dup));
     const bool punched = punch("127.0.0.1", kUdp, ack.session_id, 500);
     int replies = 0;
     while (c.next(m, 700)) ++replies;
@@ -569,14 +839,15 @@ void runFull(int secs) {
     close(b.fd);
   }
   std::string code;
-  {  // pairing: wrong code, then the right one
+  {  // CPace pairing: wrong code (fresh Yb), then the right one
     const size_t mark = sink.count();
-    sendMsg(c.fd, MsgType::PairBegin, {});
+    sendMsg(c, MsgType::PairBegin, {});
     AuthResult r;
     bool ok = readAuth(c, r);
+    const Key32 yb1 = r.cpace_pub;
     CHECK(ok && r.status == AuthStatus::CodeShown && r.attempts_left == kPairCodeAttempts &&
-              r.seconds == kPairCodeLifetimeS,
-          "PairBegin -> CodeShown (%u attempts, %u s)", r.attempts_left, r.seconds);
+              r.seconds == kPairCodeLifetimeS && !isZero(yb1),
+          "PairBegin -> CodeShown (%u attempts, %u s) with a CPace share", r.attempts_left, r.seconds);
     PrintSink::Ev ev;
     ok = sink.wait(kEvPairingCode, mark, 2000, &ev);
     code = ok ? codeFrom(ev) : "";
@@ -585,15 +856,22 @@ void runFull(int secs) {
     CHECK(ok && code.size() == kPairCodeDigits && name == "selftest" && ev.i == kPairCodeLifetimeS,
           "PAIRING_CODE event: %zu digits, PC '%s', %d s", code.size(), name.c_str(), ev.i);
     CHECK(core.statusJson().find("\"state\":\"pairing\"") != std::string::npos, "status state = pairing");
+    sendMsg(c, MsgType::PairBegin, {});
+    ok = readAuth(c, r);
+    CHECK(ok && r.status == AuthStatus::CodeShown && r.cpace_pub == yb1 && r.attempts_left == kPairCodeAttempts,
+          "repeated PairBegin -> same code and CPace share");
     sendCode(c, wrongCode(code));
     ok = readAuth(c, r);
-    CHECK(ok && r.status == AuthStatus::WrongCode && r.attempts_left == kPairCodeAttempts - 1,
-          "wrong code -> WrongCode (%u left)", r.attempts_left);
+    CHECK(ok && r.status == AuthStatus::WrongCode && r.attempts_left == kPairCodeAttempts - 1 && !isZero(r.cpace_pub) &&
+              r.cpace_pub != yb1,
+          "wrong code -> WrongCode (%u left) with a fresh CPace share", r.attempts_left);
     sendCode(c, code);
     ok = readAuth(c, r);
-    CHECK(ok && r.status == AuthStatus::Ok && !isZero(r.key), "right code -> AuthResult{Ok} with a key");
-    pc.key = r.key;
+    CHECK(ok && r.status == AuthStatus::Ok && c.confirmOk && c.sealed,
+          "right code -> AuthResult{Ok}; PC verified phoneConfirm, session sealed (%s)", cipherLabel(c.cipher));
+    pc.key = c.hs ? c.hs->newPairingKey() : Key32{};
     pc.phoneId = ack.phone_id;
+    CHECK(!isZero(pc.key), "PC derived the pairing key (never sent)");
     PrintSink::Ev end;
     CHECK(sink.wait(kEvPairingEnded, mark, 2000, &end) && end.i == kPairingPaired && end.s == "selftest",
           "PAIRING_ENDED paired '%s'", end.s.c_str());
@@ -606,8 +884,8 @@ void runFull(int secs) {
   }
   Capabilities caps;
   bool gotCaps = c.waitFor(MsgType::Capabilities, m, 3000) && decode(m.payload.data(), m.payload.size(), caps);
-  CHECK(gotCaps && !caps.cameras.empty(), "Capabilities: %zu cameras, %zu params, active %u", caps.cameras.size(),
-        caps.params.size(), caps.active_camera);
+  CHECK(gotCaps && !caps.cameras.empty(), "Capabilities (sealed): %zu cameras, %zu params, active %u",
+        caps.cameras.size(), caps.params.size(), caps.active_camera);
   for (const auto& cam : caps.cameras)
     printf("    camera %s facing=%d level=%u orient=%d zoom=%.1f flash=%d sizes=%zu first=%ux%u@%u fpsRanges=%zu\n",
            cam.id.c_str(), static_cast<int>(cam.facing), cam.hw_level, cam.sensor_orientation, cam.max_zoom,
@@ -619,6 +897,8 @@ void runFull(int secs) {
            static_cast<int>(pd.type), pd.flags, pd.min, pd.max, pd.step, static_cast<long long>(pd.current.i),
            pd.current.f, pd.options.size());
   }
+  CHECK(jsonStr(core.statusJson(), "cipher") == cipherLabel(expectedDefault()), "status cipher = %s",
+        jsonStr(core.statusJson(), "cipher").c_str());
 
   // --- busy
   {
@@ -654,12 +934,12 @@ void runFull(int secs) {
   double rttMin = 1e9;
   int stats = 0;
   Stats lastStats;
-  while (monoMs() - start < secs * 1000) {
+  while (monoMs() - start < secs * 1000 && !c.protoError && !c.eof) {
     const int64_t now = monoMs();
     if (now - lastPing > 500) {
       Ping p;
       p.t0_us = static_cast<uint64_t>(monoUs());
-      sendMsg(c.fd, MsgType::Ping, encode(p));
+      sendMsg(c, MsgType::Ping, encode(p));
       lastPing = now;
     }
     if (!keyReqAt && now - start > secs * 500) {
@@ -698,8 +978,8 @@ void runFull(int secs) {
     }
   }
   const double dur = (monoMs() - start) / 1000.0;
-  CHECK(frames > secs * 20, "TCP frames: %d in %.1fs (%.1f fps), %d key, %d with SPS, %.0f kbps", frames, dur,
-        frames / dur, keys, configs, bytes * 8 / dur / 1000);
+  CHECK(frames > secs * 20 && !c.protoError, "TCP frames (sealed): %d in %.1fs (%.1f fps), %d key, %d with SPS, %.0f kbps",
+        frames, dur, frames / dur, keys, configs, bytes * 8 / dur / 1000);
   CHECK(frames > 0 && latMax < 1000, "capture->client latency avg %.1f ms max %.1f ms (same clock)",
         frames ? latSum / frames : 0.0, latMax);
   CHECK(pongs > 0, "Ping/Pong: %d pongs, min RTT %.2f ms", pongs, rttMin);
@@ -742,7 +1022,9 @@ void runFull(int secs) {
           st.dropped_frames, framesAfter, keysAfter, lastLat);
   }
 
-  // --- reconfigure: 1280x720
+  // --- reconfigure: 1280x720 (the phone's TCP sealer must keep counting: a
+  // restarted counter would fail to open here = nonce reuse)
+  const uint64_t ctrBefore = c.rx ? c.rx->counter() : 0;
   setParam(c, ParamId::VideoWidth, ParamValue::Int(1280), &ps);
   setParam(c, ParamId::VideoHeight, ParamValue::Int(720), &ps);
   VideoFormat vf2;
@@ -768,19 +1050,27 @@ void runFull(int secs) {
   while (monoMs() - t2 < 1500)
     if (c.next(m, 200) && m.type == MsgType::VideoFrame) ++f2;
   CHECK(f2 > 20, "frames after reconfigure: %d in 1.5 s", f2);
+  CHECK(c.rx && !c.protoError && c.rx->counter() > ctrBefore + static_cast<uint64_t>(f2),
+        "TCP record counter monotonic across reconfigure + codec switch (%llu -> %llu, all opened)",
+        static_cast<unsigned long long>(ctrBefore), static_cast<unsigned long long>(c.rx ? c.rx->counter() : 0));
   command(c, CommandId::StopStream);
   {
     Command cmd;
     cmd.cmd = CommandId::SetDeviceName;
     cmd.text = "renamed-by-pc";
-    sendMsg(c.fd, MsgType::Command, encode(cmd));
+    sendMsg(c, MsgType::Command, encode(cmd));
     usleep(300000);
     CHECK(sink.has(kEvDeviceName), "Command SetDeviceName -> app event 7 (DEVICE_NAME)");
   }
-  sendMsg(c.fd, MsgType::Bye, {});
+  // Back to the initial stream settings: the cipher comparison below runs on them.
+  setParam(c, ParamId::VideoCodec, ParamValue::EnumV(static_cast<int32_t>(vf.codec)), &ps);
+  setParam(c, ParamId::VideoWidth, ParamValue::Int(vf.width), &ps);
+  setParam(c, ParamId::VideoHeight, ParamValue::Int(vf.height), &ps);
+  setParam(c, ParamId::Zoom, ParamValue::Real(1.0f), &ps);
+  sendMsg(c, MsgType::Bye, {});
   // Expect EOF
   bool eof = !c.waitFor(MsgType::Hello, m, 3000);
-  CHECK(eof, "server closes after Bye");
+  CHECK(eof && !c.protoError, "server closes after Bye (every phone record opened)");
   close(c.fd);
   {
     bool leaked = false;
@@ -795,29 +1085,82 @@ void runFull(int secs) {
     HelloAck a2;
     const size_t mark = sink.count();
     bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a2);
-    CHECK(ok && a2.paired && a2.phone_id == pc.phoneId && a2.nonce != ack.nonce,
-          "reconnect: HelloAck paired=%d, same phone_id, fresh nonce", a2.paired);
-    sendProof(r, pc, a2, true);
+    CHECK(ok && a2.paired && a2.phone_id == pc.phoneId && a2.eph_pub != ack.eph_pub,
+          "reconnect: HelloAck paired=%d, same phone_id, fresh ephemeral key", a2.paired);
+    sendProof(r, pc, true);
     AuthResult ar;
     ok = readAuth(r, ar);
-    CHECK(ok && ar.status == AuthStatus::NotPaired && !r.eof, "bad mac -> NotPaired, connection kept open");
+    CHECK(ok && ar.status == AuthStatus::NotPaired && !r.eof && !r.sealed,
+          "bad confirmation -> NotPaired, connection kept open (plain)");
     CHECK(!punch("127.0.0.1", kUdp, a2.session_id, 400), "punch before authentication not answered");
-    sendProof(r, pc, a2);
+    sendProof(r, pc);
     ok = readAuth(r, ar);
-    CHECK(ok && ar.status == AuthStatus::Ok && isZero(ar.key), "good AuthProof -> Ok (key all zeros)");
+    CHECK(ok && ar.status == AuthStatus::Ok && r.confirmOk && r.sealed,
+          "good AuthProof -> Ok; PC verified phoneConfirm (v3 key from the pairing)");
     Capabilities c2;
     CHECK(r.waitFor(MsgType::Capabilities, m, 3000) && decode(m.payload.data(), m.payload.size(), c2),
-          "Capabilities after AuthProof");
-    CHECK(punch("127.0.0.1", kUdp, a2.session_id, 1000), "punch after authentication answered");
+          "Capabilities after AuthProof (sealed)");
+    CHECK(!punch("127.0.0.1", kUdp, a2.session_id, 500, &r, PunchKind::Plain), "plain punch not answered");
+    CHECK(!punch("127.0.0.1", kUdp, a2.session_id, 500, &r, PunchKind::WrongKey), "wrongly-sealed punch not answered");
+    CHECK(punch("127.0.0.1", kUdp, a2.session_id, 1000, &r), "sealed punch answered with a sealed PunchAck");
     CHECK(!sink.has(kEvPairingCode, mark), "no pairing code shown for a paired PC");
-    sendMsg(r.fd, MsgType::Bye, {});
-    CHECK(r.waitClosed(3000), "closed after Bye");
+    sendMsg(r, MsgType::Bye, {});
+    CHECK(r.waitClosed(3000) && !r.protoError, "closed after Bye");
     close(r.fd);
     usleep(300000);
   }
 
+  // --- a tampered sealed record / a plain message after Ok kill the connection
+  {
+    Client t;
+    HelloAck ta;
+    bool ok = helloAuth(t, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", ta);
+    sendProof(t, pc);
+    AuthResult ar;
+    ok = ok && readAuth(t, ar) && ar.status == AuthStatus::Ok && t.sealed;
+    ok = ok && t.waitFor(MsgType::Capabilities, m, 3000);
+    Ping p;
+    p.t0_us = static_cast<uint64_t>(monoUs());
+    std::vector<uint8_t> rec;
+    if (ok) {
+      const std::vector<uint8_t> pl = encode(p);
+      t.tx->seal(MsgType::Ping, pl.data(), pl.size(), rec);
+      rec[kTcpHeaderSize + 4] ^= 0x20;  // flip one ciphertext bit
+      sendRaw(t.fd, rec);
+    }
+    CHECK(ok && t.waitClosed(3000), "tampered sealed record -> connection dropped");
+    close(t.fd);
+    usleep(300000);
+
+    Client q;
+    ok = helloAuth(q, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", ta);
+    sendProof(q, pc);
+    ok = ok && readAuth(q, ar) && ar.status == AuthStatus::Ok && q.sealed;
+    ok = ok && q.waitFor(MsgType::Capabilities, m, 3000);
+    if (ok) {
+      std::vector<uint8_t> plain;
+      appendTcpMessage(plain, MsgType::Ping, encode(p));
+      sendRaw(q.fd, plain);
+    }
+    CHECK(ok && q.waitClosed(3000), "plain message after AuthResult{Ok} -> connection dropped");
+    close(q.fd);
+    usleep(300000);
+  }
+
+  // --- every cipher, negotiated by restricting the Hello mask (TCP latency + seal cost)
+  std::vector<Cipher> ciphers{Cipher::None, Cipher::ChaCha20Poly1305};
+  if (hardwareAesAvailable()) ciphers.push_back(Cipher::Aes128Gcm);
+  std::vector<StreamRun> tcpRuns;
+  for (Cipher ci : ciphers) {
+    StreamRun run = runStream(core, pc, ci, VideoTransport::Tcp, "127.0.0.1", 3000);
+    CHECK(run.ok && run.frames > 45, "TCP %-17s negotiated: %d frames, latency avg %.1f max %.1f ms, seal %.1f/%.1f us/frame",
+          cipherLabel(ci), run.frames, run.latAvg(), run.latMax, run.sealAvgUs, run.sealMaxUs);
+    tcpRuns.push_back(run);
+  }
+
   // --- UDP session (needs a non-loopback address)
   std::string ip = wlanIp();
+  std::vector<StreamRun> udpRuns;
   if (ip.empty()) {
     printf("  (no non-loopback IPv4: UDP test skipped)\n");
   } else {
@@ -825,43 +1168,26 @@ void runFull(int secs) {
     HelloAck ua;
     bool ok = helloAuth(u, ip, kCtl, pc, VideoTransport::Udp, "selftest-udp", ua);
     CHECK(ok && ua.paired, "UDP session: Hello via %s -> AuthRequired (paired)", ip.c_str());
-    sendProof(u, pc, ua);
+    sendProof(u, pc);
     AuthResult uar;
-    ok = readAuth(u, uar) && uar.status == AuthStatus::Ok;
-    CHECK(ok, "UDP session authenticated with AuthProof");
+    ok = readAuth(u, uar) && uar.status == AuthStatus::Ok && u.confirmOk;
+    CHECK(ok, "UDP session authenticated with AuthProof (%s)", cipherLabel(u.cipher));
     int us = socket(AF_INET, SOCK_DGRAM, 0);
     int rcv = 4 << 20;
     setsockopt(us, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
-    sockaddr_in pa{};
-    pa.sin_family = AF_INET;
-    pa.sin_port = htons(kUdp);
-    inet_pton(AF_INET, ip.c_str(), &pa.sin_addr);
-    UdpHeader ph;
-    ph.type = UdpType::Punch;
-    ph.session_id = ua.session_id;
-    uint8_t pd[kUdpHeaderSize];
-    writeUdpHeader(ph, pd);
-    sendto(us, pd, sizeof(pd), 0, reinterpret_cast<sockaddr*>(&pa), sizeof(pa));
-    bool punchAck = false;
-    pollfd pp{us, POLLIN, 0};
-    if (poll(&pp, 1, 1000) > 0) {
-      uint8_t b[64];
-      ssize_t n = recv(us, b, sizeof(b), 0);
-      UdpHeader rh;
-      punchAck = n > 0 && readUdpHeader(b, static_cast<size_t>(n), rh) && rh.type == UdpType::PunchAck &&
-                 rh.session_id == ua.session_id;
-    }
-    CHECK(punchAck, "PunchAck received");
+    sendPunch(us, ip, kUdp, ua.session_id, &u);
+    CHECK(waitPunchAck(us, ua.session_id, &u, 1000), "sealed PunchAck received");
     setParam(u, ParamId::FecPercent, ParamValue::Int(20), &ps);
     CHECK(ps.status == ParamStatus::Ok, "FecPercent=20 accepted");
     command(u, CommandId::StartStream);
     FrameAssembler fa;
-    int uf = 0, fecDg = 0, dg = 0;
+    int uf = 0, fecDg = 0, dg = 0, badDg = 0;
     uint64_t ubytes = 0;
+    size_t maxDg = 0;
+    std::vector<uint8_t> replay;  // a sealed datagram the opener already accepted
     int64_t us0 = monoMs();
     while (monoMs() - us0 < 4000) {
-      // keep the TCP side drained
-      while (u.parser.next(m)) {}
+      u.drain();  // keep the TCP side drained (opened in order)
       pollfd fds[2] = {{us, POLLIN, 0}, {u.fd, POLLIN, 0}};
       if (poll(fds, 2, 100) <= 0) continue;
       if (fds[1].revents) {
@@ -872,29 +1198,89 @@ void runFull(int secs) {
       if (fds[0].revents) {
         uint8_t b[kUdpMaxDatagram];
         ssize_t n = recv(us, b, sizeof(b), MSG_DONTWAIT);
+        if (n <= 0) continue;
+        size_t len = static_cast<size_t>(n);
+        maxDg = std::max(maxDg, len);
+        std::vector<uint8_t> copy;
+        if (replay.empty() && len > kUdpHeaderSize + kUdpSealOverhead) copy.assign(b, b + len);
+        if (!u.urx->open(b, len, len)) {
+          ++badDg;
+          continue;
+        }
+        if (!copy.empty()) replay = std::move(copy);
         UdpHeader vh;
-        if (n <= 0 || !readUdpHeader(b, static_cast<size_t>(n), vh)) continue;
+        if (!readUdpHeader(b, len, vh)) continue;
         ++dg;
         if (vh.type == UdpType::Fec) ++fecDg;
         FrameAssembler::Frame fr;
-        if (fa.push(vh, b + kUdpHeaderSize, static_cast<size_t>(n) - kUdpHeaderSize, fr)) {
+        if (fa.push(vh, b + kUdpHeaderSize, len - kUdpHeaderSize, fr)) {
           ++uf;
           ubytes += fr.data.size();
         }
       }
     }
-    CHECK(uf > 60, "UDP frames assembled: %d (%d datagrams, %d FEC), %.0f kbps, lost %llu", uf, dg, fecDg,
-          ubytes * 8 / 4.0 / 1000, static_cast<unsigned long long>(fa.counters().frames_lost));
+    CHECK(uf > 60 && badDg == 0, "UDP frames assembled: %d (%d sealed datagrams <= %zu B, %d FEC, %d bad), %.0f kbps, lost %llu",
+          uf, dg, maxDg, fecDg, badDg, ubytes * 8 / 4.0 / 1000, static_cast<unsigned long long>(fa.counters().frames_lost));
     CHECK(fecDg > 0, "FEC datagrams sent after data fragments");
+    CHECK(maxDg <= kUdpMaxDatagram, "sealed datagrams fit kUdpMaxDatagram (%zu <= %zu)", maxDg, kUdpMaxDatagram);
+    {
+      size_t l = 0;
+      const uint64_t rej = u.urx->rejected();
+      const bool replayed = !replay.empty() && u.urx->open(replay.data(), replay.size(), l);
+      CHECK(!replay.empty() && !replayed && u.urx->rejected() == rej + 1, "replayed UDP datagram rejected by the PC opener");
+    }
+    // Punch from a NEW address (video destination moves) + reconfigure: the
+    // phone's UDP sealer must continue its counter (a reset would be nonce
+    // reuse and the PC's replay window would reject the datagrams).
+    {
+      int us2 = socket(AF_INET, SOCK_DGRAM, 0);
+      int rcv2 = 4 << 20;
+      setsockopt(us2, SOL_SOCKET, SO_RCVBUF, &rcv2, sizeof(rcv2));
+      const uint64_t rej0 = u.urx->rejected();
+      sendPunch(us2, ip, kUdp, ua.session_id, &u);
+      const bool acked = waitPunchAck(us2, ua.session_id, &u, 1000);
+      setParam(u, ParamId::VideoWidth, ParamValue::Int(1280), &ps);
+      setParam(u, ParamId::VideoHeight, ParamValue::Int(720), &ps);
+      FrameAssembler fa2;
+      int good = 0, bad = 0, frames2 = 0;
+      const int64_t t3 = monoMs();
+      while (monoMs() - t3 < 3000) {
+        u.drain();
+        pollfd fds[3] = {{us2, POLLIN, 0}, {u.fd, POLLIN, 0}, {us, POLLIN, 0}};
+        if (poll(fds, 3, 100) <= 0) continue;
+        uint8_t b[kUdpMaxDatagram];
+        if (fds[2].revents) recv(us, b, sizeof(b), MSG_DONTWAIT);  // stragglers to the old address
+        if (fds[1].revents) {
+          uint8_t t[65536];
+          ssize_t n = recv(u.fd, t, sizeof(t), MSG_DONTWAIT);
+          if (n > 0) u.parser.feed(t, static_cast<size_t>(n));
+        }
+        if (!fds[0].revents) continue;
+        ssize_t n = recv(us2, b, sizeof(b), MSG_DONTWAIT);
+        if (n <= 0) continue;
+        size_t len = static_cast<size_t>(n);
+        if (!u.urx->open(b, len, len)) {
+          ++bad;
+          continue;
+        }
+        ++good;
+        UdpHeader vh;
+        FrameAssembler::Frame fr;
+        if (readUdpHeader(b, len, vh) && fa2.push(vh, b + kUdpHeaderSize, len - kUdpHeaderSize, fr)) ++frames2;
+      }
+      CHECK(acked && good > 0 && bad == 0 && frames2 > 20 && u.urx->rejected() == rej0,
+            "new punch address + reconfigure: UDP counter continues (%d datagrams opened, %d rejected, %d frames)",
+            good, bad, frames2);
+      setParam(u, ParamId::VideoWidth, ParamValue::Int(vf.width), &ps);
+      setParam(u, ParamId::VideoHeight, ParamValue::Int(vf.height), &ps);
+      close(us);
+      us = us2;
+    }
     printf("  status: %s\n", core.statusJson().c_str());
 
     // ABR: ReceiverReports announcing 15 % fragment loss must lower the bitrate.
     {
-      auto kbps = [&] {
-        std::string s = core.statusJson();
-        size_t p = s.find("\"bitrateKbps\":");
-        return p == std::string::npos ? 0 : atoi(s.c_str() + p + 14);
-      };
+      auto kbps = [&] { return static_cast<int>(jsonNum(core.statusJson(), "bitrateKbps")); };
       const int before = kbps();
       ReceiverReport rr;
       for (int i = 0; i < 8; ++i) {
@@ -902,7 +1288,7 @@ void runFull(int secs) {
         rr.fragments_lost += 15;
         rr.frames_received += 8;
         rr.recv_bitrate_bps = static_cast<uint32_t>(before * 1000);
-        sendMsg(u.fd, MsgType::ReceiverReport, encode(rr));
+        sendMsg(u, MsgType::ReceiverReport, encode(rr));
         int64_t tw = monoMs();
         while (monoMs() - tw < 250) {
           uint8_t b[65536];
@@ -911,27 +1297,43 @@ void runFull(int secs) {
         }
       }
       const int after = kbps();
-      CHECK(after > 0 && after < before, "ABR: 15%% loss lowers bitrate %d -> %d kbps", before, after);
+      CHECK(after > 0 && after < before && !u.protoError, "ABR: 15%% loss lowers bitrate %d -> %d kbps", before, after);
     }
     close(us);
     close(u.fd);  // abrupt close: server must clean up by itself
     usleep(500000);
     printf("  status after abrupt close: %s\n", core.statusJson().c_str());
+
+    for (Cipher ci : ciphers) {
+      StreamRun run = runStream(core, pc, ci, VideoTransport::Udp, ip, 3000);
+      CHECK(run.ok && run.frames > 45, "UDP %-17s negotiated: %d frames, latency avg %.1f max %.1f ms, seal %.1f/%.1f us/frame",
+            cipherLabel(ci), run.frames, run.latAvg(), run.latMax, run.sealAvgUs, run.sealMaxUs);
+      udpRuns.push_back(run);
+    }
   }
+  printf("  -- latency comparison (capture->client, PC side opens; seal = phone sender thread per frame)\n");
+  for (size_t i = 0; i < tcpRuns.size(); ++i)
+    printf("     TCP %-17s avg %6.1f ms  max %6.1f ms  seal avg %7.1f us  max %7.1f us  (%d frames)\n",
+           cipherLabel(ciphers[i]), tcpRuns[i].latAvg(), tcpRuns[i].latMax, tcpRuns[i].sealAvgUs,
+           tcpRuns[i].sealMaxUs, tcpRuns[i].frames);
+  for (size_t i = 0; i < udpRuns.size(); ++i)
+    printf("     UDP %-17s avg %6.1f ms  max %6.1f ms  seal avg %7.1f us  max %7.1f us  (%d frames)\n",
+           cipherLabel(ciphers[i]), udpRuns[i].latAvg(), udpRuns[i].latMax, udpRuns[i].sealAvgUs,
+           udpRuns[i].sealMaxUs, udpRuns[i].frames);
 
   // --- unpairing a connected PC drops its session
   {
     Client r;
     HelloAck a;
     bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
-    sendProof(r, pc, a);
+    sendProof(r, pc);
     AuthResult ar;
-    ok = ok && readAuth(r, ar) && ar.status == AuthStatus::Ok;
+    ok = ok && readAuth(r, ar) && ar.status == AuthStatus::Ok && r.confirmOk;
     CHECK(ok, "authenticated again for the unpair test");
     const size_t mark = sink.count();
     CHECK(core.unpairClient(toHex(pc.id.data(), kIdSize)), "unpairClient(id)");
     const bool bye = r.waitFor(MsgType::Bye, m, 3000);
-    CHECK(bye && r.waitClosed(3000), "unpaired PC: session dropped (Bye + close)");
+    CHECK(bye && r.waitClosed(3000), "unpaired PC: session dropped (sealed Bye + close)");
     CHECK(sink.wait(kEvClientDisconnected, mark, 2000), "CLIENT_DISCONNECTED after unpair");
     CHECK(core.pairedClientsJson() == "[]", "paired list empty after unpair");
     close(r.fd);
@@ -943,13 +1345,13 @@ void runFull(int secs) {
     HelloAck a;
     bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
     CHECK(ok && !a.paired, "after unpair: HelloAck paired=0");
-    sendProof(r, pc, a);
+    sendProof(r, pc);
     AuthResult ar;
     ok = readAuth(r, ar);
     CHECK(ok && ar.status == AuthStatus::NotPaired, "old key -> NotPaired");
     const size_t mark = sink.count();
-    sendMsg(r.fd, MsgType::PairBegin, {});
-    ok = readAuth(r, ar) && ar.status == AuthStatus::CodeShown;
+    sendMsg(r, MsgType::PairBegin, {});
+    ok = readAuth(r, ar) && ar.status == AuthStatus::CodeShown && !isZero(ar.cpace_pub);
     CHECK(ok && sink.wait(kEvPairingCode, mark, 2000), "PairBegin on the same connection -> CodeShown");
     core.cancelPairing();
     ok = readAuth(r, ar);
@@ -966,7 +1368,7 @@ void runFull(int secs) {
     HelloAck a;
     const size_t mark = sink.count();
     bool ok = helloAuth(r, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a);
-    sendMsg(r.fd, MsgType::PairBegin, {});
+    sendMsg(r, MsgType::PairBegin, {});
     AuthResult ar;
     ok = ok && readAuth(r, ar) && ar.status == AuthStatus::CodeShown && ar.attempts_left == kPairCodeAttempts;
     PrintSink::Ev ev;
@@ -990,7 +1392,7 @@ void runFull(int secs) {
     HelloAck a2;
     const size_t mark2 = sink.count();
     ok = helloAuth(r2, "127.0.0.1", kCtl, pc, VideoTransport::Tcp, "selftest", a2);
-    sendMsg(r2.fd, MsgType::PairBegin, {});
+    sendMsg(r2, MsgType::PairBegin, {});
     ok = ok && readAuth(r2, ar);
     CHECK(ok && ar.status == AuthStatus::Locked && ar.seconds > 0 && ar.seconds <= kPairLockoutS &&
               r2.waitClosed(3000) && !sink.has(kEvPairingCode, mark2),
@@ -1033,7 +1435,7 @@ int main(int argc, char** argv) {
   else if (mode == "abr") runAbrSim();
   else if (mode == "full") runFull(argc > 2 ? std::max(2, atoi(argv[2])) : 5);
   else {
-    printf("usage: owc_selftest probe | full [secs] [-v]\n");
+    printf("usage: owc_selftest probe | abr | full [secs] [-v]\n");
     return 2;
   }
   printf("== %s: %d failure(s)\n", mode.c_str(), g_fail);

@@ -9,8 +9,9 @@ como webcam virtual (DirectShow) e fonte nativa no OBS.
 ```
 android/                      App Android (Gradle, Kotlin UI fina + NDK core)
   app/src/main/cpp/           Core NDK: câmera (ACamera) -> AMediaCodec (surface) -> rede
-protocol/                     Protocolo binário v1 (C++17 portátil) + testes
+protocol/                     Protocolo binário v3 (C++17 portátil) + testes
   include/owc/protocol.h      CONTRATO — fonte da verdade
+  include/owc/crypto.h        CONTRATO — handshake X25519/CPace, chaves, registros AEAD TCP/UDP
 windows/
   common/include/owc/shm.h    CONTRATO — barramento de frames em memória compartilhada (NV12)
   core/                       owc_core: conexão, depacketizer, decoder MF HW, ShmWriter, adb, discovery
@@ -102,8 +103,25 @@ Pareamento (lado do celular):
 - Arquivo `filesDir/owc_pairing.txt` (texto, gravado de forma atômica: temp + fsync + rename, modo 0600):
   `OWC-PAIRING 1`, `phone_id <hex32>`, uma linha `client <id hex32> <chave hex64> <pareado_em unix s> <nome>`
   por PC (máx. 32; o mais antigo sai). `allowBackup=false` mantém as chaves fora de backups.
+- Protocolo v3 (`owc/crypto.h`): cada conexão usa uma chave X25519 efêmera nova (`arc4random_buf`) e o
+  `th` = SHA-256 dos bytes exatos do Hello recebido e do HelloAck enviado. A cifra é
+  `chooseCipher(Hello.cipher_mask, localCipherMask())` (AES-128-GCM só com AES de hardware, senão
+  ChaCha20-Poly1305; None apenas se o PC oferecer só None); interseção vazia = HelloAck{VersionMismatch} + close.
+  PC pareado: AuthProof traz `pcConfirm()` derivado da chave guardada (chaves v2 continuam válidas, mesmo
+  arquivo); o celular responde `AuthResult{Ok, confirm = phoneConfirm()}` ou NotPaired (conexão segue aberta).
+  Pareamento: CPace — o código de 6 dígitos nunca trafega; CodeShown/WrongCode levam `Yb` (novo a cada
+  tentativa), PairCode traz `Ya` + `pcConfirm()`; confirmação errada ou share inválido = código errado
+  (mesma contagem global). Sucesso grava `newPairingKey()` (a chave nunca vai no fio).
+- Depois de `AuthResult{Ok}` (que vai em claro) TODO o tráfego é cifrado: o celular sela do primeiro
+  envio seguinte em diante (Capabilities, Pong, Log, Stats, VideoFrame, PunchAck, vídeo/FEC UDP; UDP
+  fragmenta com `kUdpMaxPayloadSealed`) e só aceita registros `Sealed` que abram; registro que não abre ou
+  mensagem em claro derruba a conexão; Punch que não abre com a chave da sessão é ignorado (ninguém
+  redireciona o vídeo). Threads: abrir = `owc-net` (TCP e Punch), selar = `owc-send` (nunca a thread de
+  saída do encoder). Segredos são apagados (`secureWipe`/destrutores) ao fim da sessão.
 - Antes de `AuthResult{Ok}` o celular só aceita PairBegin/PairCode/AuthProof/Bye; não responde Ping nem
   Punch UDP (o `session_id` só vale após Ok), não envia Capabilities/Log/Stats e não emite CLIENT_CONNECTED.
+  O PC não deve enviar nada entre AuthProof/PairCode e o AuthResult (o que chegar em claro depois do Ok
+  derruba a conexão).
   Uma conexão não autenticada ocupa a vaga única (outras recebem Busy) e é fechada após `kAuthTimeoutS`
   (ou quando o código expira, `kPairCodeLifetimeS`).
 - Tentativas: os códigos errados contam globalmente até um bloqueio ou um sucesso (esquecidos após 10 min),
@@ -119,12 +137,16 @@ Pareamento (lado do celular):
 [{"id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","name":"PC-SALA","pairedAt":1761000000}]
 ```
 
-`nativeGetStatus()` (`pairing` = conexão não autenticada exibindo um código):
+`nativeGetStatus()` (`pairing` = conexão não autenticada exibindo um código; `cipher` = cifra da sessão
+autenticada, `"none"` fora dela; `sealUsAvg`/`sealUsMax` = tempo de AEAD por quadro de vídeo na thread de
+envio, µs, acumulado na conexão — diagnóstico):
 ```json
 {"state":"idle|listening|pairing|connected|streaming","peer":"192.168.0.10:51234",
  "transport":"tcp|udp","cameraId":"0","width":1920,"height":1080,"fps":30.0,
- "codec":"h264","bitrateKbps":8000,"dropped":0,"encodeLatencyMs":12.5}
+ "codec":"h264","bitrateKbps":8000,"dropped":0,"encodeLatencyMs":12.5,
+ "cipher":"none|aes-128-gcm|chacha20-poly1305","sealUsAvg":45.0,"sealUsMax":180.0}
 ```
+A `MainActivity` mostra "Criptografia: AES-128-GCM" (ou ChaCha20-Poly1305 / nenhuma) quando conectado.
 
 JNI: nomes `Java_com_owc_webcam_NativeBridge_native*` com `jclass` (estático).
 `onNativeEvent` assinatura `(IILjava/lang/String;)V`. O nativo guarda `JavaVM*`

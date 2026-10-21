@@ -84,8 +84,11 @@ std::string AppCore::statusJson() {
   snprintf(num, sizeof(num), ",\"width\":%d,\"height\":%d,\"fps\":%.1f,", s.width, s.height, s.fps);
   o += num;
   o += "\"codec\":" + json::quote(s.codec);
-  snprintf(num, sizeof(num), ",\"bitrateKbps\":%d,\"dropped\":%u,\"encodeLatencyMs\":%.1f}",
-           s.bitrateKbps, s.dropped, s.encodeLatencyMs);
+  snprintf(num, sizeof(num), ",\"bitrateKbps\":%d,\"dropped\":%u,\"encodeLatencyMs\":%.1f,", s.bitrateKbps,
+           s.dropped, s.encodeLatencyMs);
+  o += num;
+  o += "\"cipher\":" + json::quote(s.cipher);
+  snprintf(num, sizeof(num), ",\"sealUsAvg\":%.1f,\"sealUsMax\":%.1f}", s.sealUsAvg, s.sealUsMax);
   o += num;
   return o;
 }

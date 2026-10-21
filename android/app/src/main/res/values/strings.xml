@@ -5,6 +5,8 @@
     <string name="lbl_state">Estado</string>
     <string name="lbl_peer">PC conectado</string>
     <string name="lbl_transport">Transporte</string>
+    <string name="lbl_cipher">Criptografia</string>
+    <string name="cipher_none">nenhuma</string>
     <string name="lbl_video">Vídeo</string>
     <string name="lbl_bitrate">Bitrate</string>
     <string name="lbl_latency">Latência de codificação</string>

@@ -16,6 +16,20 @@
 // TCP backpressure: video is only written while the socket's unsent bytes
 // (SIOCOUTQ) are <= max(1.5 x average frame, 16 KiB); otherwise frames wait in
 // our queue, where the policy above applies (docs/LOW_LATENCY_RESEARCH.md §4).
+//
+// Encryption (protocol v3, owc/crypto.h): ALL sealing happens on this sender
+// thread, never on the encoder output thread. The worker hands the phone->PC
+// keys over with setSessionKeys() before it queues AuthResult{Ok} with
+// startSealing = true; the sender thread adopts them under mu_ together with
+// the next item it pops, so:
+//   - TCP: everything queued before the Ok and the Ok itself go out plain,
+//     every later message (control, Pong, Log, Stats, VideoFrame) is one
+//     sealed record (VideoFrame: TcpSealer::seal2 over header + AU, which
+//     encrypts while copying into sealBuf_: one pass, no extra copy).
+//   - UDP: every datagram sent after the adoption (PunchAck, video, FEC) is
+//     sealed in place in the sendmmsg batch buffer right before it is sent;
+//     sealed sessions fragment with kUdpMaxPayloadSealed.
+// Cipher::None: no keys are handed over and nothing changes.
 #pragma once
 
 #include <netinet/in.h>
@@ -31,11 +45,19 @@
 
 #include "encoder/video_encoder.h"
 #include "net/socket_util.h"
+#include "owc/crypto.h"
 #include "owc/protocol.h"
 
 namespace owc::net {
 
 enum class VideoMode { Tcp, Udp, Pending /* UDP requested, no punch yet: video discarded */ };
+
+// Phone -> PC session crypto (p2c keys). Initialised by the worker, then owned
+// by the sender thread. Aead destructors wipe the key schedules.
+struct TxCrypto {
+  TcpSealer tcp;
+  UdpSealer udp;
+};
 
 class Sender {
  public:
@@ -48,6 +70,11 @@ class Sender {
     uint32_t tcpOutq = 0;         // unsent bytes in the TCP socket
     uint32_t avgFrameBytes = 0;
     int64_t sentLatencyUs = 0;    // EWMA capture -> frame fully handed to the socket
+    // AEAD cost on this thread, per video frame (all its records/datagrams,
+    // FEC included). Cumulative for this connection; only sealed frames count.
+    uint64_t sealFrames = 0;
+    uint64_t sealNsTotal = 0;
+    uint32_t sealNsMax = 0;
   };
 
   Sender(std::shared_ptr<Socket> tcp, int udpFd);
@@ -58,7 +85,16 @@ class Sender {
   void start();
   void stop();  // wakes and joins; does not shut the socket down
 
-  void pushControl(MsgType type, std::vector<uint8_t> payload);
+  // startSealing: this is AuthResult{Ok}; it goes out plain and every TCP
+  // message after it is sealed (if setSessionKeys() was called).
+  void pushControl(MsgType type, std::vector<uint8_t> payload, bool startSealing = false);
+  // Worker, before the Ok is queued and before the session id is published
+  // (so every PunchAck is sealed). Not for Cipher::None. At most ONCE per
+  // Sender (false = already set, keys discarded): a second init would restart
+  // the counters = nonce reuse.
+  bool setSessionKeys(std::unique_ptr<TxCrypto> keys);
+  // Net thread: answer a validated punch (sealed when the session is).
+  void pushPunchAck(const sockaddr_in& to, uint32_t sessionId);
   void pushLog(LogLevel level, const std::string& text);
   // phone_us is stamped at send time as the midpoint of receive and send.
   void pushPong(uint64_t t0, int64_t rxMonoUs);
@@ -83,17 +119,24 @@ class Sender {
     MsgType type;
     std::vector<uint8_t> payload;
     bool pong = false;
+    bool startSealing = false;
+    bool punchAck = false;
     uint64_t t0 = 0;
     int64_t rxUs = 0;
+    sockaddr_in to{};
+    uint32_t sid = 0;
   };
 
   void loop();
+  void adoptKeysLocked();  // sender thread, under mu_
   bool sendCtrl(Ctrl& c);
+  void sendPunchAck(const Ctrl& c);
+  bool sendTcpRecord(MsgType type, const uint8_t* a, size_t an, const uint8_t* b, size_t bn);
   bool drainControl();  // sends all queued control; false on socket failure
   bool sendVideoTcp(const EncodedFrame& f, uint32_t seq);
   bool sendVideoUdp(const EncodedFrame& f, uint32_t seq);
   bool flushBatch();
-  void sendFec(const UdpHeader& base, const uint8_t* au, size_t len);
+  void sendFec(const UdpHeader& base, const uint8_t* au, size_t len, size_t maxPayload);
   uint32_t outq() const;
   void fail(const char* why);
 
@@ -118,6 +161,9 @@ class Sender {
   uint32_t sessionId_ = 0;
   int pacingBps_ = 20000000;
   int fecPct_ = 0;
+  bool okPending_ = false;                // an Ok with startSealing is queued
+  std::unique_ptr<TxCrypto> pendingTx_;   // keys not yet adopted by the sender thread
+  bool keysSet_ = false;                  // setSessionKeys() happened (never again)
   Stats stats_;
 
   std::atomic<bool> dead_{false};
@@ -131,6 +177,10 @@ class Sender {
   int batchCount_ = 0;
   sockaddr_in batchTarget_{};
   int batchRateBps_ = 0;
+  std::unique_ptr<TxCrypto> tx_;  // adopted keys (null: plain session)
+  bool tcpSealed_ = false;        // the Ok went out: TCP records are sealed
+  std::vector<uint8_t> sealBuf_;  // one sealed TCP record (capacity reused)
+  uint64_t frameSealNs_ = 0;      // AEAD time spent on the current video frame
 };
 
 }  // namespace owc::net

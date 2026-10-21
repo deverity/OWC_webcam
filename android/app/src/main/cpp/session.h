@@ -17,6 +17,7 @@
 #include "app_core.h"
 #include "camera/camera_info.h"
 #include "net/net_server.h"
+#include "owc/crypto.h"
 #include "pairing_store.h"
 #include "params.h"
 #include "pipeline.h"
@@ -87,9 +88,15 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   void onAuthProof(const std::vector<uint8_t>& payload);
   void onPairBegin();
   void onPairCode(const std::vector<uint8_t>& payload);
-  void sendAuthResult(AuthStatus st, uint8_t attemptsLeft = 0, uint16_t seconds = 0, const Key32* key = nullptr);
-  void authenticated(const Key32* newKey);  // session starts
+  void sendAuthResult(AuthStatus st, uint8_t attemptsLeft = 0, uint16_t seconds = 0,
+                      const Key32* cpacePub = nullptr, const Key32* confirm = nullptr);
+  void authenticated();                     // session starts (hs_ is ready)
   void endPairing(int outcome);             // clears the pending code, tells the app
+  // A Handshake bound to this connection's Hello/HelloAck (fresh object per
+  // authentication attempt, so no state leaks between AuthProof / CPace tries).
+  std::unique_ptr<Handshake> freshHandshake();
+  bool newCpaceShare();                     // hs_ = fresh, yb_ = cpaceStart(code_, new randomness)
+  void wipeHandshake();                     // secrets of the current connection
   bool codePending() const { return !code_.empty(); }
   void onSetParam(const std::vector<uint8_t>& payload);
   void onCommand(const std::vector<uint8_t>& payload);
@@ -142,8 +149,15 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   // ---- authentication of the current connection
   Id16 clientId_{};
   std::string clientName_;  // sanitized Hello::client_name
-  Id16 nonce_{};
-  Id16 phoneId_{};           // as sent in HelloAck (AuthProof is checked against it)
+  // v3 handshake inputs (owc/crypto.h): exact Hello/HelloAck payload bytes,
+  // the PC's ephemeral key, our ephemeral secret (wiped at the end) and the
+  // negotiated cipher. Never logged.
+  std::vector<uint8_t> helloBytes_, ackBytes_;
+  Key32 peerEph_{};
+  Key32 ephSecret_{};
+  Cipher cipher_ = Cipher::None;
+  std::unique_ptr<Handshake> hs_;
+  Key32 yb_{};               // current CPace share (resent on a repeated PairBegin)
   uint32_t pendingSid_ = 0;  // published in conn_->sessionId only after AuthResult{Ok}
   int64_t authDeadlineMs_ = 0;
   std::string code_;         // pending 6-digit code ("" = none). Never logged.
@@ -175,6 +189,7 @@ class Worker : public net::NetServer::Callbacks, public VideoEncoder::Sink {
   float encodeFps_ = 0;
   bool appStreaming_ = false;  // STREAMING_STARTED sent without STOPPED
   int64_t lastBreakdownMs_ = 0;
+  uint64_t lastSealFrames_ = 0, lastSealNs_ = 0;  // breakdown window of Sender::Stats seal counters
   // Closed-loop correction for encoders that overshoot their target (seen in
   // high-speed mode on OMX.qcom): encoder bitrate = target x rcFactor_.
   double rcFactor_ = 1.0;

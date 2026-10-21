@@ -191,6 +191,21 @@ void NetServer::readClient() {
     }
     TcpFrameParser::Message m;
     while (parser_.next(m)) {
+      if (client_->rxSealed.load(std::memory_order_acquire)) {
+        // Encrypted session: from AuthResult{Ok} on, only records that open.
+        if (m.type != MsgType::Sealed) {
+          LOGW_LOCAL("plain %s after authentication from %s", toString(m.type), client_->peerStr.c_str());
+          dropClient("plain message in an encrypted session");
+          return;
+        }
+        if (!client_->rx->tcp.open(m, opened_)) {
+          LOGW_LOCAL("record %llu from %s failed to open",
+                     static_cast<unsigned long long>(client_->rx->tcp.counter()), client_->peerStr.c_str());
+          dropClient("record failed authentication");
+          return;
+        }
+        std::swap(m, opened_);
+      }
       if (m.type == MsgType::Ping) {
         // Not answered before authentication (sessionId is published by the
         // worker only after AuthResult{Ok}).
@@ -214,22 +229,24 @@ void NetServer::readUdpVideo() {
     ssize_t n = ::recvfrom(udpFd_, buf, sizeof(buf), MSG_DONTWAIT,
                            reinterpret_cast<sockaddr*>(&from), &fl);
     if (n < 0) return;
-    UdpHeader h;
-    if (!readUdpHeader(buf, static_cast<size_t>(n), h) || h.type != UdpType::Punch) continue;
     if (!client_) continue;
-    const uint32_t sid = client_->sessionId.load();
-    if (sid == 0 || h.session_id != sid) {
+    // sessionId first: it is published after rxSealed, so a non-zero id
+    // guarantees an encrypted session's opener is visible.
+    const uint32_t sid = client_->sessionId.load(std::memory_order_acquire);
+    if (sid == 0) continue;  // not authenticated: punches are not answered
+    size_t len = static_cast<size_t>(n);
+    if (client_->rxSealed.load(std::memory_order_acquire) && !client_->rx->udp.open(buf, len, len)) {
+      LOGD("unauthenticated datagram from %s dropped", addrToString(from).c_str());
+      continue;  // only a punch sealed with this session's key may set the video destination
+    }
+    UdpHeader h;
+    if (!readUdpHeader(buf, len, h) || h.type != UdpType::Punch) continue;
+    if (h.session_id != sid) {
       LOGD("punch with wrong session id %08x from %s", h.session_id, addrToString(from).c_str());
       continue;
     }
     client_->sender->setUdpTarget(from, sid);
-    UdpHeader ack;
-    ack.type = UdpType::PunchAck;
-    ack.session_id = sid;
-    uint8_t out[kUdpHeaderSize];
-    writeUdpHeader(ack, out);
-    ::sendto(udpFd_, out, sizeof(out), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&from),
-             sizeof(from));
+    client_->sender->pushPunchAck(from, sid);  // the sender seals it (p2c UDP key)
     cb_->onPunch(client_->gen, from);
   }
 }

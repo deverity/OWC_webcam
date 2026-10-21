@@ -463,6 +463,15 @@ class MainActivity : Activity() {
                 sb.append(getString(R.string.lbl_peer)).append(": ").append(peer).append('\n')
                 sb.append(getString(R.string.lbl_transport)).append(": ")
                     .append(j.optString("transport", "-").uppercase(Locale.ROOT)).append('\n')
+                val st = j.optString("state")
+                if (st == "connected" || st == "streaming") {
+                    val cipher = when (j.optString("cipher", "none")) {
+                        "aes-128-gcm" -> "AES-128-GCM"
+                        "chacha20-poly1305" -> "ChaCha20-Poly1305"
+                        else -> getString(R.string.cipher_none)
+                    }
+                    sb.append(getString(R.string.lbl_cipher)).append(": ").append(cipher).append('\n')
+                }
             }
             val w = j.optInt("width"); val h = j.optInt("height")
             if (w > 0 && h > 0) {

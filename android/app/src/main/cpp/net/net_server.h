@@ -8,8 +8,13 @@
 //     A connection that has not authenticated yet still occupies the single
 //     client slot (others get Busy); the worker closes it after
 //     kAuthTimeoutS / when its pairing code expires.
-//   - UDP video socket (udpPort): Punch -> validate session_id, remember the
-//     source address, reply PunchAck. The same fd is used by the Sender for video.
+//     Encrypted sessions: records are opened here (TcpOpener) before Ping
+//     handling / forwarding; a record that fails to open or a plain message
+//     after the switch drops the connection.
+//   - UDP video socket (udpPort): Punch -> (open with the session key when
+//     encrypted) validate session_id, remember the source address, ask the
+//     Sender to reply PunchAck (it owns the p2c UDP sealer). The same fd is
+//     used by the Sender for video.
 //   - UDP discovery socket (discoveryPort): DiscoveryRequest -> DiscoveryReply.
 //   - Announce (DiscoveryReply kind=3) broadcast to announcePort every 2 s while
 //     idle, every 5 s (busy=1) while a client is connected: phones in doze drop
@@ -34,12 +39,25 @@
 
 namespace owc::net {
 
+// PC -> phone session crypto (c2p keys), protocol v3 (owc/crypto.h).
+struct RxCrypto {
+  TcpOpener tcp;  // every TCP message after AuthResult{Ok}
+  UdpOpener udp;  // punches
+};
+
 struct ClientConn {
   uint64_t gen = 0;
   std::shared_ptr<Socket> sock;
   sockaddr_in peer{};
   std::string peerStr;
   std::shared_ptr<Sender> sender;
+  // Encrypted session handoff (not used with Cipher::None). The worker fills
+  // `rx` and then sets rxSealed (release) BEFORE it publishes sessionId and
+  // queues AuthResult{Ok}; from then on only the net thread touches `rx`, and
+  // every TCP message it parses must be a Sealed record that opens (anything
+  // else drops the connection) and every punch must open with rx->udp.
+  std::unique_ptr<RxCrypto> rx;
+  std::atomic<bool> rxSealed{false};
   // Set by the worker only after AuthResult{Ok}; 0 = not authenticated: UDP
   // punches are ignored and Pings are not answered.
   std::atomic<uint32_t> sessionId{0};
@@ -98,6 +116,7 @@ class NetServer {
   // Net-thread-only state.
   std::shared_ptr<ClientConn> client_;
   TcpFrameParser parser_;
+  TcpFrameParser::Message opened_;  // scratch for TcpOpener::open
   uint64_t nextGen_ = 1;
   std::vector<uint8_t> rxBuf_;
 };

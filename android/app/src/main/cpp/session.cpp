@@ -37,6 +37,16 @@ LogLevel toWire(log::Level l) {
   }
   return LogLevel::Info;
 }
+
+// Names used in the status JSON (ARCHITECTURE.md "Contrato JNI").
+const char* cipherName(Cipher c) {
+  switch (c) {
+    case Cipher::Aes128Gcm: return "aes-128-gcm";
+    case Cipher::ChaCha20Poly1305: return "chacha20-poly1305";
+    case Cipher::None: break;
+  }
+  return "none";
+}
 }  // namespace
 
 Worker::Worker(const StartOptions& opts, EventSink* sink, std::shared_ptr<SharedInfo> info,
@@ -390,6 +400,7 @@ void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
   clientName_.clear();
   pendingSid_ = 0;
   code_.clear();
+  wipeHandshake();
   helloDeadlineMs_ = monoMs() + kHelloTimeoutMs;
   punchDeadlineMs_ = 0;
   wantStream_ = false;
@@ -398,6 +409,7 @@ void Worker::onConnected(std::shared_ptr<net::ClientConn> c) {
   keyReqs_.clear();
   lastOverflows_ = 0;  // per-sender counters start at zero
   lastSentFrames_ = 0;
+  lastSealFrames_ = lastSealNs_ = 0;
   appliedFec_ = -1;
   applyQueuePolicy();
   // No PC log sink, Capabilities or app CLIENT_CONNECTED event until the
@@ -424,7 +436,9 @@ void Worker::onDisconnected() {
   helloDone_ = false;
   closing_ = false;
   pendingSid_ = 0;
-  nonce_ = Id16{};
+  // Session keys: the openers die with the ClientConn (net thread drops its
+  // reference too), the sealers with the Sender; Aead destructors wipe them.
+  wipeHandshake();
   // arg: 1 = PC said Bye (explicit), 0 = connection lost/timeout (PC will auto-reconnect).
   // Only for sessions that were up (CLIENT_CONNECTED is sent after authentication).
   if (wasSession) emit(kEvClientDisconnected, byeReceived_ ? 1 : 0, "");
@@ -500,24 +514,72 @@ void Worker::onHello(const std::vector<uint8_t>& payload) {
     closeClient("protocol version mismatch");
     return;
   }
+  Cipher cipher;
+  if (!chooseCipher(h.cipher_mask, localCipherMask(), cipher)) {
+    sendControl(MsgType::HelloAck, encode(makeAck(HelloStatus::VersionMismatch)));
+    LOGW_LOCAL("no common cipher with %s (PC mask 0x%x, ours 0x%x)", conn_->peerStr.c_str(), h.cipher_mask,
+               localCipherMask());
+    closeClient("no common cipher");
+    return;
+  }
   clientId_ = h.client_id;
   clientName_ = sanitizePeerName(h.client_name);
-  arc4random_buf(nonce_.data(), nonce_.size());
-  phoneId_ = pairing_->phoneId();
   pendingSid_ = 0;
   while (pendingSid_ == 0) pendingSid_ = arc4random();
   requested_ = h.transport;
+  // Fresh ephemeral X25519 key per connection; th binds the exact Hello bytes
+  // received and the exact HelloAck bytes sent.
+  wipeHandshake();
+  cipher_ = cipher;
+  arc4random_buf(ephSecret_.data(), ephSecret_.size());
+  peerEph_ = h.eph_pub;
+  helloBytes_ = payload;
+  hs_ = std::make_unique<Handshake>(Handshake::Role::Phone, ephSecret_);
   HelloAck ack = makeAck(HelloStatus::AuthRequired);
   ack.session_id = pendingSid_;
-  ack.phone_id = phoneId_;
-  ack.nonce = nonce_;
+  ack.phone_id = pairing_->phoneId();
+  ack.eph_pub = hs_->ephPublic();
+  ack.cipher = static_cast<uint8_t>(cipher_);
   ack.paired = pairing_->contains(clientId_);
-  sendControl(MsgType::HelloAck, encode(ack));
+  ackBytes_ = encode(ack);
+  if (!hs_->begin(helloBytes_.data(), helloBytes_.size(), ackBytes_.data(), ackBytes_.size(), peerEph_, cipher_)) {
+    wipeHandshake();
+    closeClient("invalid ephemeral key in Hello");
+    return;
+  }
+  sendControl(MsgType::HelloAck, ackBytes_);
   helloSeen_ = true;
   authDeadlineMs_ = monoMs() + kAuthTimeoutMs;
-  LOGI("Hello from '%s' (%s): %s", clientName_.c_str(), conn_->peerStr.c_str(),
-       ack.paired ? "paired, waiting for AuthProof" : "not paired");
+  LOGI("Hello from '%s' (%s): %s, cipher %s", clientName_.c_str(), conn_->peerStr.c_str(),
+       ack.paired ? "paired, waiting for AuthProof" : "not paired", cipherName(cipher_));
   updateStatus();
+}
+
+std::unique_ptr<Handshake> Worker::freshHandshake() {
+  auto hs = std::make_unique<Handshake>(Handshake::Role::Phone, ephSecret_);
+  if (!hs->begin(helloBytes_.data(), helloBytes_.size(), ackBytes_.data(), ackBytes_.size(), peerEph_, cipher_))
+    return nullptr;
+  return hs;
+}
+
+bool Worker::newCpaceShare() {
+  hs_ = freshHandshake();
+  if (!hs_) return false;
+  Key32 rnd;
+  arc4random_buf(rnd.data(), rnd.size());
+  yb_ = hs_->cpaceStart(code_, rnd);
+  secureWipe(rnd.data(), rnd.size());
+  return true;
+}
+
+void Worker::wipeHandshake() {
+  hs_.reset();  // the Handshake destructor wipes its secrets
+  secureWipe(ephSecret_.data(), ephSecret_.size());
+  secureWipe(yb_.data(), yb_.size());
+  peerEph_ = Key32{};
+  helloBytes_.clear();
+  ackBytes_.clear();
+  cipher_ = Cipher::None;
 }
 
 // ------------------------------------------------------------------ authentication
@@ -538,14 +600,17 @@ void Worker::onAuthMessage(MsgType type, const std::vector<uint8_t>& payload) {
   }
 }
 
-void Worker::sendAuthResult(AuthStatus st, uint8_t attemptsLeft, uint16_t seconds, const Key32* key) {
+void Worker::sendAuthResult(AuthStatus st, uint8_t attemptsLeft, uint16_t seconds, const Key32* cpacePub,
+                            const Key32* confirm) {
   AuthResult r;
   r.status = st;
   r.attempts_left = attemptsLeft;
   r.seconds = seconds;
-  if (key) r.key = *key;
-  sendControl(MsgType::AuthResult, encode(r));
-  r.key.fill(0);
+  if (cpacePub) r.cpace_pub = *cpacePub;
+  if (confirm) r.confirm = *confirm;
+  // AuthResult{Ok} is the last plain TCP message: the sender seals everything after it.
+  if (conn_) conn_->sender->pushControl(MsgType::AuthResult, encode(r), st == AuthStatus::Ok);
+  secureWipe(r.confirm.data(), r.confirm.size());
 }
 
 void Worker::onAuthProof(const std::vector<uint8_t>& payload) {
@@ -557,18 +622,27 @@ void Worker::onAuthProof(const std::vector<uint8_t>& payload) {
   Key32 key{};
   bool ok = decode(payload.data(), payload.size(), p) && pairing_->keyFor(clientId_, key);
   if (ok) {
-    Key32 mac = authMac(key, phoneId_, clientId_, nonce_);
-    ok = constantTimeEqual(mac.data(), p.mac.data(), kKeySize);
+    // Fresh Handshake per attempt: a wrong proof leaves nothing behind for a
+    // PairBegin on the same connection.
+    hs_ = freshHandshake();
+    ok = hs_ != nullptr;
+    if (ok) {
+      hs_->usePairingKey(key);
+      Key32 expect = hs_->pcConfirm();
+      ok = constantTimeEqual(expect.data(), p.confirm.data(), kKeySize);
+      secureWipe(expect.data(), expect.size());
+    }
   }
-  key.fill(0);
+  secureWipe(key.data(), key.size());
   if (!ok) {
+    hs_.reset();
     // The connection stays open: the PC drops its key and may PairBegin.
     LOGI("AuthProof from '%s' (%s) rejected: unknown PC or wrong proof", clientName_.c_str(),
          conn_->peerStr.c_str());
     sendAuthResult(AuthStatus::NotPaired);
     return;
   }
-  authenticated(nullptr);
+  authenticated();
 }
 
 void Worker::onPairBegin() {
@@ -587,9 +661,9 @@ void Worker::onPairBegin() {
     closeClient("pairing locked out");
     return;
   }
-  if (codePending()) {  // repeated PairBegin: same code, no fresh attempts
+  if (codePending()) {  // repeated PairBegin: same code and CPace share, no fresh attempts
     const auto left = static_cast<uint16_t>(std::max<int64_t>(1, (codeExpiryMs_ - now + 999) / 1000));
-    sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), left);
+    sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), left, &yb_);
     return;
   }
   // Wrong codes count globally until a lockout or a success (forgotten after
@@ -603,10 +677,17 @@ void Worker::onPairBegin() {
   char buf[16];
   snprintf(buf, sizeof(buf), "%0*u", static_cast<int>(kPairCodeDigits), arc4random_uniform(mod));
   code_ = buf;
-  std::fill(std::begin(buf), std::end(buf), '\0');
+  secureWipe(buf, sizeof(buf));
+  // CPace: the code is an input on both sides and never travels; the PC gets
+  // only our share Yb.
+  if (!newCpaceShare()) {
+    code_.clear();
+    closeClient("handshake failure");
+    return;
+  }
   codeExpiryMs_ = now + kPairCodeLifetimeS * 1000LL;
   updateStatus();  // "pairing" is visible before the PC / app hear about the code
-  sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), kPairCodeLifetimeS);
+  sendAuthResult(AuthStatus::CodeShown, static_cast<uint8_t>(attemptsLeft_), kPairCodeLifetimeS, &yb_);
   emit(kEvPairingCode, kPairCodeLifetimeS, code_ + "\n" + clientName_);
   LOGI("pairing requested by '%s' (%s): code shown on the phone (%d attempt(s))", clientName_.c_str(),
        conn_->peerStr.c_str(), attemptsLeft_);
@@ -624,21 +705,24 @@ void Worker::onPairCode(const std::vector<uint8_t>& payload) {
     closeClient("pairing code expired");
     return;
   }
+  // The PC typed a code, ran CPace with our Yb and proved the result:
+  // a wrong code (or an invalid share) shows up as a confirmation mismatch.
   PairCode pc;
-  const bool match = decode(payload.data(), payload.size(), pc) && pc.code.size() == code_.size() &&
-                     constantTimeEqual(reinterpret_cast<const uint8_t*>(pc.code.data()),
-                                       reinterpret_cast<const uint8_t*>(code_.data()), code_.size());
-  std::fill(pc.code.begin(), pc.code.end(), '\0');
+  bool match = false;
+  if (hs_ && decode(payload.data(), payload.size(), pc) && hs_->cpaceFinish(pc.cpace_pub)) {
+    Key32 expect = hs_->pcConfirm();
+    match = constantTimeEqual(expect.data(), pc.confirm.data(), kKeySize);
+    secureWipe(expect.data(), expect.size());
+  }
   if (match) {
-    Key32 key;
-    arc4random_buf(key.data(), key.size());
+    Key32 key = hs_->newPairingKey();
     if (!pairing_->add(clientId_, clientName_, key, static_cast<int64_t>(time(nullptr))))
       LOGW_LOCAL("pairing with '%s' could not be saved: it lasts until the app restarts", clientName_.c_str());
+    secureWipe(key.data(), key.size());
     pairFailures_ = 0;
     LOGI("PC '%s' (%s) paired", clientName_.c_str(), conn_->peerStr.c_str());
     endPairing(kPairingPaired);
-    authenticated(&key);
-    key.fill(0);
+    authenticated();
     return;
   }
   ++pairFailures_;
@@ -646,7 +730,13 @@ void Worker::onPairCode(const std::vector<uint8_t>& payload) {
   --attemptsLeft_;
   if (attemptsLeft_ > 0) {
     LOGI("wrong pairing code from '%s' (%d attempt(s) left)", clientName_.c_str(), attemptsLeft_);
-    sendAuthResult(AuthStatus::WrongCode, static_cast<uint8_t>(attemptsLeft_));
+    // Same code, new CPace share: every try is a fresh exchange.
+    if (!newCpaceShare()) {
+      endPairing(kPairingFailed);
+      closeClient("handshake failure");
+      return;
+    }
+    sendAuthResult(AuthStatus::WrongCode, static_cast<uint8_t>(attemptsLeft_), 0, &yb_);
     return;
   }
   lockoutUntilMs_ = now + kPairLockoutS * 1000LL;
@@ -660,18 +750,68 @@ void Worker::onPairCode(const std::vector<uint8_t>& payload) {
 
 void Worker::endPairing(int outcome) {
   if (!codePending()) return;
-  std::fill(code_.begin(), code_.end(), '0');
+  secureWipe(&code_[0], code_.size());
   code_.clear();
+  // A finished pairing leaves hs_ ready for authenticated(); any other
+  // outcome drops the CPace state.
+  if (outcome != kPairingPaired) hs_.reset();
+  secureWipe(yb_.data(), yb_.size());
   codeExpiryMs_ = 0;
   attemptsLeft_ = 0;
   updateStatus();
   emit(kEvPairingEnded, outcome, clientName_);
 }
 
-void Worker::authenticated(const Key32* newKey) {
-  // Published before the Ok goes out: the PC may punch the instant it reads it.
-  conn_->sessionId = pendingSid_;  // from now on UDP punches (and Pings) are accepted
-  sendAuthResult(AuthStatus::Ok, 0, 0, newKey);
+void Worker::authenticated() {
+  // Handoff order (all before the Ok can reach the PC, which seals from its
+  // first message after reading it):
+  //   1. p2c sealers -> Sender (once per connection): adopted with the next
+  //      item it pops, so every PunchAck is sealed;
+  //   2. c2p openers -> ClientConn, rxSealed: the net thread opens every TCP
+  //      message parsed from now on (the PC sends nothing between its proof
+  //      and our answer) and every punch;
+  //   3. sessionId: published before the Ok goes out (the PC may punch the
+  //      instant it reads it); its release orders 1 before the net thread's
+  //      acquire;
+  //   4. AuthResult{Ok, phoneConfirm} queued with startSealing: plain itself,
+  //      everything the sender writes after it is sealed.
+  SessionKeys keys = hs_->keys();
+  // Keys are installed exactly once per connection (helloDone_ gates every
+  // auth message); refuse rather than re-init a sealer (counter reset = nonce reuse).
+  if (cipher_ != Cipher::None && (conn_->rx || conn_->rxSealed.load())) {
+    secureWipe(&keys, sizeof(keys));
+    hs_.reset();
+    closeClient("session keys already installed");
+    return;
+  }
+  if (cipher_ != Cipher::None) {
+    auto rx = std::make_unique<net::RxCrypto>();
+    auto tx = std::make_unique<net::TxCrypto>();
+    const bool ok = rx->tcp.init(keys.c2p_tcp) && rx->udp.init(keys.c2p_udp) && tx->tcp.init(keys.p2c_tcp) &&
+                    tx->udp.init(keys.p2c_udp);
+    if (!ok) {
+      secureWipe(&keys, sizeof(keys));
+      hs_.reset();
+      LOGE_LOCAL("cipher %s could not be initialised", cipherName(cipher_));
+      closeClient("cipher init failed");
+      return;
+    }
+    if (!conn_->sender->setSessionKeys(std::move(tx))) {
+      secureWipe(&keys, sizeof(keys));
+      hs_.reset();
+      closeClient("session keys already installed");
+      return;
+    }
+    conn_->rx = std::move(rx);
+    conn_->rxSealed.store(true, std::memory_order_release);
+  }
+  secureWipe(&keys, sizeof(keys));
+  Key32 confirm = hs_->phoneConfirm();
+  hs_.reset();
+  secureWipe(ephSecret_.data(), ephSecret_.size());
+  conn_->sessionId.store(pendingSid_, std::memory_order_release);  // UDP punches (and Pings) accepted
+  sendAuthResult(AuthStatus::Ok, 0, 0, nullptr, &confirm);
+  secureWipe(confirm.data(), confirm.size());
   helloDone_ = true;
   refreshCameras();
   // USB (adb forward => 127.0.0.1) cannot carry UDP.
@@ -692,8 +832,8 @@ void Worker::authenticated(const Key32* newKey) {
   sendCapabilities();
   lastStatsMs_ = monoMs();
   emit(kEvClientConnected, 0, conn_->peerStr);
-  LOGI_PC("session %08x with '%s' (%s), transport %s", pendingSid_, clientName_.c_str(), conn_->peerStr.c_str(),
-          requested_ == VideoTransport::Udp ? "udp" : "tcp");
+  LOGI_PC("session %08x with '%s' (%s), transport %s, cipher %s", pendingSid_, clientName_.c_str(),
+          conn_->peerStr.c_str(), requested_ == VideoTransport::Udp ? "udp" : "tcp", cipherName(cipher_));
   updateStatus();
 }
 
@@ -1046,11 +1186,19 @@ void Worker::logLatencyBreakdown(const net::Sender::Stats& ss) {
   const float enc = pipeline_->encodeLatencyMs();
   const float sent = ss.sentLatencyUs / 1000.0f;
   const float exp = pipeline_->exposureMs();
+  // AEAD time per frame on the sender thread over this window (max = session max).
+  const uint64_t sf = ss.sealFrames - std::min(ss.sealFrames, lastSealFrames_);
+  const uint64_t sn = ss.sealNsTotal - std::min(ss.sealNsTotal, lastSealNs_);
+  lastSealFrames_ = ss.sealFrames;
+  lastSealNs_ = ss.sealNsTotal;
+  char seal[96] = "";
+  if (sf) snprintf(seal, sizeof(seal), " | %s seal %.0f us/frame (max %.0f)", cipherName(cipher_), sn / 1000.0 / sf,
+                   ss.sealNsMax / 1000.0);
   LOGI_PC("latency breakdown (%s %dx%d@%d): sensor->ISP done %.1f ms | ->encoder out %.1f ms (+%.1f) | "
-          "->sent %.1f ms (+%.1f) | queue %u, dropped %u | exp %.2f ms (eff ISP %.1f) frameDur %.2f ms "
+          "->sent %.1f ms (+%.1f)%s | queue %u, dropped %u | exp %.2f ms (eff ISP %.1f) frameDur %.2f ms "
           "iso %d depth %.1f",
           pipeline_->highSpeedActive() ? "high-speed" : "normal", params_.stream.width,
-          params_.stream.height, params_.stream.fps, isp, enc, enc - isp, sent, sent - enc, ss.queued,
+          params_.stream.height, params_.stream.fps, isp, enc, enc - isp, sent, sent - enc, seal, ss.queued,
           ss.dropped, exp, isp - exp / 2, pipeline_->frameDurationMs(), pipeline_->iso(),
           pipeline_->pipelineDepth());
 }
@@ -1089,7 +1237,13 @@ void Worker::updateStatus() {
     st.state = streaming_ ? "streaming" : "connected";
     st.peer = conn_->peerStr;
     st.transport = conn_->sender->videoMode() == net::VideoMode::Udp ? "udp" : "tcp";
-    st.dropped = conn_->sender->stats().dropped;
+    st.cipher = cipherName(cipher_);
+    const net::Sender::Stats ss = conn_->sender->stats();
+    st.dropped = ss.dropped;
+    if (ss.sealFrames) {
+      st.sealUsAvg = static_cast<float>(ss.sealNsTotal / 1000.0 / ss.sealFrames);
+      st.sealUsMax = static_cast<float>(ss.sealNsMax / 1000.0);
+    }
   } else if (conn_ && codePending()) {
     st.state = "pairing";
     st.peer = conn_->peerStr;
